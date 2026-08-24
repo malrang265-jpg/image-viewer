@@ -1,10 +1,8 @@
-name: Build Windows EXE
+name: Build EXE
 
 on:
   push:
     branches: [ main ]
-    tags:
-      - 'v*'
   workflow_dispatch:
 
 jobs:
@@ -12,38 +10,22 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
     
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
-    - name: Debug - List files
-      shell: cmd
+    - name: Install
       run: |
-        echo Current directory:
-        cd
-        echo Files in current directory:
-        dir /B
-        echo Files in src directory:
-        if exist src dir /B src
-        if exist src\ui dir /B src\ui
+        pip install PyQt5 Pillow pyinstaller
     
-    - name: Install dependencies
+    - name: Build
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pyinstaller
+        cd src
+        pyinstaller --onefile --windowed --name ImageViewer --paths=. main.py
     
-    - name: Build EXE with PyInstaller
-      run: |
-        pyinstaller --onefile --windowed --name ImageViewer --clean --noconfirm src/main.py
-    
-    - name: Upload EXE artifact
-      uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v4
       with:
-        name: ImageViewer-Windows
-        path: dist/ImageViewer.exe
-        retention-days: 30
+        name: ImageViewer
+        path: src/dist/ImageViewer.exe
