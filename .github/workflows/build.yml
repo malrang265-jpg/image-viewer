@@ -5,8 +5,6 @@ on:
     branches: [ main ]
     tags:
       - 'v*'
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -21,6 +19,16 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+    
+    - name: Debug - List files
+      run: |
+        echo "Current directory:"
+        pwd
+        echo "Files in current directory:"
+        dir /B
+        echo "Files in src directory:"
+        if exist src dir /B src
+        if exist src\ui dir /B src\ui
     
     - name: Install dependencies
       run: |
@@ -38,12 +46,3 @@ jobs:
         name: ImageViewer-Windows
         path: dist/ImageViewer.exe
         retention-days: 30
-    
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v2
-      with:
-        files: dist/ImageViewer.exe
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
