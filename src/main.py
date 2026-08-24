@@ -17,7 +17,6 @@ from PyQt5.QtGui import QImage, QPixmap, QKeySequence, QWheelEvent, QTransform
 from PyQt5.QtWidgets import QShortcut
 from PIL import Image
 
-# Settings class
 class Settings:
     def __init__(self):
         self.settings_file = os.path.join(os.path.expanduser('~'), '.image_viewer_settings.json')
@@ -40,10 +39,10 @@ class Settings:
     def default_settings(self):
         return {
             'window_geometry': None,
-            'zoom_quality': 'speed',
+            'zoom_quality': 'balanced',  # 기본값을 balanced로 변경
             'wheel_action': 'navigate',
-            'show_filename': True,
-            'background_color': '#1a1a1a',
+            'show_filename': False,
+            'background_color': '#2b2b2b',
             'fit_to_window': True,
             'slideshow_interval': 3,
             'cache_size': 50,
@@ -73,7 +72,6 @@ class Settings:
         self.data[key] = value
         self.save()
 
-# ImageLoader class
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     
@@ -83,18 +81,24 @@ class ImageLoader:
         return ext in ImageLoader.SUPPORTED_FORMATS
     
     @staticmethod
-    def load_pixmap(filepath, quality='speed'):
+    def load_pixmap(filepath, quality='balanced'):
         try:
             with Image.open(filepath) as img:
                 if img.format == 'GIF':
                     img.seek(0)
+                
+                # RGBA 변환
                 if img.mode not in ('RGB', 'RGBA'):
                     img = img.convert('RGBA')
+                
+                # QImage 변환 (고품질)
                 data = img.tobytes('raw', img.mode)
                 qimage = QImage(data, img.width, img.height, 
                                QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
+                
                 return QPixmap.fromImage(qimage.copy())
-        except:
+        except Exception as e:
+            print(f"이미지 로드 실패: {filepath} - {e}")
             return None
     
     @staticmethod
@@ -103,21 +107,33 @@ class ImageLoader:
             with Image.open(filepath) as img:
                 if img.format == 'GIF':
                     img.seek(0)
-                max_size = 2048
+                
+                # 최대 크기 제한 (2048 -> 4096으로 증가)
+                max_size = 4096
                 if img.width > max_size or img.height > max_size:
                     ratio = min(max_size / img.width, max_size / img.height)
                     new_size = (int(img.width * ratio), int(img.height * ratio))
+                    # LANCZOS 리샘플링으로 화질 개선
                     img = img.resize(new_size, Image.LANCZOS)
+                
+                # RGBA 변환
                 if img.mode not in ('RGB', 'RGBA'):
                     img = img.convert('RGBA')
+                
+                # QImage 변환
                 data = img.tobytes('raw', img.mode)
                 qimage = QImage(data, img.width, img.height, 
                                QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
+                
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
+    
+    @staticmethod
+    def rotate_pixmap(pixmap, angle):
+        transform = QTransform().rotate(angle)
+        return pixmap.transformed(transform, Qt.SmoothTransformation)
 
-# CacheManager class
 class CacheManager:
     def __init__(self, max_size=50):
         self.max_size = max_size
@@ -144,7 +160,6 @@ class CacheManager:
         with self.lock:
             self.cache.clear()
 
-# ZipHandler class
 class ZipHandler:
     @staticmethod
     def is_zip(filename):
@@ -168,12 +183,15 @@ class ZipHandler:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
+                
                 img = Image.open(BytesIO(data))
                 if img.mode not in ('RGB', 'RGBA'):
                     img = img.convert('RGBA')
+                
                 data_bytes = img.tobytes('raw', img.mode)
                 qimage = QImage(data_bytes, img.width, img.height,
                               QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
+                
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
@@ -183,22 +201,27 @@ class ZipHandler:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
+                
                 img = Image.open(BytesIO(data))
-                max_size = 2048
+                
+                # 최대 크기 제한 (4096으로 증가)
+                max_size = 4096
                 if img.width > max_size or img.height > max_size:
                     ratio = min(max_size / img.width, max_size / img.height)
                     new_size = (int(img.width * ratio), int(img.height * ratio))
                     img = img.resize(new_size, Image.LANCZOS)
+                
                 if img.mode not in ('RGB', 'RGBA'):
                     img = img.convert('RGBA')
+                
                 data_bytes = img.tobytes('raw', img.mode)
                 qimage = QImage(data_bytes, img.width, img.height,
                               QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
+                
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
 
-# SlideshowManager class
 class SlideshowManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -238,7 +261,6 @@ class SlideshowManager(QObject):
     def is_active(self):
         return self.is_playing
 
-# SettingsDialog class
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -250,6 +272,17 @@ class SettingsDialog(QDialog):
         self.setWindowTitle('설정')
         self.setModal(True)
         self.setMinimumWidth(400)
+        self.setStyleSheet("""
+            QDialog { background-color: #2b2b2b; color: #ffffff; }
+            QGroupBox { color: #ffffff; border: 1px solid #555; margin-top: 10px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            QLabel { color: #ffffff; }
+            QCheckBox { color: #ffffff; }
+            QComboBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
+            QSpinBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
+            QPushButton { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 5px 10px; }
+            QPushButton:hover { background-color: #4c4c4c; }
+        """)
         layout = QVBoxLayout(self)
         
         display_group = QGroupBox('이미지 표시')
@@ -323,11 +356,11 @@ class SettingsDialog(QDialog):
         layout.addLayout(button_layout)
     
     def load_settings(self):
-        quality = self.settings.get('zoom_quality', 'speed')
+        quality = self.settings.get('zoom_quality', 'balanced')
         index = self.zoom_quality.findData(quality)
         if index >= 0:
             self.zoom_quality.setCurrentIndex(index)
-        self.show_filename.setChecked(self.settings.get('show_filename', True))
+        self.show_filename.setChecked(self.settings.get('show_filename', False))
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
         wheel_action = self.settings.get('wheel_action', 'navigate')
         index = self.wheel_action.findData(wheel_action)
@@ -336,7 +369,7 @@ class SettingsDialog(QDialog):
         self.cache_size.setValue(self.settings.get('cache_size', 50))
         self.preload_next.setChecked(self.settings.get('preload_next', True))
         self.slideshow_interval.setValue(self.settings.get('slideshow_interval', 3))
-        self.current_color = self.settings.get('background_color', '#1a1a1a')
+        self.current_color = self.settings.get('background_color', '#2b2b2b')
         self.update_color_button()
     
     def choose_color(self):
@@ -346,7 +379,7 @@ class SettingsDialog(QDialog):
             self.update_color_button()
     
     def update_color_button(self):
-        self.color_button.setStyleSheet(f"background-color: {self.current_color};")
+        self.color_button.setStyleSheet(f"background-color: {self.current_color}; color: white;")
         self.color_button.setText(self.current_color)
     
     def save_settings(self):
@@ -360,7 +393,6 @@ class SettingsDialog(QDialog):
         self.settings.set('background_color', self.current_color)
         self.accept()
 
-# ImageViewer class
 class ImageViewer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -402,17 +434,13 @@ class ImageViewer(QMainWindow):
         self.image_label.setMinimumSize(100, 100)
         self.scroll_area.setWidget(self.image_label)
         
-        bg_color = self.settings.get('background_color', '#1a1a1a')
-        self.setStyleSheet(f"background-color: {bg_color};")
+        bg_color = self.settings.get('background_color', '#2b2b2b')
+        self.setStyleSheet(f"QMainWindow {{ background-color: {bg_color}; }}")
         
         self.filename_label = QLabel('')
         self.filename_label.setAlignment(Qt.AlignCenter)
-        self.filename_label.setStyleSheet("color: white; background-color: rgba(0,0,0,0.7); padding: 5px;")
+        self.filename_label.setStyleSheet("color: white; background-color: rgba(0,0,0,0.7); padding: 5px; border-radius: 3px;")
         self.filename_label.hide()
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(300)
-        self.progress_bar.hide()
         
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
@@ -479,7 +507,6 @@ class ImageViewer(QMainWindow):
                 self.load_single_file(path)
     
     def load_directory(self, directory):
-        self.show_progress_bar(True)
         self.image_list = []
         try:
             for filename in sorted(os.listdir(directory)):
@@ -488,11 +515,8 @@ class ImageViewer(QMainWindow):
             if self.image_list:
                 self.current_index = 0
                 self.show_current_image()
-                self.preload_adjacent_images()
         except Exception as e:
             print(f"폴더 로드 실패: {e}")
-        finally:
-            self.show_progress_bar(False)
     
     def load_single_file(self, filepath):
         directory = os.path.dirname(filepath)
@@ -504,13 +528,11 @@ class ImageViewer(QMainWindow):
             pass
     
     def load_zip(self, zip_path):
-        self.show_progress_bar(True)
         self.current_zip = zip_path
         self.image_list = ZipHandler.list_images(zip_path)
         if self.image_list:
             self.current_index = 0
             self.show_current_image()
-        self.show_progress_bar(False)
     
     def show_current_image(self):
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
@@ -521,23 +543,14 @@ class ImageViewer(QMainWindow):
         pixmap = self.cache_manager.get(cache_key)
         
         if pixmap is None:
-            quality = self.settings.get('zoom_quality', 'speed')
+            quality = self.settings.get('zoom_quality', 'balanced')
             if self.current_zip:
-                if quality == 'speed':
-                    pixmap = ZipHandler.load_image_from_zip_fast(self.current_zip, current_file)
-                else:
-                    pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
-                display_name = f"{os.path.basename(self.current_zip)} - {current_file}"
+                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
             else:
-                if quality == 'speed':
-                    pixmap = ImageLoader.load_pixmap_fast(current_file)
-                else:
-                    pixmap = ImageLoader.load_pixmap(current_file, quality)
-                display_name = os.path.basename(current_file)
+                pixmap = ImageLoader.load_pixmap(current_file, quality)
+            
             if pixmap:
                 self.cache_manager.put(cache_key, pixmap)
-        else:
-            display_name = os.path.basename(current_file) if not self.current_zip else f"{os.path.basename(self.current_zip)} - {current_file}"
         
         if pixmap:
             if self.rotation_angle != 0:
@@ -545,44 +558,35 @@ class ImageViewer(QMainWindow):
                 pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
             self.current_pixmap = pixmap
             self.update_image_display()
-            if self.settings.get('show_filename', True):
+            
+            if self.settings.get('show_filename', False):
+                display_name = os.path.basename(current_file) if not self.current_zip else f"{os.path.basename(self.current_zip)} - {current_file}"
                 self.filename_label.setText(display_name)
                 self.filename_label.show()
                 self.filename_label.adjustSize()
                 self.filename_label.move(10, 10)
-            self.preload_adjacent_images()
-    
-    def preload_adjacent_images(self):
-        if not self.settings.get('preload_next', True):
-            return
-        preload_indices = []
-        if self.current_index < len(self.image_list) - 1:
-            preload_indices.append(self.current_index + 1)
-        if self.current_index > 0:
-            preload_indices.append(self.current_index - 1)
-        
-        for idx in preload_indices:
-            file_path = self.image_list[idx]
-            cache_key = f"{self.current_zip}_{file_path}" if self.current_zip else file_path
-            if self.cache_manager.get(cache_key) is None:
-                def preload_worker(key=file_path):
-                    if self.current_zip:
-                        pixmap = ZipHandler.load_image_from_zip_fast(self.current_zip, key)
-                    else:
-                        pixmap = ImageLoader.load_pixmap_fast(key)
-                    if pixmap:
-                        self.cache_manager.put(cache_key, pixmap)
-                thread = threading.Thread(target=preload_worker, daemon=True)
-                thread.start()
+            else:
+                self.filename_label.hide()
     
     def update_image_display(self):
         if not hasattr(self, 'current_pixmap'):
             return
+        
         if self.fit_to_window:
-            scaled_pixmap = self.current_pixmap.scaled(self.scroll_area.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
+            # SmoothTransformation으로 화질 개선
+            scaled_pixmap = self.current_pixmap.scaled(
+                self.scroll_area.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
         else:
             new_size = self.current_pixmap.size() * self.zoom_factor
-            scaled_pixmap = self.current_pixmap.scaled(new_size, Qt.KeepAspectRatio, Qt.FastTransformation)
+            scaled_pixmap = self.current_pixmap.scaled(
+                new_size,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+        
         self.image_label.setPixmap(scaled_pixmap)
         self.image_label.adjustSize()
     
@@ -652,6 +656,7 @@ class ImageViewer(QMainWindow):
             self.filename_label.setText("슬라이드쇼 재생 중...")
             self.filename_label.show()
         else:
+            self.filename_label.hide()
             self.show_current_image()
     
     def rotate_right(self):
@@ -664,6 +669,10 @@ class ImageViewer(QMainWindow):
     
     def show_context_menu(self, pos):
         menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background-color: #2b2b2b; color: white; border: 1px solid #555; }
+            QMenu::item:selected { background-color: #3c3c3c; }
+        """)
         
         prev_action = QAction('이전 이미지', self)
         prev_action.triggered.connect(self.prev_image)
@@ -727,8 +736,8 @@ class ImageViewer(QMainWindow):
             self.apply_settings()
     
     def apply_settings(self):
-        bg_color = self.settings.get('background_color', '#1a1a1a')
-        self.setStyleSheet(f"background-color: {bg_color};")
+        bg_color = self.settings.get('background_color', '#2b2b2b')
+        self.setStyleSheet(f"QMainWindow {{ background-color: {bg_color}; }}")
         cache_size = self.settings.get('cache_size', 50)
         self.cache_manager = CacheManager(cache_size)
         interval = self.settings.get('slideshow_interval', 3)
@@ -736,32 +745,12 @@ class ImageViewer(QMainWindow):
         if self.image_list:
             self.show_current_image()
     
-    def show_progress_bar(self, show):
-        if show:
-            self.progress_bar.show()
-            self.progress_bar.setRange(0, 0)
-        else:
-            self.progress_bar.hide()
-    
     def wheelEvent(self, event: QWheelEvent):
-        if event.modifiers() & Qt.ControlModifier:
-            if event.angleDelta().y() > 0:
-                self.zoom_in()
-            else:
-                self.zoom_out()
-            return
-        
-        wheel_action = self.settings.get('wheel_action', 'navigate')
-        if wheel_action == 'navigate':
-            if event.angleDelta().y() > 0:
-                self.prev_image()
-            else:
-                self.next_image()
+        # 휠 위로 = 이전 이미지, 휠 아래로 = 다음 이미지
+        if event.angleDelta().y() > 0:
+            self.prev_image()
         else:
-            if event.angleDelta().y() > 0:
-                self.zoom_in()
-            else:
-                self.zoom_out()
+            self.next_image()
     
     def mousePressEvent(self, event):
         if event.button() == Qt.XButton1:
@@ -780,12 +769,12 @@ class ImageViewer(QMainWindow):
         self.slideshow.stop()
         super().closeEvent(event)
 
-# Main
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    
     viewer = ImageViewer()
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
