@@ -21,12 +21,13 @@ jobs:
         python-version: '3.11'
     
     - name: Debug - List files
+      shell: cmd
       run: |
-        echo "Current directory:"
-        pwd
-        echo "Files in current directory:"
+        echo Current directory:
+        cd
+        echo Files in current directory:
         dir /B
-        echo "Files in src directory:"
+        echo Files in src directory:
         if exist src dir /B src
         if exist src\ui dir /B src\ui
     
