@@ -8,13 +8,12 @@ from collections import OrderedDict
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
-                            QProgressBar, QDialog, QHBoxLayout, QComboBox,
-                            QCheckBox, QPushButton, QColorDialog, QGroupBox,
-                            QFormLayout, QSpinBox, QTableWidget, QTableWidgetItem,
-                            QHeaderView)
-from PyQt5.QtCore import Qt, QTimer, QObject
-from PyQt5.QtGui import QImage, QPixmap, QKeySequence, QWheelEvent, QTransform
-from PyQt5.QtWidgets import QShortcut
+                            QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
+                            QColorDialog, QGroupBox, QFormLayout, QSpinBox,
+                            QListWidget, QListWidgetItem, QShortcut)
+from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray
+from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
+                        QMovie, QKeyEvent, QCloseEvent)
 from PIL import Image
 
 class Settings:
@@ -39,8 +38,7 @@ class Settings:
     def default_settings(self):
         return {
             'window_geometry': None,
-            'zoom_quality': 'balanced',  # 기본값을 balanced로 변경
-            'wheel_action': 'navigate',
+            'zoom_quality': 'balanced',
             'show_filename': False,
             'background_color': '#2b2b2b',
             'fit_to_window': True,
@@ -48,18 +46,19 @@ class Settings:
             'cache_size': 50,
             'preload_next': True,
             'shortcuts': {
-                'next_image': ['Right'],
-                'prev_image': ['Left'],
-                'zoom_in': ['Up'],
-                'zoom_out': ['Down'],
-                'actual_size': ['0'],
-                'toggle_fullscreen': ['F', 'F11'],
-                'delete_image': ['Delete'],
-                'open_file': ['O', 'Ctrl+O'],
-                'slideshow': ['S'],
-                'rotate_right': ['R'],
-                'rotate_left': ['L'],
-                'exit_fullscreen': ['Escape'],
+                'next_image': 'Right',
+                'prev_image': 'Left',
+                'zoom_in': 'Up',
+                'zoom_out': 'Down',
+                'actual_size': '0',
+                'toggle_fullscreen': 'F11',
+                'close_program': 'Ctrl+Q',
+                'show_image_list': 'Tab',
+                'delete_image': 'Delete',
+                'open_file': 'Ctrl+O',
+                'slideshow': 'S',
+                'rotate_right': 'R',
+                'rotate_left': 'L',
                 'mouse_next': 'XButton1',
                 'mouse_prev': 'XButton2'
             }
@@ -71,9 +70,20 @@ class Settings:
     def set(self, key, value):
         self.data[key] = value
         self.save()
+    
+    def get_shortcut(self, action, default=''):
+        shortcuts = self.data.get('shortcuts', {})
+        return shortcuts.get(action, default)
+    
+    def set_shortcut(self, action, key_sequence):
+        if 'shortcuts' not in self.data:
+            self.data['shortcuts'] = {}
+        self.data['shortcuts'][action] = key_sequence
+        self.save()
 
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+    ANIMATED_FORMATS = {'.gif', '.webp'}
     
     @staticmethod
     def is_supported(filename):
@@ -81,58 +91,33 @@ class ImageLoader:
         return ext in ImageLoader.SUPPORTED_FORMATS
     
     @staticmethod
+    def is_animated(filename):
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in ImageLoader.ANIMATED_FORMATS
+    
+    @staticmethod
     def load_pixmap(filepath, quality='balanced'):
         try:
             with Image.open(filepath) as img:
-                if img.format == 'GIF':
-                    img.seek(0)
-                
-                # RGBA 변환
                 if img.mode not in ('RGB', 'RGBA'):
                     img = img.convert('RGBA')
-                
-                # QImage 변환 (고품질)
                 data = img.tobytes('raw', img.mode)
                 qimage = QImage(data, img.width, img.height, 
                                QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
-                
-                return QPixmap.fromImage(qimage.copy())
-        except Exception as e:
-            print(f"이미지 로드 실패: {filepath} - {e}")
-            return None
-    
-    @staticmethod
-    def load_pixmap_fast(filepath):
-        try:
-            with Image.open(filepath) as img:
-                if img.format == 'GIF':
-                    img.seek(0)
-                
-                # 최대 크기 제한 (2048 -> 4096으로 증가)
-                max_size = 4096
-                if img.width > max_size or img.height > max_size:
-                    ratio = min(max_size / img.width, max_size / img.height)
-                    new_size = (int(img.width * ratio), int(img.height * ratio))
-                    # LANCZOS 리샘플링으로 화질 개선
-                    img = img.resize(new_size, Image.LANCZOS)
-                
-                # RGBA 변환
-                if img.mode not in ('RGB', 'RGBA'):
-                    img = img.convert('RGBA')
-                
-                # QImage 변환
-                data = img.tobytes('raw', img.mode)
-                qimage = QImage(data, img.width, img.height, 
-                               QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
-                
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
     
     @staticmethod
-    def rotate_pixmap(pixmap, angle):
-        transform = QTransform().rotate(angle)
-        return pixmap.transformed(transform, Qt.SmoothTransformation)
+    def load_movie(filepath):
+        """GIF/WebP 애니메이션 로드"""
+        try:
+            movie = QMovie(filepath)
+            if movie.isValid():
+                return movie
+        except:
+            pass
+        return None
 
 class CacheManager:
     def __init__(self, max_size=50):
@@ -183,83 +168,214 @@ class ZipHandler:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
-                
                 img = Image.open(BytesIO(data))
                 if img.mode not in ('RGB', 'RGBA'):
                     img = img.convert('RGBA')
-                
                 data_bytes = img.tobytes('raw', img.mode)
                 qimage = QImage(data_bytes, img.width, img.height,
                               QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
-                
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
     
     @staticmethod
-    def load_image_from_zip_fast(zip_path, filename):
+    def load_animation_from_zip(zip_path, filename):
+        """ZIP에서 애니메이션 로드"""
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
-                
-                img = Image.open(BytesIO(data))
-                
-                # 최대 크기 제한 (4096으로 증가)
-                max_size = 4096
-                if img.width > max_size or img.height > max_size:
-                    ratio = min(max_size / img.width, max_size / img.height)
-                    new_size = (int(img.width * ratio), int(img.height * ratio))
-                    img = img.resize(new_size, Image.LANCZOS)
-                
-                if img.mode not in ('RGB', 'RGBA'):
-                    img = img.convert('RGBA')
-                
-                data_bytes = img.tobytes('raw', img.mode)
-                qimage = QImage(data_bytes, img.width, img.height,
-                              QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
-                
-                return QPixmap.fromImage(qimage.copy())
+                # 임시 파일로 저장
+                temp_file = os.path.join(os.path.expanduser('~'), '.temp_animation')
+                with open(temp_file, 'wb') as f:
+                    f.write(data)
+                movie = QMovie(temp_file)
+                if movie.isValid():
+                    return movie
         except:
-            return None
+            pass
+        return None
 
-class SlideshowManager(QObject):
-    def __init__(self, parent=None):
+class ImageListDialog(QDialog):
+    """이미지 목록 다이얼로그"""
+    def __init__(self, image_list, current_index, parent=None):
         super().__init__(parent)
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.next_slide)
-        self.is_playing = False
-        self.interval = 3000
-        self.current_callback = None
+        self.image_list = image_list
+        self.current_index = current_index
+        self.selected_index = current_index
+        self.init_ui()
     
-    def set_interval(self, seconds):
-        self.interval = seconds * 1000
-        if self.is_playing:
-            self.timer.setInterval(self.interval)
+    def init_ui(self):
+        self.setWindowTitle('이미지 목록')
+        self.setModal(True)
+        self.setMinimumSize(300, 400)
+        self.setStyleSheet("""
+            QDialog { background-color: #2b2b2b; color: white; }
+            QListWidget { background-color: #3c3c3c; color: white; border: 1px solid #555; }
+            QListWidget::item:selected { background-color: #4a90d9; }
+            QPushButton { background-color: #3c3c3c; color: white; border: 1px solid #555; padding: 5px; }
+            QPushButton:hover { background-color: #4c4c4c; }
+        """)
+        
+        layout = QVBoxLayout(self)
+        
+        self.list_widget = QListWidget()
+        for i, image_path in enumerate(self.image_list):
+            display_name = os.path.basename(image_path) if not image_path.startswith('zip:') else image_path.split(':', 2)[2]
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.UserRole, i)
+            self.list_widget.addItem(item)
+        
+        self.list_widget.setCurrentRow(self.current_index)
+        self.list_widget.itemDoubleClicked.connect(self.on_double_click)
+        self.list_widget.itemClicked.connect(self.on_item_clicked)
+        layout.addWidget(self.list_widget)
+        
+        button_layout = QHBoxLayout()
+        select_button = QPushButton('선택')
+        select_button.clicked.connect(self.accept)
+        cancel_button = QPushButton('취소')
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(select_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
     
-    def set_callback(self, callback):
-        self.current_callback = callback
+    def on_item_clicked(self, item):
+        self.selected_index = item.data(Qt.UserRole)
     
-    def start(self):
-        if self.current_callback:
-            self.timer.start(self.interval)
-            self.is_playing = True
+    def on_double_click(self, item):
+        self.selected_index = item.data(Qt.UserRole)
+        self.accept()
     
-    def stop(self):
-        self.timer.stop()
-        self.is_playing = False
+    def get_selected_index(self):
+        return self.selected_index
+
+class ShortcutSettingsDialog(QDialog):
+    """단축키 설정 다이얼로그"""
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.shortcut_buttons = {}
+        self.capturing = False
+        self.current_action = None
+        self.init_ui()
+        self.load_shortcuts()
     
-    def toggle(self):
-        if self.is_playing:
-            self.stop()
-        else:
-            self.start()
+    def init_ui(self):
+        self.setWindowTitle('단축키 설정')
+        self.setModal(True)
+        self.setMinimumWidth(400)
+        self.setStyleSheet("""
+            QDialog { background-color: #2b2b2b; color: white; }
+            QLabel { color: white; }
+            QPushButton { background-color: #3c3c3c; color: white; border: 1px solid #555; padding: 5px 10px; }
+            QPushButton:hover { background-color: #4c4c4c; }
+            QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
+        """)
+        
+        layout = QVBoxLayout(self)
+        
+        actions = [
+            ('next_image', '다음 이미지'),
+            ('prev_image', '이전 이미지'),
+            ('toggle_fullscreen', '전체화면 토글'),
+            ('close_program', '프로그램 닫기'),
+            ('show_image_list', '이미지 목록 표시'),
+            ('zoom_in', '확대'),
+            ('zoom_out', '축소'),
+            ('actual_size', '실제 크기'),
+            ('delete_image', '삭제'),
+            ('open_file', '열기'),
+            ('slideshow', '슬라이드쇼'),
+            ('rotate_right', '오른쪽 회전'),
+            ('rotate_left', '왼쪽 회전'),
+        ]
+        
+        for action_key, action_name in actions:
+            group = QGroupBox(action_name)
+            group_layout = QHBoxLayout()
+            
+            button = QPushButton('키 입력 대기...')
+            button.setMinimumWidth(150)
+            button.clicked.connect(lambda checked, k=action_key, b=button: self.start_capture(k, b))
+            self.shortcut_buttons[action_key] = button
+            group_layout.addWidget(button)
+            
+            group.setLayout(group_layout)
+            layout.addWidget(group)
+        
+        button_layout = QHBoxLayout()
+        reset_button = QPushButton('기본값 복원')
+        reset_button.clicked.connect(self.reset_defaults)
+        button_layout.addWidget(reset_button)
+        
+        button_layout.addStretch()
+        
+        save_button = QPushButton('저장')
+        save_button.clicked.connect(self.save_shortcuts)
+        button_layout.addWidget(save_button)
+        
+        cancel_button = QPushButton('취소')
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
     
-    def next_slide(self):
-        if self.current_callback:
-            self.current_callback()
+    def load_shortcuts(self):
+        actions = ['next_image', 'prev_image', 'toggle_fullscreen', 'close_program',
+                  'show_image_list', 'zoom_in', 'zoom_out', 'actual_size',
+                  'delete_image', 'open_file', 'slideshow', 'rotate_right', 'rotate_left']
+        
+        for action in actions:
+            shortcut = self.settings.get_shortcut(action, '없음')
+            if action in self.shortcut_buttons:
+                self.shortcut_buttons[action].setText(shortcut)
     
-    def is_active(self):
-        return self.is_playing
+    def start_capture(self, action_key, button):
+        if self.capturing:
+            return
+        
+        self.capturing = True
+        self.current_action = action_key
+        button.setText('키를 누르세요...')
+        button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
+    
+    def keyPressEvent(self, event):
+        if self.capturing and self.current_action:
+            key = event.key()
+            modifiers = event.modifiers()
+            
+            if key == Qt.Key_Escape:
+                self.cancel_capture()
+                return
+            
+            key_sequence = QKeySequence(modifiers | key).toString()
+            
+            if key_sequence and self.current_action in self.shortcut_buttons:
+                self.shortcut_buttons[self.current_action].setText(key_sequence)
+                self.shortcut_buttons[self.current_action].setStyleSheet("")
+                self.capturing = False
+                self.current_action = None
+        
+        super().keyPressEvent(event)
+    
+    def cancel_capture(self):
+        if self.current_action and self.current_action in self.shortcut_buttons:
+            original = self.settings.get_shortcut(self.current_action, '없음')
+            self.shortcut_buttons[self.current_action].setText(original)
+            self.shortcut_buttons[self.current_action].setStyleSheet("")
+        self.capturing = False
+        self.current_action = None
+    
+    def reset_defaults(self):
+        defaults = self.settings.default_settings()['shortcuts']
+        for action, shortcut in defaults.items():
+            if action in self.shortcut_buttons:
+                self.shortcut_buttons[action].setText(shortcut)
+    
+    def save_shortcuts(self):
+        for action, button in self.shortcut_buttons.items():
+            self.settings.set_shortcut(action, button.text())
+        self.accept()
 
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
@@ -302,17 +418,6 @@ class SettingsDialog(QDialog):
         
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
-        
-        mouse_group = QGroupBox('마우스')
-        mouse_layout = QFormLayout()
-        
-        self.wheel_action = QComboBox()
-        self.wheel_action.addItem('이미지 전환', 'navigate')
-        self.wheel_action.addItem('확대/축소', 'zoom')
-        mouse_layout.addRow('휠 동작:', self.wheel_action)
-        
-        mouse_group.setLayout(mouse_layout)
-        layout.addWidget(mouse_group)
         
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
@@ -362,10 +467,6 @@ class SettingsDialog(QDialog):
             self.zoom_quality.setCurrentIndex(index)
         self.show_filename.setChecked(self.settings.get('show_filename', False))
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
-        wheel_action = self.settings.get('wheel_action', 'navigate')
-        index = self.wheel_action.findData(wheel_action)
-        if index >= 0:
-            self.wheel_action.setCurrentIndex(index)
         self.cache_size.setValue(self.settings.get('cache_size', 50))
         self.preload_next.setChecked(self.settings.get('preload_next', True))
         self.slideshow_interval.setValue(self.settings.get('slideshow_interval', 3))
@@ -386,7 +487,6 @@ class SettingsDialog(QDialog):
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
-        self.settings.set('wheel_action', self.wheel_action.currentData())
         self.settings.set('cache_size', self.cache_size.value())
         self.settings.set('preload_next', self.preload_next.isChecked())
         self.settings.set('slideshow_interval', self.slideshow_interval.value())
@@ -398,7 +498,9 @@ class ImageViewer(QMainWindow):
         super().__init__()
         self.settings = Settings()
         self.cache_manager = CacheManager(self.settings.get('cache_size', 50))
-        self.slideshow = SlideshowManager(self)
+        self.slideshow = QTimer()
+        self.slideshow.timeout.connect(self.next_image)
+        self.slideshow_playing = False
         self.current_index = 0
         self.image_list = []
         self.current_zip = None
@@ -406,13 +508,13 @@ class ImageViewer(QMainWindow):
         self.fit_to_window = True
         self.rotation_angle = 0
         self.shortcut_objects = {}
+        self.current_movie = None
         
         self.init_ui()
         self.load_settings()
         self.setup_shortcuts()
         
-        self.slideshow.set_callback(self.next_image)
-        self.slideshow.set_interval(self.settings.get('slideshow_interval', 3))
+        self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
     
     def init_ui(self):
         self.setWindowTitle('이미지 뷰어')
@@ -446,7 +548,6 @@ class ImageViewer(QMainWindow):
         self.customContextMenuRequested.connect(self.show_context_menu)
     
     def setup_shortcuts(self):
-        shortcuts_config = self.settings.get('shortcuts', {})
         for shortcut in self.shortcut_objects.values():
             shortcut.setEnabled(False)
         self.shortcut_objects.clear()
@@ -458,23 +559,21 @@ class ImageViewer(QMainWindow):
             'zoom_out': self.zoom_out,
             'actual_size': self.actual_size,
             'toggle_fullscreen': self.toggle_fullscreen,
+            'close_program': self.close,
+            'show_image_list': self.show_image_list_dialog,
             'delete_image': self.delete_image,
             'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
             'rotate_right': self.rotate_right,
             'rotate_left': self.rotate_left,
-            'exit_fullscreen': self.exit_fullscreen,
         }
         
         for action_name, callback in shortcut_actions.items():
-            keys = shortcuts_config.get(action_name, [])
-            if isinstance(keys, str):
-                keys = [keys]
-            for key in keys:
-                if key:
-                    shortcut = QShortcut(QKeySequence(key), self)
-                    shortcut.activated.connect(callback)
-                    self.shortcut_objects[f"{action_name}_{key}"] = shortcut
+            key = self.settings.get_shortcut(action_name, '')
+            if key:
+                shortcut = QShortcut(QKeySequence(key), self)
+                shortcut.activated.connect(callback)
+                self.shortcut_objects[action_name] = shortcut
     
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -489,11 +588,9 @@ class ImageViewer(QMainWindow):
     def load_settings(self):
         geometry = self.settings.get('window_geometry')
         if geometry:
-            from PyQt5.QtCore import QByteArray
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
     
     def save_settings(self):
-        from PyQt5.QtCore import QByteArray
         geometry = self.saveGeometry().toBase64().data().decode()
         self.settings.set('window_geometry', geometry)
     
@@ -508,15 +605,21 @@ class ImageViewer(QMainWindow):
     
     def load_directory(self, directory):
         self.image_list = []
+        self.current_zip = None
+        
+        # 같은 폴더의 지원되는 이미지만 로드
         try:
             for filename in sorted(os.listdir(directory)):
                 if ImageLoader.is_supported(filename):
                     self.image_list.append(os.path.join(directory, filename))
-            if self.image_list:
-                self.current_index = 0
-                self.show_current_image()
-        except Exception as e:
-            print(f"폴더 로드 실패: {e}")
+        except:
+            pass
+        
+        if self.image_list:
+            self.current_index = 0
+            self.show_current_image()
+        else:
+            self.image_label.clear()
     
     def load_single_file(self, filepath):
         directory = os.path.dirname(filepath)
@@ -530,37 +633,71 @@ class ImageViewer(QMainWindow):
     def load_zip(self, zip_path):
         self.current_zip = zip_path
         self.image_list = ZipHandler.list_images(zip_path)
+        
         if self.image_list:
             self.current_index = 0
             self.show_current_image()
+        else:
+            self.image_label.clear()
+    
+    def stop_current_movie(self):
+        if self.current_movie:
+            self.current_movie.stop()
+            self.current_movie = None
     
     def show_current_image(self):
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
             return
         
-        current_file = self.image_list[self.current_index]
-        cache_key = f"{self.current_zip}_{current_file}" if self.current_zip else current_file
-        pixmap = self.cache_manager.get(cache_key)
+        self.stop_current_movie()
         
-        if pixmap is None:
-            quality = self.settings.get('zoom_quality', 'balanced')
-            if self.current_zip:
-                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
+        current_file = self.image_list[self.current_index]
+        
+        # ZIP 파일인 경우
+        if self.current_zip:
+            if ImageLoader.is_animated(current_file):
+                # 애니메이션 로드
+                movie = ZipHandler.load_animation_from_zip(self.current_zip, current_file)
+                if movie:
+                    self.current_movie = movie
+                    self.image_label.setMovie(movie)
+                    movie.start()
+                    self.update_image_display()
+                    return
             else:
-                pixmap = ImageLoader.load_pixmap(current_file, quality)
-            
-            if pixmap:
-                self.cache_manager.put(cache_key, pixmap)
+                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
+        else:
+            # 일반 파일인 경우
+            if ImageLoader.is_animated(current_file):
+                # GIF/WebP 애니메이션
+                movie = ImageLoader.load_movie(current_file)
+                if movie:
+                    self.current_movie = movie
+                    self.image_label.setMovie(movie)
+                    movie.start()
+                    self.update_image_display()
+                    return
+            else:
+                cache_key = current_file
+                pixmap = self.cache_manager.get(cache_key)
+                
+                if pixmap is None:
+                    quality = self.settings.get('zoom_quality', 'balanced')
+                    pixmap = ImageLoader.load_pixmap(current_file, quality)
+                    if pixmap:
+                        self.cache_manager.put(cache_key, pixmap)
         
         if pixmap:
             if self.rotation_angle != 0:
                 transform = QTransform().rotate(self.rotation_angle)
                 pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
+            
             self.current_pixmap = pixmap
+            self.image_label.setPixmap(pixmap)
             self.update_image_display()
             
             if self.settings.get('show_filename', False):
-                display_name = os.path.basename(current_file) if not self.current_zip else f"{os.path.basename(self.current_zip)} - {current_file}"
+                display_name = os.path.basename(current_file) if not self.current_zip else current_file
                 self.filename_label.setText(display_name)
                 self.filename_label.show()
                 self.filename_label.adjustSize()
@@ -569,25 +706,15 @@ class ImageViewer(QMainWindow):
                 self.filename_label.hide()
     
     def update_image_display(self):
-        if not hasattr(self, 'current_pixmap'):
-            return
+        if hasattr(self, 'current_pixmap') and self.current_pixmap:
+            if self.fit_to_window:
+                scaled_pixmap = self.current_pixmap.scaled(
+                    self.scroll_area.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.image_label.setPixmap(scaled_pixmap)
         
-        if self.fit_to_window:
-            # SmoothTransformation으로 화질 개선
-            scaled_pixmap = self.current_pixmap.scaled(
-                self.scroll_area.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-        else:
-            new_size = self.current_pixmap.size() * self.zoom_factor
-            scaled_pixmap = self.current_pixmap.scaled(
-                new_size,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-        
-        self.image_label.setPixmap(scaled_pixmap)
         self.image_label.adjustSize()
     
     def next_image(self):
@@ -623,20 +750,34 @@ class ImageViewer(QMainWindow):
         else:
             self.showFullScreen()
     
-    def exit_fullscreen(self):
-        if self.isFullScreen():
-            self.showNormal()
+    def close_program(self):
+        self.close()
+    
+    def show_image_list_dialog(self):
+        if not self.image_list:
+            return
+        
+        dialog = ImageListDialog(self.image_list, self.current_index, self)
+        if dialog.exec_() == QDialog.Accepted:
+            selected = dialog.get_selected_index()
+            if selected != self.current_index:
+                self.current_index = selected
+                self.rotation_angle = 0
+                self.show_current_image()
     
     def delete_image(self):
         if not self.image_list or self.current_zip:
             return
+        
         current_file = self.image_list[self.current_index]
         try:
             os.remove(current_file)
             self.cache_manager.clear()
             self.image_list.pop(self.current_index)
+            
             if self.current_index >= len(self.image_list):
                 self.current_index = len(self.image_list) - 1
+            
             if self.image_list:
                 self.show_current_image()
             else:
@@ -646,18 +787,20 @@ class ImageViewer(QMainWindow):
             pass
     
     def open_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, '이미지 열기', '', '이미지 파일 (*.png *.jpg *.jpeg *.gif *.webp);;ZIP 파일 (*.zip);;모든 파일 (*)')
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, '이미지 열기', '',
+            '이미지 파일 (*.png *.jpg *.jpeg *.gif *.webp);;ZIP 파일 (*.zip);;모든 파일 (*)'
+        )
         if file_path:
             self.load_path(file_path)
     
     def toggle_slideshow(self):
-        self.slideshow.toggle()
-        if self.slideshow.is_active():
-            self.filename_label.setText("슬라이드쇼 재생 중...")
-            self.filename_label.show()
+        if self.slideshow_playing:
+            self.slideshow.stop()
+            self.slideshow_playing = False
         else:
-            self.filename_label.hide()
-            self.show_current_image()
+            self.slideshow.start()
+            self.slideshow_playing = True
     
     def rotate_right(self):
         self.rotation_angle = (self.rotation_angle + 90) % 360
@@ -712,6 +855,10 @@ class ImageViewer(QMainWindow):
         slideshow_action.triggered.connect(self.toggle_slideshow)
         menu.addAction(slideshow_action)
         
+        image_list_action = QAction('이미지 목록', self)
+        image_list_action.triggered.connect(self.show_image_list_dialog)
+        menu.addAction(image_list_action)
+        
         menu.addSeparator()
         
         open_action = QAction('열기...', self)
@@ -728,6 +875,10 @@ class ImageViewer(QMainWindow):
         settings_action.triggered.connect(self.show_settings)
         menu.addAction(settings_action)
         
+        shortcuts_action = QAction('단축키 설정', self)
+        shortcuts_action.triggered.connect(self.show_shortcut_settings)
+        menu.addAction(shortcuts_action)
+        
         menu.exec_(self.mapToGlobal(pos))
     
     def show_settings(self):
@@ -735,13 +886,18 @@ class ImageViewer(QMainWindow):
         if dialog.exec_():
             self.apply_settings()
     
+    def show_shortcut_settings(self):
+        dialog = ShortcutSettingsDialog(self.settings, self)
+        if dialog.exec_():
+            self.setup_shortcuts()
+    
     def apply_settings(self):
         bg_color = self.settings.get('background_color', '#2b2b2b')
         self.setStyleSheet(f"QMainWindow {{ background-color: {bg_color}; }}")
         cache_size = self.settings.get('cache_size', 50)
         self.cache_manager = CacheManager(cache_size)
         interval = self.settings.get('slideshow_interval', 3)
-        self.slideshow.set_interval(interval)
+        self.slideshow.setInterval(interval * 1000)
         if self.image_list:
             self.show_current_image()
     
@@ -753,10 +909,14 @@ class ImageViewer(QMainWindow):
             self.next_image()
     
     def mousePressEvent(self, event):
-        if event.button() == Qt.XButton1:
-            self.prev_image()
-        elif event.button() == Qt.XButton2:
+        mouse_next = self.settings.get_shortcut('mouse_next', 'XButton1')
+        mouse_prev = self.settings.get_shortcut('mouse_prev', 'XButton2')
+        
+        if mouse_next == 'XButton1' and event.button() == Qt.XButton1:
             self.next_image()
+        elif mouse_prev == 'XButton2' and event.button() == Qt.XButton2:
+            self.prev_image()
+        
         super().mousePressEvent(event)
     
     def resizeEvent(self, event):
@@ -764,8 +924,9 @@ class ImageViewer(QMainWindow):
         if self.fit_to_window and hasattr(self, 'current_pixmap'):
             self.update_image_display()
     
-    def closeEvent(self, event):
+    def closeEvent(self, event: QCloseEvent):
         self.save_settings()
+        self.stop_current_movie()
         self.slideshow.stop()
         super().closeEvent(event)
 
