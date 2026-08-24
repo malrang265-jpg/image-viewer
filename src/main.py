@@ -73,7 +73,11 @@ class Settings:
     
     def get_shortcut(self, action, default=''):
         shortcuts = self.data.get('shortcuts', {})
-        return shortcuts.get(action, default)
+        value = shortcuts.get(action, default)
+        # 리스트인 경우 문자열로 변환
+        if isinstance(value, list):
+            return value[0] if value else default
+        return value
     
     def set_shortcut(self, action, key_sequence):
         if 'shortcuts' not in self.data:
@@ -184,7 +188,6 @@ class ZipHandler:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
-                # 임시 파일로 저장
                 temp_file = os.path.join(os.path.expanduser('~'), '.temp_animation')
                 with open(temp_file, 'wb') as f:
                     f.write(data)
@@ -220,7 +223,7 @@ class ImageListDialog(QDialog):
         
         self.list_widget = QListWidget()
         for i, image_path in enumerate(self.image_list):
-            display_name = os.path.basename(image_path) if not image_path.startswith('zip:') else image_path.split(':', 2)[2]
+            display_name = os.path.basename(image_path)
             item = QListWidgetItem(display_name)
             item.setData(Qt.UserRole, i)
             self.list_widget.addItem(item)
@@ -509,6 +512,7 @@ class ImageViewer(QMainWindow):
         self.rotation_angle = 0
         self.shortcut_objects = {}
         self.current_movie = None
+        self.current_pixmap = None
         
         self.init_ui()
         self.load_settings()
@@ -570,10 +574,15 @@ class ImageViewer(QMainWindow):
         
         for action_name, callback in shortcut_actions.items():
             key = self.settings.get_shortcut(action_name, '')
-            if key:
-                shortcut = QShortcut(QKeySequence(key), self)
-                shortcut.activated.connect(callback)
-                self.shortcut_objects[action_name] = shortcut
+            if key and key != '없음' and key != '':
+                # 리스트가 아닌 문자열로 변환
+                if isinstance(key, list):
+                    key = key[0] if key else ''
+                
+                if key:
+                    shortcut = QShortcut(QKeySequence(key), self)
+                    shortcut.activated.connect(callback)
+                    self.shortcut_objects[action_name] = shortcut
     
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -607,7 +616,6 @@ class ImageViewer(QMainWindow):
         self.image_list = []
         self.current_zip = None
         
-        # 같은 폴더의 지원되는 이미지만 로드
         try:
             for filename in sorted(os.listdir(directory)):
                 if ImageLoader.is_supported(filename):
@@ -652,11 +660,10 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         
         current_file = self.image_list[self.current_index]
+        pixmap = None
         
-        # ZIP 파일인 경우
         if self.current_zip:
             if ImageLoader.is_animated(current_file):
-                # 애니메이션 로드
                 movie = ZipHandler.load_animation_from_zip(self.current_zip, current_file)
                 if movie:
                     self.current_movie = movie
@@ -667,9 +674,7 @@ class ImageViewer(QMainWindow):
             else:
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
         else:
-            # 일반 파일인 경우
             if ImageLoader.is_animated(current_file):
-                # GIF/WebP 애니메이션
                 movie = ImageLoader.load_movie(current_file)
                 if movie:
                     self.current_movie = movie
