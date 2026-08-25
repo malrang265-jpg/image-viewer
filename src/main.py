@@ -129,7 +129,7 @@ class Settings:
     
     def default_settings(self):
         return {
-            'window_geometry': None,  # {'x': int, 'y': int, 'width': int, 'height': int}
+            'window_geometry': None,
             'zoom_quality': 'balanced',
             'show_filename': False,
             'background_color': '#2b2b2b',
@@ -767,7 +767,7 @@ class ImageViewer(QMainWindow):
         self.current_zip = None
         self.zoom_factor = 1.0
         self.fit_to_window = True
-        self.rotation_angle = 0        
+        self.rotation_angle = 0
         self.current_movie = None
         self.current_pixmap = None
         self.original_pixmap = None
@@ -964,7 +964,6 @@ class ImageViewer(QMainWindow):
                 y = geometry.get('y', 100)
                 w = geometry.get('width', 800)
                 h = geometry.get('height', 600)
-                # 화면 범위 내 확인
                 screen = QApplication.primaryScreen().availableGeometry()
                 if x < screen.left():
                     x = screen.left()
