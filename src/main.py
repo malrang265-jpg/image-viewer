@@ -706,24 +706,26 @@ class ImageViewer(QMainWindow):
         
         self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
     
-    def setup_icon(self):
+        def setup_icon(self):
         """아이콘 설정 - 제목 표시줄과 작업 표시줄 모두 적용"""
         icon_path = os.path.join(get_app_dir(), 'icon.ico')
         
         if os.path.exists(icon_path):
             icon = QIcon(icon_path)
             self.setWindowIcon(icon)
-            # 작업 표시줄 아이콘도 설정
-            if hasattr(self, 'windowHandle'):
-                self.windowHandle().setIcon(icon)
+            # 창이 생성된 후 아이콘 설정
+            QTimer.singleShot(0, lambda: self.apply_window_icon(icon))
         elif getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            # PyInstaller 패키징된 경우
             icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
             if os.path.exists(icon_path):
                 icon = QIcon(icon_path)
                 self.setWindowIcon(icon)
-                if hasattr(self, 'windowHandle'):
-                    self.windowHandle().setIcon(icon)
+                QTimer.singleShot(0, lambda: self.apply_window_icon(icon))
+    
+    def apply_window_icon(self, icon):
+        """창 핸들이 생성된 후 아이콘 적용"""
+        if self.windowHandle():
+            self.windowHandle().setIcon(icon)
     
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
