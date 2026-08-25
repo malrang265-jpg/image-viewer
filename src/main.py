@@ -192,7 +192,7 @@ class Settings:
 
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-    ANIMATED_FORMATS = {'.gif'}  # WebP는 정적 이미지로 처리
+    ANIMATED_FORMATS = {'.gif', '.webp'}  # WebP도 애니메이션 처리
     
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     
@@ -430,8 +430,6 @@ class ShortcutSettingsDialog(QDialog):
         self.current_slot = 0
         self.init_ui()
         self.load_shortcuts()
-        self.setMouseTracking(True)
-        self.grabMouse()  # 마우스 이벤트 캡처
     
     def init_ui(self):
         self.setWindowTitle('단축키 설정')
@@ -504,7 +502,6 @@ class ShortcutSettingsDialog(QDialog):
         button.setText('키/마우스 입력 대기...')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
-        self.grabMouse()
         self.setFocus()
     
     def keyPressEvent(self, event):
@@ -542,21 +539,11 @@ class ShortcutSettingsDialog(QDialog):
                 return
         super().mousePressEvent(event)
     
-    def mouseDoubleClickEvent(self, event):
-        if self.capturing and self.current_action:
-            if event.button() == Qt.LeftButton:
-                self.shortcut_buttons[self.current_action][self.current_slot].setText('Left Double Click')
-                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
-                return
-        super().mouseDoubleClickEvent(event)
-    
     def stop_capture(self):
         self.capturing = False
         self.current_action = None
         self.current_slot = 0
         self.releaseKeyboard()
-        self.releaseMouse()
     
     def reset_defaults(self):
         defaults = self.settings.default_settings()['shortcuts']
@@ -1111,7 +1098,7 @@ class ImageViewer(QMainWindow):
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file,
                                                        saturation, brightness, contrast)
             else:
-                # GIF만 애니메이션으로 처리, WebP는 정적 이미지로 처리
+                # GIF/WebP 애니메이션 처리
                 if ImageLoader.is_animated(current_file):
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
@@ -1185,7 +1172,7 @@ class ImageViewer(QMainWindow):
                 self.gif_loop_count = 0
     
     def update_image_display(self):
-        # GIF 애니메이션 처리
+        # GIF/WebP 애니메이션 처리
         if self.current_movie:
             try:
                 if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
