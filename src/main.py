@@ -10,7 +10,6 @@ import concurrent.futures
 from io import BytesIO
 from collections import OrderedDict
 
-# OpenGL 가속 설정
 os.environ['QT_OPENGL'] = 'software'
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
@@ -148,7 +147,7 @@ class Settings:
             'slideshow_interval': 3,
             'slideshow_mode': 'time',
             'slideshow_gif_loops': 2,
-            'cache_size': 200,  # 캐시 크기 증가
+            'cache_size': 200,
             'preload_next': True,
             'shortcuts': {
                 'next_image': ['Right', ''],
@@ -195,7 +194,6 @@ class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     ANIMATED_FORMATS = {'.gif', '.webp'}
     
-    # 스레드 풀 (병렬 이미지 로딩)
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     
     @staticmethod
@@ -242,15 +240,6 @@ class ImageLoader:
         except:
             pass
         return None
-    
-    @staticmethod
-    def load_pixmap_async(filepath, callback, saturation=100, brightness=100, contrast=100):
-        """비동기 이미지 로딩"""
-        def load():
-            return ImageLoader.load_pixmap(filepath, saturation=saturation, brightness=brightness, contrast=contrast)
-        
-        future = ImageLoader._executor.submit(load)
-        future.add_done_callback(lambda f: callback(f.result()))
     
     @staticmethod
     def load_thumbnail(filepath, size=(150, 150)):
@@ -805,7 +794,10 @@ class ImageViewer(QMainWindow):
     def setup_icon(self):
         icon_path = get_icon_path()
         if icon_path:
-            self.setWindowIcon(QIcon(icon_path))
+            icon = QIcon(icon_path)
+            self.setWindowIcon(icon)
+            if self.windowHandle():
+                self.windowHandle().setIcon(icon)
     
     def showEvent(self, event):
         super().showEvent(event)
@@ -946,6 +938,13 @@ class ImageViewer(QMainWindow):
     
     def keyPressEvent(self, event: QKeyEvent):
         key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
+        
+        # ESC로 전체화면 종료
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            event.accept()
+            return
+        
         close_shortcuts = self.settings.get_shortcuts('close_program')
         if key_sequence in close_shortcuts:
             QTimer.singleShot(150, self.close)
@@ -1111,6 +1110,7 @@ class ImageViewer(QMainWindow):
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file,
                                                        saturation, brightness, contrast)
             else:
+                # WebP/GIF 애니메이션 확인
                 if ImageLoader.is_animated(current_file):
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
@@ -1184,6 +1184,7 @@ class ImageViewer(QMainWindow):
                 self.gif_loop_count = 0
     
     def update_image_display(self):
+        # GIF/WebP 애니메이션 처리
         if self.current_movie:
             try:
                 if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
@@ -1200,10 +1201,12 @@ class ImageViewer(QMainWindow):
                         scaled_size = QSize(int(original_size.width() * self.zoom_factor),
                                            int(original_size.height() * self.zoom_factor))
                     self.current_movie.setScaledSize(scaled_size)
+                    self.image_label.adjustSize()
             except:
                 pass
             return
         
+        # 일반 이미지 처리
         if self.current_pixmap:
             if self.fit_to_window:
                 scaled = self.current_pixmap.scaled(
@@ -1462,8 +1465,6 @@ class ImageViewer(QMainWindow):
 
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseOpenGLES)
-    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     single_app = SingleApplication()
