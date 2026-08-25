@@ -431,6 +431,7 @@ class ShortcutSettingsDialog(QDialog):
         self.init_ui()
         self.load_shortcuts()
         self.setMouseTracking(True)
+        self.grabMouse()  # 마우스 이벤트 캡처
     
     def init_ui(self):
         self.setWindowTitle('단축키 설정')
@@ -522,6 +523,33 @@ class ShortcutSettingsDialog(QDialog):
                 self.stop_capture()
                 return
         super().keyPressEvent(event)
+    
+    def mousePressEvent(self, event):
+        if self.capturing and self.current_action:
+            button = event.button()
+            mouse_buttons = {
+                Qt.LeftButton: 'Left Click',
+                Qt.RightButton: 'Right Click',
+                Qt.MiddleButton: 'Middle Click',
+                Qt.XButton1: 'XButton1',
+                Qt.XButton2: 'XButton2'
+            }
+            if button in mouse_buttons:
+                button_text = mouse_buttons[button]
+                self.shortcut_buttons[self.current_action][self.current_slot].setText(button_text)
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+                self.stop_capture()
+                return
+        super().mousePressEvent(event)
+    
+    def mouseDoubleClickEvent(self, event):
+        if self.capturing and self.current_action:
+            if event.button() == Qt.LeftButton:
+                self.shortcut_buttons[self.current_action][self.current_slot].setText('Left Double Click')
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+                self.stop_capture()
+                return
+        super().mouseDoubleClickEvent(event)
     
     def stop_capture(self):
         self.capturing = False
@@ -769,7 +797,6 @@ class ImageViewer(QMainWindow):
         if icon_path:
             icon = QIcon(icon_path)
             self.setWindowIcon(icon)
-            # 아이콘을 강제로 적용
             app = QApplication.instance()
             if app:
                 app.setWindowIcon(icon)
@@ -912,7 +939,6 @@ class ImageViewer(QMainWindow):
             self.unsetCursor()
     
     def keyPressEvent(self, event: QKeyEvent):
-        # ESC로 전체화면 종료
         if event.key() == Qt.Key_Escape:
             if self.isFullScreen():
                 self.showNormal()
@@ -992,7 +1018,6 @@ class ImageViewer(QMainWindow):
                 self.setGeometry(x, y, w, h)
     
     def save_settings(self):
-        # 전체화면이면 저장 안 함
         if not self.isFullScreen():
             pos = self.pos()
             size = self.size()
@@ -1433,14 +1458,10 @@ class ImageViewer(QMainWindow):
             self.update_image_display()
     
     def closeEvent(self, event: QCloseEvent):
-        # 전체화면이면 먼저 해제
         if self.isFullScreen():
             self.showNormal()
-        
-        # 창 모드 위치만 저장
         if not self.isFullScreen():
             self.save_settings()
-        
         self.stop_current_movie()
         self.slideshow.stop()
         super().closeEvent(event)
