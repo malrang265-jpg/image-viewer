@@ -821,7 +821,8 @@ class ImageViewer(QMainWindow):
         self.slideshow.timeout.connect(self.next_image)
         self.slideshow_playing = False
         self.slideshow_mode = 'time'
-        self.gif_loop_count = 0        self.gif_max_loops = 2
+        self.gif_loop_count = 0                                                                                    
+        self.gif_max_loops = 2
         self.gif_frame_connected = False
         self.current_index = 0
         self.image_list = []
