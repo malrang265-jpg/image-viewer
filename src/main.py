@@ -47,13 +47,14 @@ class SingleApplication:
         if self.socket.state() == QLocalSocket.ConnectedState:
             self.socket.write(message.encode())
             self.socket.flush()
+            self.socket.waitForBytesWritten(100)
             self.socket.disconnectFromServer()
     
     def on_new_connection(self):
         socket = self.server.nextPendingConnection()
-        if socket.waitForReadyRead(100):
-            data = socket.readAll().data().decode()
-            if self.file_received_callback:
+        if socket.waitForReadyRead(200):
+            data = socket.readAll().data().decode('utf-8', errors='ignore')
+            if self.file_received_callback and data:
                 self.file_received_callback(data)
         socket.disconnectFromServer()
     
@@ -789,7 +790,8 @@ class ImageViewer(QMainWindow):
                     try:
                         shortcut = QShortcut(QKeySequence(key), self)
                         shortcut.activated.connect(callback)
-                        shortcut.setContext(Qt.ApplicationShortcut)
+                        # 프로그램 내에서만 동작하도록 설정
+                        shortcut.setContext(Qt.WidgetWithChildrenShortcut)
                         self.shortcut_objects[f"{action_name}_{i}"] = shortcut
                     except:
                         pass
@@ -1181,6 +1183,13 @@ class ImageViewer(QMainWindow):
         super().closeEvent(event)
 
 def main():
+    # 빠른 시작을 위해 최소한의 초기화
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    
+    # 중복 실행 확인
     single_app = SingleApplication()
     
     if single_app.is_running():
@@ -1190,13 +1199,7 @@ def main():
     
     single_app.start_server()
     
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    
     viewer = ImageViewer()
-    
     single_app.set_file_received_callback(viewer.load_path)
     
     if len(sys.argv) > 1:
