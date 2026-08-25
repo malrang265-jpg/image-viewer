@@ -23,8 +23,8 @@ from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-# 키보드 훅 콜백 타입 정의
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.c_uintptr, ctypes.c_void_p)
+# 키보드 훅 콜백 타입 정의 (수정됨)
+HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
 
 # 전역 키보드 훅
 WH_KEYBOARD_LL = 13
@@ -33,12 +33,10 @@ keyboard_hook = None
 def low_level_keyboard_proc(nCode, wParam, lParam):
     if nCode == 0:
         vk_code = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong)).contents.value
-        # 방향키, Delete, PageUp, PageDown 차단
         if vk_code in [0x25, 0x26, 0x27, 0x28, 0x2E, 0x21, 0x22]:
             return 1
     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-# 콜백 함수 객체 생성
 keyboard_proc = HOOKPROC(low_level_keyboard_proc)
 
 def setup_keyboard_hook():
@@ -626,7 +624,6 @@ class SettingsDialog(QDialog):
             QPushButton:hover { background-color: #4c4c4c; }
         """)
         layout = QVBoxLayout(self)
-        
         file_assoc_group = QGroupBox('파일 연결')
         file_assoc_layout = QVBoxLayout()
         file_assoc_label = QLabel('Pekoviewer로 열 파일 확장자:')
@@ -637,7 +634,6 @@ class SettingsDialog(QDialog):
             file_assoc_layout.addWidget(checkbox)
         file_assoc_group.setLayout(file_assoc_layout)
         layout.addWidget(file_assoc_group)
-        
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         self.zoom_quality = QComboBox()
@@ -651,7 +647,6 @@ class SettingsDialog(QDialog):
         display_layout.addRow('', self.fit_to_window)
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
-        
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         self.cache_size = QSpinBox()
@@ -662,7 +657,6 @@ class SettingsDialog(QDialog):
         performance_layout.addRow('', self.preload_next)
         performance_group.setLayout(performance_layout)
         layout.addWidget(performance_group)
-        
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
         self.slideshow_mode = QComboBox()
@@ -679,14 +673,12 @@ class SettingsDialog(QDialog):
         slideshow_layout.addRow('GIF 재생 횟수:', self.slideshow_gif_loops)
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
-        
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
-        
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -708,14 +700,12 @@ class SettingsDialog(QDialog):
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
         self.cache_size.setValue(self.settings.get('cache_size', 100))
         self.preload_next.setChecked(self.settings.get('preload_next', True))
-        
         mode = self.settings.get('slideshow_mode', 'time')
         index = self.slideshow_mode.findData(mode)
         if index >= 0:
             self.slideshow_mode.setCurrentIndex(index)
         self.slideshow_interval.setValue(self.settings.get('slideshow_interval', 3))
         self.slideshow_gif_loops.setValue(self.settings.get('slideshow_gif_loops', 2))
-        
         self.current_color = self.settings.get('background_color', '#2b2b2b')
         self.update_color_button()
     
@@ -738,7 +728,6 @@ class SettingsDialog(QDialog):
             FileAssociationManager.associate_extensions(to_associate)
         if to_disassociate:
             FileAssociationManager.disassociate_extensions(to_disassociate)
-        
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
@@ -1156,7 +1145,6 @@ class ImageViewer(QMainWindow):
         self.slideshow_mode = self.settings.get('slideshow_mode', 'time')
         self.gif_max_loops = self.settings.get('slideshow_gif_loops', 2)
         self.gif_loop_count = 0
-        
         if self.slideshow_mode == 'loop' and self.current_movie:
             self.connect_gif_loop()
         else:
@@ -1264,7 +1252,6 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    
     single_app = SingleApplication()
     if single_app.is_running():
         if len(sys.argv) > 1:
@@ -1272,7 +1259,6 @@ def main():
         sys.exit(0)
     single_app.start_server()
     
-    # 키보드 훅 설정
     try:
         setup_keyboard_hook()
     except Exception as e:
@@ -1286,7 +1272,6 @@ def main():
     
     viewer.show()
     
-    # 창이 표시된 후 강제로 맨 앞으로
     QTimer.singleShot(100, viewer.force_foreground)
     QTimer.singleShot(300, viewer.force_foreground)
     QTimer.singleShot(500, viewer.force_foreground)
