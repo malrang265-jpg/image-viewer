@@ -20,11 +20,9 @@ from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
-# Windows API
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-# PIL 지연 로딩 - 필요할 때만 import
 PIL_Image = None
 
 def get_pil_image():
@@ -172,11 +170,9 @@ class FileAssociationManager:
         associated = []
         if not WINDOWS:
             return associated
-        
         exe_path = os.path.join(get_app_dir(), 'Pekoviewer.exe')
         if not os.path.exists(exe_path):
             return associated
-        
         try:
             for ext in FileAssociationManager.SUPPORTED_EXTENSIONS:
                 try:
@@ -196,22 +192,18 @@ class FileAssociationManager:
     def associate_extensions(extensions):
         if not WINDOWS:
             return False
-        
         exe_path = os.path.join(get_app_dir(), 'Pekoviewer.exe')
         if not os.path.exists(exe_path):
             return False
-        
         try:
             for ext in extensions:
                 prog_id = f"Pekoviewer{ext.replace('.', '')}"
                 key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}")
                 winreg.SetValue(key, "", winreg.REG_SZ, f"Pekoviewer {ext} File")
                 winreg.CloseKey(key)
-                
                 key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\DefaultIcon")
                 winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}",0')
                 winreg.CloseKey(key)
-                
                 key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open\\command")
                 winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}" "%1"')
                 winreg.CloseKey(key)
@@ -260,8 +252,6 @@ class ImageLoader:
                 return pixmap
         except:
             pass
-        
-        # PIL 폴백
         try:
             Image = get_pil_image()
             with Image.open(filepath) as img:
@@ -334,11 +324,9 @@ class ZipHandler:
                         images.append(filename)
         except:
             pass
-        
         def natural_key(s):
             return [int(text) if text.isdigit() else text.lower() 
                     for text in re.split(r'(\d+)', s)]
-        
         images.sort(key=natural_key)
         return images
     
@@ -347,7 +335,6 @@ class ZipHandler:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
-                
                 ext = os.path.splitext(filename)[1].lower()
                 if ext == '.gif':
                     temp_file = os.path.join(get_app_dir(), '.temp_gif')
@@ -359,11 +346,9 @@ class ZipHandler:
                         pixmap = movie.currentPixmap()
                         movie.stop()
                         return pixmap
-                
                 pixmap = QPixmap()
                 if pixmap.loadFromData(data):
                     return pixmap
-                
                 Image = get_pil_image()
                 img = Image.open(BytesIO(data))
                 img = img.convert('RGBA')
@@ -380,7 +365,6 @@ class ImageListDialog(QDialog):
         self.current_index = current_index
         self.selected_index = current_index
         self.current_zip = current_zip
-        self.thumbnail_loader = None
         self.init_ui()
     
     def init_ui(self):
@@ -395,32 +379,25 @@ class ImageListDialog(QDialog):
             QPushButton { background-color: #3c3c3c; color: white; border: 1px solid #555; padding: 5px; }
             QPushButton:hover { background-color: #4c4c4c; }
         """)
-        
         layout = QVBoxLayout(self)
-        
         self.preview_label = QLabel('이미지를 선택하세요')
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumHeight(200)
         self.preview_label.setStyleSheet("border: 1px solid #555; background-color: #3c3c3c;")
         layout.addWidget(self.preview_label)
-        
         self.list_widget = QListWidget()
         self.list_widget.setViewMode(QListView.ListMode)
         self.list_widget.setSpacing(2)
-        
         for i, image_path in enumerate(self.image_list):
             display_name = os.path.basename(image_path)
             item = QListWidgetItem(display_name)
             item.setData(Qt.UserRole, i)
             self.list_widget.addItem(item)
-        
         self.list_widget.setCurrentRow(self.current_index)
         self.list_widget.itemDoubleClicked.connect(self.on_double_click)
         self.list_widget.itemClicked.connect(self.on_item_clicked)
         layout.addWidget(self.list_widget)
-        
         self.show_preview(self.current_index)
-        
         button_layout = QHBoxLayout()
         select_button = QPushButton('선택')
         select_button.clicked.connect(self.accept)
@@ -441,16 +418,12 @@ class ImageListDialog(QDialog):
     def show_preview(self, index):
         if index < 0 or index >= len(self.image_list):
             return
-        
         self.preview_label.setText('로딩 중...')
-        
-        # 동기 로드 (빠른 응답)
         try:
             if self.current_zip:
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, self.image_list[index])
             else:
                 pixmap = ImageLoader.load_thumbnail(self.image_list[index])
-            
             if pixmap:
                 scaled = pixmap.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.preview_label.setPixmap(scaled)
@@ -482,13 +455,10 @@ class ShortcutSettingsDialog(QDialog):
             QPushButton:hover { background-color: #4c4c4c; }
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
-        
         layout = QVBoxLayout(self)
-        
         info_label = QLabel('각 기능에 최대 2개의 단축키를 설정할 수 있습니다. ESC 키는 단축키를 삭제합니다.')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
-        
         actions = [
             ('next_image', '다음 이미지'), ('prev_image', '이전 이미지'),
             ('toggle_fullscreen', '전체화면 토글'), ('close_program', '프로그램 닫기'),
@@ -498,25 +468,20 @@ class ShortcutSettingsDialog(QDialog):
             ('slideshow', '슬라이드쇼'), ('rotate_right', '오른쪽 회전'),
             ('rotate_left', '왼쪽 회전'),
         ]
-        
         for action_key, action_name in actions:
             group = QGroupBox(action_name)
             group_layout = QHBoxLayout()
-            
             button1 = QPushButton('단축키 1')
             button1.setMinimumWidth(120)
             button1.clicked.connect(lambda checked, k=action_key, s=0, b=button1: self.start_capture(k, s, b))
-            
             button2 = QPushButton('단축키 2')
             button2.setMinimumWidth(120)
             button2.clicked.connect(lambda checked, k=action_key, s=1, b=button2: self.start_capture(k, s, b))
-            
             self.shortcut_buttons[action_key] = [button1, button2]
             group_layout.addWidget(button1)
             group_layout.addWidget(button2)
             group.setLayout(group_layout)
             layout.addWidget(group)
-        
         button_layout = QHBoxLayout()
         reset_button = QPushButton('기본값 복원')
         reset_button.clicked.connect(self.reset_defaults)
@@ -614,7 +579,6 @@ class SettingsDialog(QDialog):
             QPushButton:hover { background-color: #4c4c4c; }
         """)
         layout = QVBoxLayout(self)
-        
         file_assoc_group = QGroupBox('파일 연결')
         file_assoc_layout = QVBoxLayout()
         file_assoc_label = QLabel('Pekoviewer로 열 파일 확장자:')
@@ -625,7 +589,6 @@ class SettingsDialog(QDialog):
             file_assoc_layout.addWidget(checkbox)
         file_assoc_group.setLayout(file_assoc_layout)
         layout.addWidget(file_assoc_group)
-        
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         self.zoom_quality = QComboBox()
@@ -639,7 +602,6 @@ class SettingsDialog(QDialog):
         display_layout.addRow('', self.fit_to_window)
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
-        
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         self.cache_size = QSpinBox()
@@ -650,7 +612,6 @@ class SettingsDialog(QDialog):
         performance_layout.addRow('', self.preload_next)
         performance_group.setLayout(performance_layout)
         layout.addWidget(performance_group)
-        
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
         self.slideshow_interval = QSpinBox()
@@ -659,14 +620,12 @@ class SettingsDialog(QDialog):
         slideshow_layout.addRow('간격:', self.slideshow_interval)
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
-        
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
-        
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -680,7 +639,6 @@ class SettingsDialog(QDialog):
         current_associations = FileAssociationManager.get_current_associations()
         for ext, checkbox in self.extension_checkboxes.items():
             checkbox.setChecked(ext in current_associations)
-        
         quality = self.settings.get('zoom_quality', 'balanced')
         index = self.zoom_quality.findData(quality)
         if index >= 0:
@@ -712,7 +670,6 @@ class SettingsDialog(QDialog):
             FileAssociationManager.associate_extensions(to_associate)
         if to_disassociate:
             FileAssociationManager.disassociate_extensions(to_disassociate)
-        
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
@@ -741,7 +698,6 @@ class ImageViewer(QMainWindow):
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
-        
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -752,31 +708,20 @@ class ImageViewer(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
     
-        def bring_to_front(self):
-        """창을 맨 앞으로 가져오기"""
+    def bring_to_front(self):
         try:
             hwnd = int(self.winId())
-            
-            # 최소화 상태 해제
             if self.isMinimized():
                 self.showNormal()
             else:
                 self.show()
-            
-            # Windows API 호출
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            
-            # TOPMOST 설정 후 해제 (깜빡임 방지)
-            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)  # HWND_TOPMOST
-            user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001)  # HWND_NOTOPMOST
-            
-            # 포커스 설정
+            user32.ShowWindow(hwnd, 9)
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
+            user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001)
             user32.SetForegroundWindow(hwnd)
             user32.BringWindowToTop(hwnd)
-        except Exception as e:
-            print(f"bring_to_front 오류: {e}")
-        
-        # Qt 방식 백업
+        except:
+            pass
         self.show()
         self.raise_()
         self.activateWindow()
@@ -785,30 +730,24 @@ class ImageViewer(QMainWindow):
         self.setWindowTitle('Pekoviewer')
         self.setMinimumSize(400, 300)
         self.setAcceptDrops(True)
-        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.scroll_area)
-        
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(100, 100)
         self.image_label.setScaledContents(False)
         self.scroll_area.setWidget(self.image_label)
-        
         self.apply_background_color()
-        
         self.filename_label = QLabel('')
         self.filename_label.setAlignment(Qt.AlignCenter)
         self.filename_label.setStyleSheet("color: white; background-color: rgba(0,0,0,0.7); padding: 5px;")
         self.filename_label.hide()
-        
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
     
@@ -820,36 +759,27 @@ class ImageViewer(QMainWindow):
             QLabel {{ background-color: transparent; }}
         """)
     
-        def keyPressEvent(self, event: QKeyEvent):
-        """키보드 이벤트 처리 - 완전히 소비"""
+    def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
         modifiers = event.modifiers()
         key_sequence = QKeySequence(modifiers | key).toString()
-        
         shortcut_actions = {
-            'next_image': self.next_image,
-            'prev_image': self.prev_image,
-            'zoom_in': self.zoom_in,
-            'zoom_out': self.zoom_out,
+            'next_image': self.next_image, 'prev_image': self.prev_image,
+            'zoom_in': self.zoom_in, 'zoom_out': self.zoom_out,
             'toggle_actual_size': self.toggle_actual_size,
             'toggle_fullscreen': self.toggle_fullscreen,
             'close_program': self.close_program,
             'show_image_list': self.show_image_list_dialog,
-            'delete_image': self.delete_image,
-            'open_file': self.open_file,
+            'delete_image': self.delete_image, 'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
-            'rotate_right': self.rotate_right,
-            'rotate_left': self.rotate_left,
+            'rotate_right': self.rotate_right, 'rotate_left': self.rotate_left,
         }
-        
         for action_name, callback in shortcut_actions.items():
             shortcuts = self.settings.get_shortcuts(action_name)
             if key_sequence in shortcuts:
                 callback()
                 event.accept()
                 return
-        
-        # 처리되지 않은 키도 소비
         event.accept()
     
     def check_mouse_shortcut(self, button_text):
@@ -914,7 +844,6 @@ class ImageViewer(QMainWindow):
                     self.image_list.append(os.path.join(directory, filename))
         except:
             pass
-        
         if self.image_list:
             self.current_index = 0
             self.show_current_image()
@@ -953,12 +882,10 @@ class ImageViewer(QMainWindow):
             return
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
             return
-        
         self.is_loading = True
         self.stop_current_movie()
         current_file = self.image_list[self.current_index]
         pixmap = None
-        
         try:
             if self.current_zip:
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
@@ -980,7 +907,6 @@ class ImageViewer(QMainWindow):
                         pixmap = ImageLoader.load_pixmap(current_file)
                         if pixmap:
                             self.cache_manager.put(cache_key, pixmap)
-            
             if pixmap:
                 if self.rotation_angle != 0:
                     transform = QTransform().rotate(self.rotation_angle)
@@ -989,7 +915,6 @@ class ImageViewer(QMainWindow):
                 self.original_pixmap = pixmap
                 self.image_label.setPixmap(pixmap)
                 self.update_image_display()
-                
                 if self.settings.get('show_filename', False):
                     display_name = os.path.basename(current_file) if not self.current_zip else current_file
                     self.filename_label.setText(display_name)
@@ -1011,10 +936,8 @@ class ImageViewer(QMainWindow):
             base_pixmap = self.original_pixmap
         elif self.current_pixmap:
             base_pixmap = self.current_pixmap
-        
         if not base_pixmap or base_pixmap.isNull():
             return
-        
         if self.fit_to_window:
             if self.current_movie:
                 scaled_size = base_pixmap.size().scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
@@ -1125,25 +1048,20 @@ class ImageViewer(QMainWindow):
             QMenu { background-color: #2b2b2b; color: white; border: 1px solid #555; }
             QMenu::item:selected { background-color: #3c3c3c; }
         """)
-        
         slideshow_action = QAction('슬라이드쇼', self)
         slideshow_action.triggered.connect(self.toggle_slideshow)
         menu.addAction(slideshow_action)
         menu.addSeparator()
-        
         settings_action = QAction('설정', self)
         settings_action.triggered.connect(self.show_settings)
         menu.addAction(settings_action)
-        
         shortcuts_action = QAction('단축키 설정', self)
         shortcuts_action.triggered.connect(self.show_shortcut_settings)
         menu.addAction(shortcuts_action)
         menu.addSeparator()
-        
         close_action = QAction('프로그램 종료', self)
         close_action.triggered.connect(self.close_program)
         menu.addAction(close_action)
-        
         menu.exec_(self.mapToGlobal(pos))
     
     def show_settings(self):
@@ -1182,7 +1100,6 @@ class ImageViewer(QMainWindow):
             button_text = 'XButton1'
         elif event.button() == Qt.XButton2:
             button_text = 'XButton2'
-        
         if button_text:
             self.check_mouse_shortcut(button_text)
         super().mousePressEvent(event)
@@ -1204,24 +1121,19 @@ class ImageViewer(QMainWindow):
         super().closeEvent(event)
 
 def main():
-    # 최소한의 설정으로 빠른 시작
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    
     single_app = SingleApplication()
     if single_app.is_running():
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
     single_app.start_server()
-    
     viewer = ImageViewer()
     single_app.set_file_received_callback(viewer.load_path)
-    
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
-    
     viewer.show()
     sys.exit(app.exec_())
 
