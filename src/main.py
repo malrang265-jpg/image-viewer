@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
                             QListWidget, QListWidgetItem, QMessageBox,
                             QListView)
-from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
@@ -772,6 +772,10 @@ class ImageViewer(QMainWindow):
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
+        # 드래그 관련
+        self.dragging = False
+        self.drag_start_pos = None
+        self.window_start_pos = None
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -821,8 +825,8 @@ class ImageViewer(QMainWindow):
         self.setWindowTitle('Pekoviewer')
         self.setMinimumSize(400, 300)
         self.setAcceptDrops(True)
-        # 제목 표시줄 제거 (프레임리스 창)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # 제목 표시줄 제거
+        self.setWindowFlags(Qt.FramelessWindowHint)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -857,7 +861,8 @@ class ImageViewer(QMainWindow):
         key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
         close_shortcuts = self.settings.get_shortcuts('close_program')
         if key_sequence in close_shortcuts:
-            self.close()
+            # 종료 지연 추가
+            QTimer.singleShot(100, self.close)
             event.accept()
             return
         shortcut_actions = {
@@ -913,7 +918,6 @@ class ImageViewer(QMainWindow):
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
     
     def save_settings(self):
-        # 전체화면이 아닐 때만 위치 저장
         if not self.isFullScreen():
             geometry = self.saveGeometry().toBase64().data().decode()
             self.settings.set('window_geometry', geometry)
@@ -1110,7 +1114,8 @@ class ImageViewer(QMainWindow):
             self.showFullScreen()
     
     def close_program(self):
-        self.close()
+        # 종료 지연
+        QTimer.singleShot(100, self.close)
     
     def show_image_list_dialog(self):
         if not self.image_list:
@@ -1235,13 +1240,16 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
-        # 모든 마우스 버튼을 설정된 단축키로만 처리
-        button_text = ''
+        # 드래그 시작 (왼쪽 버튼)
         if event.button() == Qt.LeftButton:
-            button_text = 'Left Click'
-        elif event.button() == Qt.RightButton:
-            button_text = 'Right Click'
-        elif event.button() == Qt.MiddleButton:
+            self.dragging = True
+            self.drag_start_pos = event.globalPos()
+            self.window_start_pos = self.pos()
+            event.accept()
+            return
+        
+        button_text = ''
+        if event.button() == Qt.MiddleButton:
             button_text = 'Middle Click'
         elif event.button() == Qt.XButton1:
             button_text = 'XButton1'
@@ -1253,8 +1261,29 @@ class ImageViewer(QMainWindow):
         
         super().mousePressEvent(event)
     
+    def mouseMoveEvent(self, event: QMouseEvent):
+        # 드래그로 창 이동
+        if self.dragging and self.drag_start_pos:
+            delta = event.globalPos() - self.drag_start_pos
+            self.move(self.window_start_pos + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        # 드래그 종료
+        if event.button() == Qt.LeftButton and self.dragging:
+            self.dragging = False
+            self.drag_start_pos = None
+            self.window_start_pos = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+    
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
+            # 더블클릭은 드래그가 아니라 단축키로 처리
+            self.dragging = False
             self.check_mouse_shortcut('Left Double Click')
         super().mouseDoubleClickEvent(event)
     
@@ -1264,7 +1293,6 @@ class ImageViewer(QMainWindow):
             self.update_image_display()
     
     def closeEvent(self, event: QCloseEvent):
-        # 전체화면이 아닐 때만 위치 저장
         if not self.isFullScreen():
             self.save_settings()
         self.stop_current_movie()
