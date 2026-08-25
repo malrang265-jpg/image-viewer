@@ -6,8 +6,12 @@ import threading
 import re
 import ctypes
 import ctypes.wintypes
+import concurrent.futures
 from io import BytesIO
 from collections import OrderedDict
+
+# OpenGL 가속 설정
+os.environ['QT_OPENGL'] = 'software'
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
@@ -144,7 +148,7 @@ class Settings:
             'slideshow_interval': 3,
             'slideshow_mode': 'time',
             'slideshow_gif_loops': 2,
-            'cache_size': 100,
+            'cache_size': 200,  # 캐시 크기 증가
             'preload_next': True,
             'shortcuts': {
                 'next_image': ['Right', ''],
@@ -190,6 +194,9 @@ class Settings:
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     ANIMATED_FORMATS = {'.gif', '.webp'}
+    
+    # 스레드 풀 (병렬 이미지 로딩)
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     
     @staticmethod
     def is_supported(filename):
@@ -237,6 +244,15 @@ class ImageLoader:
         return None
     
     @staticmethod
+    def load_pixmap_async(filepath, callback, saturation=100, brightness=100, contrast=100):
+        """비동기 이미지 로딩"""
+        def load():
+            return ImageLoader.load_pixmap(filepath, saturation=saturation, brightness=brightness, contrast=contrast)
+        
+        future = ImageLoader._executor.submit(load)
+        future.add_done_callback(lambda f: callback(f.result()))
+    
+    @staticmethod
     def load_thumbnail(filepath, size=(150, 150)):
         try:
             pixmap = QPixmap(filepath)
@@ -257,7 +273,7 @@ class ImageLoader:
         return None
 
 class CacheManager:
-    def __init__(self, max_size=100):
+    def __init__(self, max_size=200):
         self.max_size = max_size
         self.cache = OrderedDict()
         self.lock = threading.Lock()
@@ -754,7 +770,7 @@ class ImageViewer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = Settings()
-        self.cache_manager = CacheManager(self.settings.get('cache_size', 100))
+        self.cache_manager = CacheManager(self.settings.get('cache_size', 200))
         self.slideshow = QTimer()
         self.slideshow.timeout.connect(self.next_image)
         self.slideshow_playing = False
@@ -1446,6 +1462,8 @@ class ImageViewer(QMainWindow):
 
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseOpenGLES)
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     single_app = SingleApplication()
