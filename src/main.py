@@ -106,14 +106,20 @@ class Settings:
         self._initialized = True
         app_dir = get_app_dir()
         self.settings_file = os.path.join(app_dir, 'pekoviewer_settings.json')
-        self.data = self.load()
+        
+        # 설정 파일이 없으면 새로 생성
+        if not os.path.exists(self.settings_file):
+            self.data = self.default_settings()
+            self.save()
+        else:
+            self.load()
     
     def load(self):
         try:
             with open(self.settings_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                self.data = json.load(f)
         except:
-            return self.default_settings()
+            self.data = self.default_settings()
     
     def save(self):
         try:
@@ -1223,21 +1229,16 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
-        # XButton1/XButton2 우선 처리 (다른 프로그램에 영향 없도록)
-        if event.button() == Qt.XButton1:
-            self.prev_image()
-            event.accept()
-            return
-        elif event.button() == Qt.XButton2:
-            self.next_image()
-            event.accept()
-            return
-        
+        # 마우스 단축키 확인 (XButton1/2 차단 없음 - 기본 동작 허용)
         button_text = ''
         if event.button() == Qt.LeftButton:
             button_text = 'Left Click'
         elif event.button() == Qt.MiddleButton:
             button_text = 'Middle Click'
+        elif event.button() == Qt.XButton1:
+            button_text = 'XButton1'
+        elif event.button() == Qt.XButton2:
+            button_text = 'XButton2'
         
         if button_text:
             self.check_mouse_shortcut(button_text)
