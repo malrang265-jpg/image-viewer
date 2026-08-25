@@ -1,4 +1,4 @@
-name: Build
+name: Build Portable
 
 on:
   push:
@@ -17,14 +17,21 @@ jobs:
         python-version: '3.11'
     
     - name: Install
-      run: pip install PyQt5 Pillow pyinstaller
+      run: |
+        pip install PyQt5 Pillow pyinstaller
     
-    - name: Build
+    - name: Build (폴더 형태)
       working-directory: src
-      run: pyinstaller --windowed --name Pekoviewer main.py
+      run: |
+        pyinstaller --windowed --name Pekoviewer main.py
     
-    - name: Upload folder
+    - name: Create ZIP
+      shell: powershell
+      run: |
+        Compress-Archive -Path "src\dist\Pekoviewer\*" -DestinationPath "Pekoviewer_Portable.zip"
+    
+    - name: Upload
       uses: actions/upload-artifact@v5
       with:
         name: Pekoviewer_Portable
-        path: src/dist/Pekoviewer/
+        path: Pekoviewer_Portable.zip
