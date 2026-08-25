@@ -1,4 +1,4 @@
-name: Build Portable with Icon
+name: Build Optimized Pekoviewer
 
 on:
   push:
@@ -12,28 +12,30 @@ jobs:
     steps:
     - uses: actions/checkout@v5
     
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~\AppData\Local\pip\Cache
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+    
     - uses: actions/setup-python@v6
       with:
-        python-version: '3.11'
+        python-version: '3.13'
+        cache: 'pip'
     
-    - name: Install
-      run: pip install PyQt5 Pillow pyinstaller
+    - name: Install optimized packages
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt5 Pillow pyinstaller nuitka cython zstandard
     
-    - name: Build
+    - name: Build with Nuitka (fastest)
       working-directory: src
       shell: cmd
       run: |
-        if exist icon.ico (
-          pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm main.py
-        ) else if exist ..\icon.ico (
-          copy ..\icon.ico .
-          pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm main.py
-        ) else (
-          pyinstaller --windowed --name Pekoviewer --noconfirm main.py
-        )
+        python -m nuitka --mingw64 --windows-disable-console --standalone --enable-plugin=pyqt5 --output-dir=dist --output-filename=Pekoviewer.exe main.py
     
-    - name: Upload folder
+    - name: Upload
       uses: actions/upload-artifact@v5
       with:
-        name: Pekoviewer_Portable
-        path: src/dist/Pekoviewer/
+        name: Pekoviewer_Optimized
+        path: src/dist/
