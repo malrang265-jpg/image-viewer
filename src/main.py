@@ -107,7 +107,6 @@ class Settings:
         app_dir = get_app_dir()
         self.settings_file = os.path.join(app_dir, 'pekoviewer_settings.json')
         
-        # 설정 파일이 없으면 새로 생성
         if not os.path.exists(self.settings_file):
             self.data = self.default_settings()
             self.save()
@@ -142,8 +141,8 @@ class Settings:
             'preload_next': True,
             'associated_extensions': [],
             'shortcuts': {
-                'next_image': ['Right', 'XButton2'],
-                'prev_image': ['Left', 'XButton1'],
+                'next_image': ['Right', ''],
+                'prev_image': ['Left', ''],
                 'zoom_in': ['Up', ''],
                 'zoom_out': ['Down', ''],
                 'toggle_actual_size': ['0', ''],
@@ -822,6 +821,9 @@ class ImageViewer(QMainWindow):
         self.setWindowTitle('Pekoviewer')
         self.setMinimumSize(400, 300)
         self.setAcceptDrops(True)
+        # 제목 표시줄 제거 (프레임리스 창)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
@@ -907,12 +909,14 @@ class ImageViewer(QMainWindow):
     
     def load_settings(self):
         geometry = self.settings.get('window_geometry')
-        if geometry:
+        if geometry and not self.isFullScreen():
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
     
     def save_settings(self):
-        geometry = self.saveGeometry().toBase64().data().decode()
-        self.settings.set('window_geometry', geometry)
+        # 전체화면이 아닐 때만 위치 저장
+        if not self.isFullScreen():
+            geometry = self.saveGeometry().toBase64().data().decode()
+            self.settings.set('window_geometry', geometry)
     
     def load_path(self, path):
         self.bring_to_front()
@@ -1218,6 +1222,8 @@ class ImageViewer(QMainWindow):
         self.cache_manager = CacheManager(cache_size)
         interval = self.settings.get('slideshow_interval', 3)
         self.slideshow.setInterval(interval * 1000)
+        self.slideshow_mode = self.settings.get('slideshow_mode', 'time')
+        self.gif_max_loops = self.settings.get('slideshow_gif_loops', 2)
         if self.image_list:
             self.show_current_image()
     
@@ -1229,10 +1235,12 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
-        # 마우스 단축키 확인 (XButton1/2 차단 없음 - 기본 동작 허용)
+        # 모든 마우스 버튼을 설정된 단축키로만 처리
         button_text = ''
         if event.button() == Qt.LeftButton:
             button_text = 'Left Click'
+        elif event.button() == Qt.RightButton:
+            button_text = 'Right Click'
         elif event.button() == Qt.MiddleButton:
             button_text = 'Middle Click'
         elif event.button() == Qt.XButton1:
@@ -1256,7 +1264,9 @@ class ImageViewer(QMainWindow):
             self.update_image_display()
     
     def closeEvent(self, event: QCloseEvent):
-        self.save_settings()
+        # 전체화면이 아닐 때만 위치 저장
+        if not self.isFullScreen():
+            self.save_settings()
         self.stop_current_movie()
         self.slideshow.stop()
         super().closeEvent(event)
@@ -1281,7 +1291,6 @@ def main():
     
     viewer.show()
     
-    # 더 많은 지연 시간으로 반복 호출
     for delay in [50, 100, 200, 400, 800, 1500]:
         QTimer.singleShot(delay, viewer.force_foreground)
     
