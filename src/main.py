@@ -61,6 +61,15 @@ def get_icon_path():
             return path
     return None
 
+def is_animated_webp(filepath):
+    """WebP가 애니메이션인지 확인"""
+    try:
+        Image = get_pil_image()
+        with Image.open(filepath) as img:
+            return getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
+    except:
+        return False
+
 class SingleApplication:
     def __init__(self, app_name="PekoviewerApp"):
         self.app_name = app_name
@@ -192,7 +201,6 @@ class Settings:
 
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-    ANIMATED_FORMATS = {'.gif', '.webp'}  # WebP도 애니메이션 처리
     
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     
@@ -202,9 +210,12 @@ class ImageLoader:
         return ext in ImageLoader.SUPPORTED_FORMATS
     
     @staticmethod
-    def is_animated(filename):
-        ext = os.path.splitext(filename)[1].lower()
-        return ext in ImageLoader.ANIMATED_FORMATS
+    def is_gif(filename):
+        return os.path.splitext(filename)[1].lower() == '.gif'
+    
+    @staticmethod
+    def is_webp(filename):
+        return os.path.splitext(filename)[1].lower() == '.webp'
     
     @staticmethod
     def load_pixmap(filepath, quality='balanced', saturation=100, brightness=100, contrast=100):
@@ -443,7 +454,7 @@ class ShortcutSettingsDialog(QDialog):
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
         layout = QVBoxLayout(self)
-        info_label = QLabel('버튼 클릭 후 키보드 키 또는 마우스 버튼을 누르세요. ESC 키는 단축키를 삭제합니다.')
+        info_label = QLabel('버튼 클릭 후 키보드 키 또는 마우스 버튼을 누르세요.\n더블클릭: 왼쪽 더블클릭, 더블우클릭: 오른쪽 더블클릭, ESC: 삭제')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         actions = [
@@ -499,7 +510,7 @@ class ShortcutSettingsDialog(QDialog):
         self.capturing = True
         self.current_action = action_key
         self.current_slot = slot
-        button.setText('키/마우스 입력 대기...')
+        button.setText('입력 대기...')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
         self.setFocus()
@@ -538,6 +549,20 @@ class ShortcutSettingsDialog(QDialog):
                 self.stop_capture()
                 return
         super().mousePressEvent(event)
+    
+    def mouseDoubleClickEvent(self, event):
+        if self.capturing and self.current_action:
+            if event.button() == Qt.LeftButton:
+                self.shortcut_buttons[self.current_action][self.current_slot].setText('Left Double Click')
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+                self.stop_capture()
+                return
+            elif event.button() == Qt.RightButton:
+                self.shortcut_buttons[self.current_action][self.current_slot].setText('Right Double Click')
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+                self.stop_capture()
+                return
+        super().mouseDoubleClickEvent(event)
     
     def stop_capture(self):
         self.capturing = False
@@ -1098,8 +1123,10 @@ class ImageViewer(QMainWindow):
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file,
                                                        saturation, brightness, contrast)
             else:
-                # GIF/WebP 애니메이션 처리
-                if ImageLoader.is_animated(current_file):
+                ext = os.path.splitext(current_file)[1].lower()
+                
+                # GIF는 항상 애니메이션
+                if ext == '.gif':
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
                         self.current_movie = movie
@@ -1110,6 +1137,31 @@ class ImageViewer(QMainWindow):
                         QTimer.singleShot(50, self.update_image_display)
                         self.is_loading = False
                         return
+                # WebP는 애니메이션 여부 확인
+                elif ext == '.webp':
+                    if is_animated_webp(current_file):
+                        movie = ImageLoader.load_movie(current_file)
+                        if movie:
+                            self.current_movie = movie
+                            movie.jumpToFrame(0)
+                            self.current_movie_original_size = movie.currentPixmap().size()
+                            self.image_label.setMovie(movie)
+                            movie.start()
+                            QTimer.singleShot(50, self.update_image_display)
+                            self.is_loading = False
+                            return
+                    # 정적 WebP는 일반 이미지로
+                    else:
+                        cache_key = f"{current_file}_{saturation}_{brightness}_{contrast}"
+                        pixmap = self.cache_manager.get(cache_key)
+                        if pixmap is None:
+                            pixmap = ImageLoader.load_pixmap(current_file,
+                                                            saturation=saturation,
+                                                            brightness=brightness,
+                                                            contrast=contrast)
+                            if pixmap and not pixmap.isNull():
+                                self.cache_manager.put(cache_key, pixmap)
+                # 일반 이미지
                 else:
                     cache_key = f"{current_file}_{saturation}_{brightness}_{contrast}"
                     pixmap = self.cache_manager.get(cache_key)
@@ -1437,6 +1489,9 @@ class ImageViewer(QMainWindow):
         if event.button() == Qt.LeftButton:
             self.dragging = False
             self.check_mouse_shortcut('Left Double Click')
+        elif event.button() == Qt.RightButton:
+            self.dragging = False
+            self.check_mouse_shortcut('Right Double Click')
         super().mouseDoubleClickEvent(event)
     
     def resizeEvent(self, event):
@@ -1458,7 +1513,6 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    # 앱 아이콘 설정
     icon_path = get_icon_path()
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))
