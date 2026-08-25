@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QListView, QSlider)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor)
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
 user32 = ctypes.windll.user32
@@ -39,12 +39,6 @@ def get_pil_enhance():
         from PIL import ImageEnhance
         PIL_ImageEnhance = ImageEnhance
     return PIL_ImageEnhance
-
-try:
-    import winreg
-    WINDOWS = True
-except ImportError:
-    WINDOWS = False
 
 def get_app_dir():
     if getattr(sys, 'frozen', False):
@@ -144,9 +138,9 @@ class Settings:
             'fit_to_window': True,
             'snap_enabled': True,
             'snap_threshold': 20,
-            'saturation': 100,  # 채도 (0-200, 100=원본)
-            'brightness': 100,  # 밝기 (0-200, 100=원본)
-            'contrast': 100,    # 명도/대비 (0-200, 100=원본)
+            'saturation': 100,
+            'brightness': 100,
+            'contrast': 100,
             'slideshow_interval': 3,
             'slideshow_mode': 'time',
             'slideshow_gif_loops': 2,
@@ -210,31 +204,34 @@ class ImageLoader:
     @staticmethod
     def load_pixmap(filepath, quality='balanced', saturation=100, brightness=100, contrast=100):
         try:
+            # PIL로 로드 (조절값 적용)
+            Image = get_pil_image()
+            with Image.open(filepath) as img:
+                img = img.convert('RGB')
+                # 채도 조절
+                if saturation != 100:
+                    enhancer = get_pil_enhance().Color(img)
+                    img = enhancer.enhance(saturation / 100.0)
+                # 밝기 조절
+                if brightness != 100:
+                    enhancer = get_pil_enhance().Brightness(img)
+                    img = enhancer.enhance(brightness / 100.0)
+                # 명도/대비 조절
+                if contrast != 100:
+                    enhancer = get_pil_enhance().Contrast(img)
+                    img = enhancer.enhance(contrast / 100.0)
+                
+                data = img.tobytes('raw', 'RGB')
+                qimage = QImage(data, img.width, img.height, QImage.Format_RGB888)
+                return QPixmap.fromImage(qimage.copy())
+        except Exception as e:
+            print(f"PIL 로드 실패: {e}")
+        
+        # QPixmap 폴백
+        try:
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
-                # 조절값이 모두 100이면 원본 반환
-                if saturation == 100 and brightness == 100 and contrast == 100:
-                    return pixmap
-                # PIL로 조절 적용
-                Image = get_pil_image()
-                with Image.open(filepath) as img:
-                    img = img.convert('RGBA')
-                    # 채도 조절
-                    if saturation != 100:
-                        enhancer = get_pil_enhance().Color(img)
-                        img = enhancer.enhance(saturation / 100.0)
-                    # 밝기 조절
-                    if brightness != 100:
-                        enhancer = get_pil_enhance().Brightness(img)
-                        img = enhancer.enhance(brightness / 100.0)
-                    # 명도/대비 조절
-                    if contrast != 100:
-                        enhancer = get_pil_enhance().Contrast(img)
-                        img = enhancer.enhance(contrast / 100.0)
-                    
-                    data = img.tobytes('raw', 'RGBA')
-                    qimage = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
-                    return QPixmap.fromImage(qimage.copy())
+                return pixmap
         except:
             pass
         return None
@@ -328,9 +325,9 @@ class ZipHandler:
                     return pixmap
                 Image = get_pil_image()
                 img = Image.open(BytesIO(data))
-                img = img.convert('RGBA')
-                data_bytes = img.tobytes('raw', 'RGBA')
-                qimage = QImage(data_bytes, img.width, img.height, QImage.Format_RGBA8888)
+                img = img.convert('RGB')
+                data_bytes = img.tobytes('raw', 'RGB')
+                qimage = QImage(data_bytes, img.width, img.height, QImage.Format_RGB888)
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
@@ -588,7 +585,6 @@ class SettingsDialog(QDialog):
         """)
         layout = QVBoxLayout(self)
         
-        # 이미지 표시 설정
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         self.zoom_quality = QComboBox()
@@ -603,7 +599,6 @@ class SettingsDialog(QDialog):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
-        # 이미지 조절 설정
         adjust_group = QGroupBox('이미지 조절')
         adjust_layout = QFormLayout()
         
@@ -634,10 +629,14 @@ class SettingsDialog(QDialog):
         contrast_row.addWidget(self.contrast_label)
         adjust_layout.addRow('명도/대비:', contrast_row)
         
+        # 실시간 미리보기 버튼
+        preview_button = QPushButton('현재 이미지에 적용')
+        preview_button.clicked.connect(self.apply_preview)
+        adjust_layout.addRow('', preview_button)
+        
         adjust_group.setLayout(adjust_layout)
         layout.addWidget(adjust_group)
         
-        # 자석 기능 설정
         snap_group = QGroupBox('창 자석 기능')
         snap_layout = QFormLayout()
         self.snap_enabled = QCheckBox('화면 가장자리에 달라붙기')
@@ -649,19 +648,6 @@ class SettingsDialog(QDialog):
         snap_group.setLayout(snap_layout)
         layout.addWidget(snap_group)
         
-        # 성능 설정
-        performance_group = QGroupBox('성능')
-        performance_layout = QFormLayout()
-        self.cache_size = QSpinBox()
-        self.cache_size.setRange(10, 500)
-        self.cache_size.setSuffix(' 개')
-        performance_layout.addRow('캐시 크기:', self.cache_size)
-        self.preload_next = QCheckBox('다음/이전 이미지 미리 로드')
-        performance_layout.addRow('', self.preload_next)
-        performance_group.setLayout(performance_layout)
-        layout.addWidget(performance_group)
-        
-        # 슬라이드쇼 설정
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
         self.slideshow_mode = QComboBox()
@@ -679,7 +665,6 @@ class SettingsDialog(QDialog):
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
         
-        # 배경색 설정
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
@@ -687,7 +672,6 @@ class SettingsDialog(QDialog):
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
         
-        # 버튼
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -697,13 +681,21 @@ class SettingsDialog(QDialog):
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
         
-        # 슬라이더 값 변경 시 라벨 업데이트
         self.saturation_slider.valueChanged.connect(
             lambda v: self.saturation_label.setText(f'{v}%'))
         self.brightness_slider.valueChanged.connect(
             lambda v: self.brightness_label.setText(f'{v}%'))
         self.contrast_slider.valueChanged.connect(
             lambda v: self.contrast_label.setText(f'{v}%'))
+    
+    def apply_preview(self):
+        """현재 이미지에 조절값 적용"""
+        if self.parent() and hasattr(self.parent(), 'apply_image_adjustments'):
+            self.parent().apply_image_adjustments(
+                self.saturation_slider.value(),
+                self.brightness_slider.value(),
+                self.contrast_slider.value()
+            )
     
     def load_settings(self):
         quality = self.settings.get('zoom_quality', 'balanced')
@@ -712,15 +704,11 @@ class SettingsDialog(QDialog):
             self.zoom_quality.setCurrentIndex(index)
         self.show_filename.setChecked(self.settings.get('show_filename', False))
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
-        
         self.saturation_slider.setValue(self.settings.get('saturation', 100))
         self.brightness_slider.setValue(self.settings.get('brightness', 100))
         self.contrast_slider.setValue(self.settings.get('contrast', 100))
-        
         self.snap_enabled.setChecked(self.settings.get('snap_enabled', True))
         self.snap_threshold.setValue(self.settings.get('snap_threshold', 20))
-        self.cache_size.setValue(self.settings.get('cache_size', 100))
-        self.preload_next.setChecked(self.settings.get('preload_next', True))
         mode = self.settings.get('slideshow_mode', 'time')
         index = self.slideshow_mode.findData(mode)
         if index >= 0:
@@ -749,8 +737,6 @@ class SettingsDialog(QDialog):
         self.settings.set('contrast', self.contrast_slider.value())
         self.settings.set('snap_enabled', self.snap_enabled.isChecked())
         self.settings.set('snap_threshold', self.snap_threshold.value())
-        self.settings.set('cache_size', self.cache_size.value())
-        self.settings.set('preload_next', self.preload_next.isChecked())
         self.settings.set('slideshow_mode', self.slideshow_mode.currentData())
         self.settings.set('slideshow_interval', self.slideshow_interval.value())
         self.settings.set('slideshow_gif_loops', self.slideshow_gif_loops.value())
@@ -886,6 +872,15 @@ class ImageViewer(QMainWindow):
             QLabel {{ background-color: transparent; }}
         """)
     
+    def apply_image_adjustments(self, saturation, brightness, contrast):
+        """이미지 조절값 적용"""
+        self.settings.set('saturation', saturation)
+        self.settings.set('brightness', brightness)
+        self.settings.set('contrast', contrast)
+        self.cache_manager.clear()
+        if self.image_list:
+            self.show_current_image()
+    
     def get_resize_region(self, pos):
         x, y = pos.x(), pos.y()
         w, h = self.width(), self.height()
@@ -998,11 +993,6 @@ class ImageViewer(QMainWindow):
                 if y + h > screen.bottom():
                     y = max(screen.top(), screen.bottom() - h)
                 self.setGeometry(x, y, w, h)
-            else:
-                try:
-                    self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
-                except:
-                    pass
     
     def save_settings(self):
         if not self.isFullScreen():
@@ -1105,13 +1095,13 @@ class ImageViewer(QMainWindow):
                         self.is_loading = False
                         return
                 else:
-                    cache_key = current_file
+                    cache_key = f"{current_file}_{self.settings.get('saturation',100)}_{self.settings.get('brightness',100)}_{self.settings.get('contrast',100)}"
                     pixmap = self.cache_manager.get(cache_key)
                     if pixmap is None:
                         saturation = self.settings.get('saturation', 100)
                         brightness = self.settings.get('brightness', 100)
                         contrast = self.settings.get('contrast', 100)
-                        pixmap = ImageLoader.load_pixmap(current_file, 
+                        pixmap = ImageLoader.load_pixmap(current_file,
                                                         saturation=saturation,
                                                         brightness=brightness,
                                                         contrast=contrast)
@@ -1123,9 +1113,19 @@ class ImageViewer(QMainWindow):
                     pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
                 self.current_pixmap = pixmap
                 self.original_pixmap = pixmap
-                # 이미지를 먼저 로드한 후 크기 조절
-                self.image_label.setPixmap(pixmap)
-                self.update_image_display()
+                
+                # 이미지를 먼저 표시
+                if self.fit_to_window:
+                    scaled_pixmap = pixmap.scaled(
+                        self.scroll_area.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                    self.image_label.setPixmap(scaled_pixmap)
+                else:
+                    self.image_label.setPixmap(pixmap)
+                self.image_label.adjustSize()
+                
                 if self.settings.get('show_filename', False):
                     display_name = os.path.basename(current_file) if not self.current_zip else current_file
                     self.filename_label.setText(display_name)
@@ -1315,22 +1315,14 @@ class ImageViewer(QMainWindow):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec_():
             self.apply_background_color()
-            self.apply_settings()
+            self.cache_manager.clear()
+            if self.image_list:
+                self.show_current_image()
     
     def show_shortcut_settings(self):
         dialog = ShortcutSettingsDialog(self.settings, self)
         if dialog.exec_():
             pass
-    
-    def apply_settings(self):
-        cache_size = self.settings.get('cache_size', 100)
-        self.cache_manager = CacheManager(cache_size)
-        interval = self.settings.get('slideshow_interval', 3)
-        self.slideshow.setInterval(interval * 1000)
-        self.slideshow_mode = self.settings.get('slideshow_mode', 'time')
-        self.gif_max_loops = self.settings.get('slideshow_gif_loops', 2)
-        if self.image_list:
-            self.show_current_image()
     
     def wheelEvent(self, event: QWheelEvent):
         if event.angleDelta().y() > 0:
