@@ -1,4 +1,4 @@
-name: Build Pekoviewer EXE
+name: Build Pekoviewer
 
 on:
   push:
@@ -16,42 +16,33 @@ jobs:
       with:
         python-version: '3.11'
     
-    - name: Debug - List files
-      shell: cmd
-      run: |
-        echo Current directory:
-        cd
-        echo Files:
-        dir /b
-        echo src folder:
-        if exist src dir /b src
-    
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install PyQt5 Pillow pyinstaller
     
-    - name: Build EXE
+    - name: Build EXE (폴더 형태)
       shell: cmd
       run: |
-        if exist main.py (
-          if exist icon.ico (
-            pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer main.py
-          ) else (
-            pyinstaller --onefile --windowed --name Pekoviewer main.py
-          )
-        ) else if exist src\main.py (
-          if exist icon.ico (
-            pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer src\main.py
-          ) else (
-            pyinstaller --onefile --windowed --name Pekoviewer src\main.py
-          )
+        if exist icon.ico (
+          pyinstaller --windowed --icon=icon.ico --name Pekoviewer main.py
         ) else (
-          echo ERROR: main.py not found
-          exit 1
+          pyinstaller --windowed --name Pekoviewer main.py
         )
     
-    - uses: actions/upload-artifact@v5
+    - name: ZIP으로 압축 (폴더 전체)
+      shell: powershell
+      run: |
+        Compress-Archive -Path "dist\Pekoviewer\*" -DestinationPath "dist\Pekoviewer_Portable.zip"
+    
+    - name: Upload ZIP
+      uses: actions/upload-artifact@v5
       with:
-        name: Pekoviewer
-        path: dist/Pekoviewer.exe
+        name: Pekoviewer_Portable
+        path: dist/Pekoviewer_Portable.zip
+    
+    - name: Upload EXE (개별 다운로드용)
+      uses: actions/upload-artifact@v5
+      with:
+        name: Pekoviewer_exe_only
+        path: dist/Pekoviewer/Pekoviewer.exe
