@@ -830,15 +830,17 @@ class ImageViewer(QMainWindow):
                 self.windowHandle().setIcon(icon)
     
     def hide_cursor(self):
-        if self.isFullScreen():
-            QApplication.setOverrideCursor(Qt.BlankCursor)
+        if self.isFullScreen() and not self.cursor_hidden:
+            self.setCursor(Qt.BlankCursor)
             self.cursor_hidden = True
             self.cursor_start_pos = None
     
     def show_cursor(self):
-        QApplication.restoreOverrideCursor()
-        self.cursor_hidden = False
-        self.cursor_start_pos = None
+        if self.cursor_hidden:
+            self.unsetCursor()
+            self.setCursor(Qt.ArrowCursor)
+            self.cursor_hidden = False
+            self.cursor_start_pos = None
     
     def reset_cursor_timer(self):
         if self.isFullScreen():
@@ -969,16 +971,13 @@ class ImageViewer(QMainWindow):
         elif region in ['topright', 'bottomleft']:
             self.setCursor(Qt.SizeBDiagCursor)
         else:
-            # 완전한 원상 복귀
             self.unsetCursor()
-            QApplication.restoreOverrideCursor()
             self.setCursor(Qt.ArrowCursor)
     
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
             if self.isFullScreen():
-                QApplication.restoreOverrideCursor()
-                self.cursor_hidden = False
+                self.show_cursor()
                 self.showNormal()
                 self.cursor_hide_timer.stop()
                 event.accept()
@@ -1316,8 +1315,7 @@ class ImageViewer(QMainWindow):
     
     def toggle_fullscreen(self):
         if self.isFullScreen():
-            QApplication.restoreOverrideCursor()
-            self.cursor_hidden = False
+            self.show_cursor()
             self.showNormal()
             self.cursor_hide_timer.stop()
         else:
@@ -1435,6 +1433,7 @@ class ImageViewer(QMainWindow):
             pass
     
     def wheelEvent(self, event: QWheelEvent):
+        self.show_cursor()
         self.reset_cursor_timer()
         if event.angleDelta().y() > 0:
             self.prev_image()
@@ -1443,6 +1442,7 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
+        self.show_cursor()
         self.reset_cursor_timer()
         region = self.get_resize_region(event.pos())
         if event.button() == Qt.LeftButton and region:
@@ -1470,7 +1470,6 @@ class ImageViewer(QMainWindow):
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        # 마우스가 숨겨져 있으면 거리 측정
         if self.cursor_hidden and self.isFullScreen():
             if self.cursor_start_pos is None:
                 self.cursor_start_pos = event.globalPos()
@@ -1509,6 +1508,7 @@ class ImageViewer(QMainWindow):
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event: QMouseEvent):
+        self.show_cursor()
         self.reset_cursor_timer()
         if event.button() == Qt.LeftButton and self.resizing:
             self.resizing = False
@@ -1516,7 +1516,6 @@ class ImageViewer(QMainWindow):
             self.resize_start_size = None
             self.resize_region = None
             self.unsetCursor()
-            QApplication.restoreOverrideCursor()
             self.setCursor(Qt.ArrowCursor)
             event.accept()
             return
@@ -1529,6 +1528,7 @@ class ImageViewer(QMainWindow):
         super().mouseReleaseEvent(event)
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
+        self.show_cursor()
         self.reset_cursor_timer()
         if event.button() == Qt.LeftButton:
             self.dragging = False
@@ -1544,7 +1544,7 @@ class ImageViewer(QMainWindow):
             self.update_image_display()
     
     def closeEvent(self, event: QCloseEvent):
-        QApplication.restoreOverrideCursor()
+        self.show_cursor()
         if self.isFullScreen():
             self.showNormal()
         if not self.isFullScreen():
