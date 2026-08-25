@@ -7,6 +7,7 @@ import re
 import ctypes
 import ctypes.wintypes
 import concurrent.futures
+import time as time_module
 from io import BytesIO
 from collections import OrderedDict
 
@@ -434,7 +435,6 @@ class ShortcutSettingsDialog(QDialog):
         self.capture_timer.setSingleShot(True)
         self.capture_timer.timeout.connect(self.finish_capture)
         self.captured_keys = []
-        self.double_click_detected = False
         self.init_ui()
         self.load_shortcuts()
     
@@ -507,7 +507,6 @@ class ShortcutSettingsDialog(QDialog):
         self.current_action = action_key
         self.current_slot = slot
         self.captured_keys = []
-        self.double_click_detected = False
         button.setText('입력 중... (1초)')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
@@ -526,7 +525,6 @@ class ShortcutSettingsDialog(QDialog):
             self.current_action = None
             self.current_slot = 0
             self.captured_keys = []
-            self.double_click_detected = False
             self.releaseKeyboard()
     
     def keyPressEvent(self, event):
@@ -541,7 +539,6 @@ class ShortcutSettingsDialog(QDialog):
                 self.current_action = None
                 self.current_slot = 0
                 self.captured_keys = []
-                self.double_click_detected = False
                 self.releaseKeyboard()
                 return
             key_sequence = QKeySequence(modifiers | key).toString()
@@ -569,10 +566,10 @@ class ShortcutSettingsDialog(QDialog):
         if self.capturing and self.current_action:
             if event.button() == Qt.LeftButton:
                 if 'Left Double Click' not in self.captured_keys:
-                    self.captured_keys.insert(0, 'Left Double Click')  # 맨 앞에 추가
+                    self.captured_keys.insert(0, 'Left Double Click')
             elif event.button() == Qt.RightButton:
                 if 'Right Double Click' not in self.captured_keys:
-                    self.captured_keys.insert(0, 'Right Double Click')  # 맨 앞에 추가
+                    self.captured_keys.insert(0, 'Right Double Click')
         super().mouseDoubleClickEvent(event)
     
     def reset_defaults(self):
@@ -803,10 +800,10 @@ class ImageViewer(QMainWindow):
         self.resize_start_pos = None
         self.resize_start_size = None
         self.resize_region = None
-        self.resize_margin = 8
+        self.resize_margin = 12  # 12픽셀로 변경
         # 마우스 숨김 관련
         self.cursor_hidden = False
-        self.cursor_move_start_time = None
+        self.cursor_start_pos = None
         self.cursor_hide_timer = QTimer()
         self.cursor_hide_timer.setSingleShot(True)
         self.cursor_hide_timer.timeout.connect(self.hide_cursor)
@@ -837,11 +834,12 @@ class ImageViewer(QMainWindow):
         if self.isFullScreen():
             self.setCursor(Qt.BlankCursor)
             self.cursor_hidden = True
+            self.cursor_start_pos = None
     
     def show_cursor(self):
         self.unsetCursor()
         self.cursor_hidden = False
-        self.cursor_move_start_time = None
+        self.cursor_start_pos = None
     
     def reset_cursor_timer(self):
         if self.isFullScreen():
@@ -972,7 +970,7 @@ class ImageViewer(QMainWindow):
         elif region in ['topright', 'bottomleft']:
             self.setCursor(Qt.SizeBDiagCursor)
         else:
-            self.unsetCursor()
+            self.unsetCursor()  # 확실히 원상 복귀
     
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
@@ -1468,13 +1466,14 @@ class ImageViewer(QMainWindow):
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        # 마우스가 숨겨져 있으면 움직임 감지
+        # 마우스가 숨겨져 있으면 거리 측정
         if self.cursor_hidden and self.isFullScreen():
-            if self.cursor_move_start_time is None:
-                self.cursor_move_start_time = __import__('time').time()
+            if self.cursor_start_pos is None:
+                self.cursor_start_pos = event.globalPos()
             else:
-                elapsed = __import__('time').time() - self.cursor_move_start_time
-                if elapsed >= 0.3:  # 0.3초 이상 움직이면
+                delta = event.globalPos() - self.cursor_start_pos
+                distance = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+                if distance >= 20:  # 20픽셀 이상 움직이면
                     self.show_cursor()
                     self.reset_cursor_timer()
         else:
