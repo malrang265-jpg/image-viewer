@@ -192,7 +192,7 @@ class Settings:
 
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-    ANIMATED_FORMATS = {'.gif', '.webp'}
+    ANIMATED_FORMATS = {'.gif'}  # WebP는 정적 이미지로 처리
     
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     
@@ -523,33 +523,6 @@ class ShortcutSettingsDialog(QDialog):
                 return
         super().keyPressEvent(event)
     
-    def mousePressEvent(self, event):
-        if self.capturing and self.current_action:
-            button = event.button()
-            mouse_buttons = {
-                Qt.LeftButton: 'Left Click',
-                Qt.RightButton: 'Right Click',
-                Qt.MiddleButton: 'Middle Click',
-                Qt.XButton1: 'XButton1',
-                Qt.XButton2: 'XButton2'
-            }
-            if button in mouse_buttons:
-                button_text = mouse_buttons[button]
-                self.shortcut_buttons[self.current_action][self.current_slot].setText(button_text)
-                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
-                return
-        super().mousePressEvent(event)
-    
-    def mouseDoubleClickEvent(self, event):
-        if self.capturing and self.current_action:
-            if event.button() == Qt.LeftButton:
-                self.shortcut_buttons[self.current_action][self.current_slot].setText('Left Double Click')
-                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
-                return
-        super().mouseDoubleClickEvent(event)
-    
     def stop_capture(self):
         self.capturing = False
         self.current_action = None
@@ -796,8 +769,10 @@ class ImageViewer(QMainWindow):
         if icon_path:
             icon = QIcon(icon_path)
             self.setWindowIcon(icon)
-            if self.windowHandle():
-                self.windowHandle().setIcon(icon)
+            # 아이콘을 강제로 적용
+            app = QApplication.instance()
+            if app:
+                app.setWindowIcon(icon)
     
     def showEvent(self, event):
         super().showEvent(event)
@@ -937,14 +912,14 @@ class ImageViewer(QMainWindow):
             self.unsetCursor()
     
     def keyPressEvent(self, event: QKeyEvent):
-        key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
-        
         # ESC로 전체화면 종료
-        if event.key() == Qt.Key_Escape and self.isFullScreen():
-            self.showNormal()
-            event.accept()
-            return
+        if event.key() == Qt.Key_Escape:
+            if self.isFullScreen():
+                self.showNormal()
+                event.accept()
+                return
         
+        key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
         close_shortcuts = self.settings.get_shortcuts('close_program')
         if key_sequence in close_shortcuts:
             QTimer.singleShot(150, self.close)
@@ -1017,6 +992,7 @@ class ImageViewer(QMainWindow):
                 self.setGeometry(x, y, w, h)
     
     def save_settings(self):
+        # 전체화면이면 저장 안 함
         if not self.isFullScreen():
             pos = self.pos()
             size = self.size()
@@ -1110,7 +1086,7 @@ class ImageViewer(QMainWindow):
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file,
                                                        saturation, brightness, contrast)
             else:
-                # WebP/GIF 애니메이션 확인
+                # GIF만 애니메이션으로 처리, WebP는 정적 이미지로 처리
                 if ImageLoader.is_animated(current_file):
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
@@ -1184,7 +1160,7 @@ class ImageViewer(QMainWindow):
                 self.gif_loop_count = 0
     
     def update_image_display(self):
-        # GIF/WebP 애니메이션 처리
+        # GIF 애니메이션 처리
         if self.current_movie:
             try:
                 if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
@@ -1457,8 +1433,14 @@ class ImageViewer(QMainWindow):
             self.update_image_display()
     
     def closeEvent(self, event: QCloseEvent):
+        # 전체화면이면 먼저 해제
+        if self.isFullScreen():
+            self.showNormal()
+        
+        # 창 모드 위치만 저장
         if not self.isFullScreen():
             self.save_settings()
+        
         self.stop_current_movie()
         self.slideshow.stop()
         super().closeEvent(event)
@@ -1467,6 +1449,12 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    
+    # 앱 아이콘 설정
+    icon_path = get_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
+    
     single_app = SingleApplication()
     if single_app.is_running():
         if len(sys.argv) > 1:
