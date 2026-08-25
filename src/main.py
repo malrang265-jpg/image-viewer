@@ -62,7 +62,6 @@ def get_icon_path():
     return None
 
 def is_animated_webp(filepath):
-    """WebP가 애니메이션인지 확인"""
     try:
         Image = get_pil_image()
         with Image.open(filepath) as img:
@@ -208,14 +207,6 @@ class ImageLoader:
     def is_supported(filename):
         ext = os.path.splitext(filename)[1].lower()
         return ext in ImageLoader.SUPPORTED_FORMATS
-    
-    @staticmethod
-    def is_gif(filename):
-        return os.path.splitext(filename)[1].lower() == '.gif'
-    
-    @staticmethod
-    def is_webp(filename):
-        return os.path.splitext(filename)[1].lower() == '.webp'
     
     @staticmethod
     def load_pixmap(filepath, quality='balanced', saturation=100, brightness=100, contrast=100):
@@ -454,7 +445,7 @@ class ShortcutSettingsDialog(QDialog):
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
         layout = QVBoxLayout(self)
-        info_label = QLabel('버튼 클릭 후 키보드 키 또는 마우스 버튼을 누르세요.\n더블클릭: 왼쪽 더블클릭, 더블우클릭: 오른쪽 더블클릭, ESC: 삭제')
+        info_label = QLabel('버튼 클릭 후 키보드 또는 마우스를 누르세요.\n왼쪽 더블클릭: Left Double Click, 오른쪽 더블클릭: Right Double Click, ESC: 삭제')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         actions = [
@@ -799,6 +790,7 @@ class ImageViewer(QMainWindow):
         self.resize_start_size = None
         self.resize_region = None
         self.resize_margin = 8
+        self.foreground_done = False  # 맨위로 한번만
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -827,8 +819,10 @@ class ImageViewer(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
-        QTimer.singleShot(0, self.force_foreground)
-        QTimer.singleShot(100, self.force_foreground)
+        # 한번만 force_foreground 호출
+        if not self.foreground_done:
+            self.foreground_done = True
+            QTimer.singleShot(200, self.force_foreground)
     
     def force_foreground(self):
         try:
@@ -1125,7 +1119,6 @@ class ImageViewer(QMainWindow):
             else:
                 ext = os.path.splitext(current_file)[1].lower()
                 
-                # GIF는 항상 애니메이션
                 if ext == '.gif':
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
@@ -1137,7 +1130,6 @@ class ImageViewer(QMainWindow):
                         QTimer.singleShot(50, self.update_image_display)
                         self.is_loading = False
                         return
-                # WebP는 애니메이션 여부 확인
                 elif ext == '.webp':
                     if is_animated_webp(current_file):
                         movie = ImageLoader.load_movie(current_file)
@@ -1150,7 +1142,6 @@ class ImageViewer(QMainWindow):
                             QTimer.singleShot(50, self.update_image_display)
                             self.is_loading = False
                             return
-                    # 정적 WebP는 일반 이미지로
                     else:
                         cache_key = f"{current_file}_{saturation}_{brightness}_{contrast}"
                         pixmap = self.cache_manager.get(cache_key)
@@ -1161,7 +1152,6 @@ class ImageViewer(QMainWindow):
                                                             contrast=contrast)
                             if pixmap and not pixmap.isNull():
                                 self.cache_manager.put(cache_key, pixmap)
-                # 일반 이미지
                 else:
                     cache_key = f"{current_file}_{saturation}_{brightness}_{contrast}"
                     pixmap = self.cache_manager.get(cache_key)
@@ -1224,7 +1214,6 @@ class ImageViewer(QMainWindow):
                 self.gif_loop_count = 0
     
     def update_image_display(self):
-        # GIF/WebP 애니메이션 처리
         if self.current_movie:
             try:
                 if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
@@ -1246,7 +1235,6 @@ class ImageViewer(QMainWindow):
                 pass
             return
         
-        # 일반 이미지 처리
         if self.current_pixmap:
             if self.fit_to_window:
                 scaled = self.current_pixmap.scaled(
@@ -1528,8 +1516,8 @@ def main():
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
     viewer.show()
-    for delay in [50, 100, 200, 400, 800, 1500]:
-        QTimer.singleShot(delay, viewer.force_foreground)
+    # 한번만 force_foreground 호출
+    QTimer.singleShot(200, viewer.force_foreground)
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
