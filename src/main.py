@@ -770,7 +770,7 @@ class ImageViewer(QMainWindow):
             QLabel {{ background-color: transparent; }}
         """)
     
-        def keyPressEvent(self, event: QKeyEvent):
+    def keyPressEvent(self, event: QKeyEvent):
         key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
         
         # 종료 단축키 먼저 확인
