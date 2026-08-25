@@ -139,12 +139,10 @@ class Settings:
         self.save()
 
 class FileAssociationManager:
-    """Windows 파일 연결 관리"""
     SUPPORTED_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.zip']
     
     @staticmethod
     def get_current_associations():
-        """현재 연결된 확장자 목록 반환"""
         associated = []
         if not WINDOWS:
             return associated
@@ -161,7 +159,6 @@ class FileAssociationManager:
                     prog_id, _ = winreg.QueryValueEx(key, "ProgId")
                     winreg.CloseKey(key)
                     
-                    # 현재 프로그램에 연결되어 있는지 확인
                     if 'Pekoviewer' in prog_id:
                         associated.append(ext)
                 except:
@@ -173,7 +170,6 @@ class FileAssociationManager:
     
     @staticmethod
     def associate_extensions(extensions):
-        """확장자 연결"""
         if not WINDOWS:
             return False
         
@@ -183,25 +179,20 @@ class FileAssociationManager:
         
         try:
             for ext in extensions:
-                # ProgID 생성
                 prog_id = f"Pekoviewer{ext.replace('.', '')}"
                 
-                # ProgID 등록
                 key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}")
                 winreg.SetValue(key, "", winreg.REG_SZ, f"Pekoviewer {ext} File")
                 winreg.CloseKey(key)
                 
-                # 아이콘 설정
                 key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\DefaultIcon")
                 winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}",0')
                 winreg.CloseKey(key)
                 
-                # 실행 명령
                 key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open\\command")
                 winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}" "%1"')
                 winreg.CloseKey(key)
                 
-                # UserChoice 설정
                 try:
                     key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, 
                                           f"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\{ext}\\UserChoice")
@@ -217,7 +208,6 @@ class FileAssociationManager:
     
     @staticmethod
     def disassociate_extensions(extensions):
-        """확장자 연결 해제"""
         if not WINDOWS:
             return False
         
@@ -692,7 +682,6 @@ class SettingsDialog(QDialog):
         """)
         layout = QVBoxLayout(self)
         
-        # 파일 연결 설정
         file_assoc_group = QGroupBox('파일 연결')
         file_assoc_layout = QVBoxLayout()
         
@@ -707,7 +696,6 @@ class SettingsDialog(QDialog):
         file_assoc_group.setLayout(file_assoc_layout)
         layout.addWidget(file_assoc_group)
         
-        # 이미지 표시 설정
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         
@@ -726,7 +714,6 @@ class SettingsDialog(QDialog):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
-        # 성능 설정
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         
@@ -741,7 +728,6 @@ class SettingsDialog(QDialog):
         performance_group.setLayout(performance_layout)
         layout.addWidget(performance_group)
         
-        # 슬라이드쇼 설정
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
         
@@ -753,7 +739,6 @@ class SettingsDialog(QDialog):
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
         
-        # 배경색 설정
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
@@ -761,7 +746,6 @@ class SettingsDialog(QDialog):
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
         
-        # 버튼
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -772,12 +756,10 @@ class SettingsDialog(QDialog):
         layout.addLayout(button_layout)
     
     def load_settings(self):
-        # 파일 연결 상태 로드
         current_associations = FileAssociationManager.get_current_associations()
         for ext, checkbox in self.extension_checkboxes.items():
             checkbox.setChecked(ext in current_associations)
         
-        # 기존 설정 로드
         quality = self.settings.get('zoom_quality', 'balanced')
         index = self.zoom_quality.findData(quality)
         if index >= 0:
@@ -801,7 +783,6 @@ class SettingsDialog(QDialog):
         self.color_button.setText(self.current_color)
     
     def save_settings(self):
-        # 파일 연결 저장
         selected_extensions = []
         for ext, checkbox in self.extension_checkboxes.items():
             if checkbox.isChecked():
@@ -809,9 +790,7 @@ class SettingsDialog(QDialog):
         
         current_associations = FileAssociationManager.get_current_associations()
         
-        # 새로 연결할 확장자
         to_associate = [ext for ext in selected_extensions if ext not in current_associations]
-        # 연결 해제할 확장자
         to_disassociate = [ext for ext in current_associations if ext not in selected_extensions]
         
         if to_associate:
@@ -819,7 +798,6 @@ class SettingsDialog(QDialog):
         if to_disassociate:
             FileAssociationManager.disassociate_extensions(to_disassociate)
         
-        # 기존 설정 저장
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
@@ -852,7 +830,6 @@ class ImageViewer(QMainWindow):
         
         self.init_ui()
         self.load_settings()
-        self.setup_shortcuts()
         self.setup_icon()
         
         self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
@@ -878,7 +855,6 @@ class ImageViewer(QMainWindow):
                 self.windowHandle().setIcon(icon)
     
     def bring_to_front(self):
-        """창을 맨 앞으로 가져오기"""
         self.show()
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
         self.raise_()
@@ -925,10 +901,11 @@ class ImageViewer(QMainWindow):
         if hasattr(self, 'scroll_area'):
             self.scroll_area.setStyleSheet(f"background-color: {bg_color};")
     
-    def setup_shortcuts(self):
-        for shortcut in self.shortcut_objects.values():
-            shortcut.setEnabled(False)
-        self.shortcut_objects.clear()
+    def keyPressEvent(self, event: QKeyEvent):
+        """키보드 이벤트 처리 - 다른 프로그램에 영향 없음"""
+        key = event.key()
+        modifiers = event.modifiers()
+        key_sequence = QKeySequence(modifiers | key).toString()
         
         shortcut_actions = {
             'next_image': self.next_image,
@@ -937,7 +914,7 @@ class ImageViewer(QMainWindow):
             'zoom_out': self.zoom_out,
             'toggle_actual_size': self.toggle_actual_size,
             'toggle_fullscreen': self.toggle_fullscreen,
-            'close_program': self.close,
+            'close_program': self.close_program,
             'show_image_list': self.show_image_list_dialog,
             'delete_image': self.delete_image,
             'open_file': self.open_file,
@@ -948,16 +925,12 @@ class ImageViewer(QMainWindow):
         
         for action_name, callback in shortcut_actions.items():
             shortcuts = self.settings.get_shortcuts(action_name)
-            
-            for i, key in enumerate(shortcuts):
-                if key and key != '' and 'Click' not in key:
-                    try:
-                        shortcut = QShortcut(QKeySequence(key), self)
-                        shortcut.activated.connect(callback)
-                        shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-                        self.shortcut_objects[f"{action_name}_{i}"] = shortcut
-                    except:
-                        pass
+            if key_sequence in shortcuts:
+                callback()
+                event.accept()
+                return
+        
+        super().keyPressEvent(event)
     
     def check_mouse_shortcut(self, button_text):
         actions = {
@@ -1005,7 +978,7 @@ class ImageViewer(QMainWindow):
         self.settings.set('window_geometry', geometry)
     
     def load_path(self, path):
-        self.bring_to_front()  # 창 맨 앞으로
+        self.bring_to_front()
         if os.path.isdir(path):
             self.load_directory(path)
         elif os.path.isfile(path):
@@ -1295,7 +1268,7 @@ class ImageViewer(QMainWindow):
     def show_shortcut_settings(self):
         dialog = ShortcutSettingsDialog(self.settings, self)
         if dialog.exec_():
-            self.setup_shortcuts()
+            pass  # keyPressEvent에서 처리하므로 별도 설정 불필요
     
     def apply_settings(self):
         cache_size = self.settings.get('cache_size', 50)
