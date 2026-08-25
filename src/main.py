@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QListView, QSlider)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QCursor)
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
 user32 = ctypes.windll.user32
@@ -430,6 +430,10 @@ class ShortcutSettingsDialog(QDialog):
         self.capturing = False
         self.current_action = None
         self.current_slot = 0
+        self.capture_timer = QTimer()
+        self.capture_timer.setSingleShot(True)
+        self.capture_timer.timeout.connect(self.finish_capture)
+        self.captured_keys = []
         self.init_ui()
         self.load_shortcuts()
     
@@ -445,7 +449,7 @@ class ShortcutSettingsDialog(QDialog):
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
         layout = QVBoxLayout(self)
-        info_label = QLabel('버튼 클릭 후 키보드 또는 마우스를 누르세요.\n왼쪽 더블클릭: Left Double Click\n오른쪽 더블클릭: Right Double Click\nESC: 삭제')
+        info_label = QLabel('버튼 클릭 후 1초 동안 입력한 모든 키/마우스 버튼이 단축키로 설정됩니다.\n왼쪽 더블클릭: Left Double Click\n오른쪽 더블클릭: Right Double Click\nESC: 삭제')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         actions = [
@@ -501,10 +505,29 @@ class ShortcutSettingsDialog(QDialog):
         self.capturing = True
         self.current_action = action_key
         self.current_slot = slot
-        button.setText('입력 대기...')
+        self.captured_keys = []
+        button.setText('입력 중... (1초)')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
         self.setFocus()
+        # 1초 후 캡처 완료
+        self.capture_timer.start(1000)
+    
+    def finish_capture(self):
+        """1초 후 캡처 완료"""
+        if self.capturing and self.current_action:
+            if self.captured_keys:
+                # 첫 번째 입력만 사용
+                shortcut_text = self.captured_keys[0]
+                self.shortcut_buttons[self.current_action][self.current_slot].setText(shortcut_text)
+            else:
+                self.shortcut_buttons[self.current_action][self.current_slot].setText('없음')
+            self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+            self.capturing = False
+            self.current_action = None
+            self.current_slot = 0
+            self.captured_keys = []
+            self.releaseKeyboard()
     
     def keyPressEvent(self, event):
         if self.capturing and self.current_action:
@@ -513,14 +536,16 @@ class ShortcutSettingsDialog(QDialog):
             if key == Qt.Key_Escape:
                 self.shortcut_buttons[self.current_action][self.current_slot].setText('없음')
                 self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
+                self.capture_timer.stop()
+                self.capturing = False
+                self.current_action = None
+                self.current_slot = 0
+                self.captured_keys = []
+                self.releaseKeyboard()
                 return
             key_sequence = QKeySequence(modifiers | key).toString()
-            if key_sequence and self.current_action in self.shortcut_buttons:
-                self.shortcut_buttons[self.current_action][self.current_slot].setText(key_sequence)
-                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
-                return
+            if key_sequence and key_sequence not in self.captured_keys:
+                self.captured_keys.append(key_sequence)
         super().keyPressEvent(event)
     
     def mousePressEvent(self, event):
@@ -535,31 +560,19 @@ class ShortcutSettingsDialog(QDialog):
             }
             if button in mouse_buttons:
                 button_text = mouse_buttons[button]
-                self.shortcut_buttons[self.current_action][self.current_slot].setText(button_text)
-                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
-                return
+                if button_text not in self.captured_keys:
+                    self.captured_keys.append(button_text)
         super().mousePressEvent(event)
     
     def mouseDoubleClickEvent(self, event):
         if self.capturing and self.current_action:
             if event.button() == Qt.LeftButton:
-                self.shortcut_buttons[self.current_action][self.current_slot].setText('Left Double Click')
-                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
-                return
+                if 'Left Double Click' not in self.captured_keys:
+                    self.captured_keys.append('Left Double Click')
             elif event.button() == Qt.RightButton:
-                self.shortcut_buttons[self.current_action][self.current_slot].setText('Right Double Click')
-                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
-                self.stop_capture()
-                return
+                if 'Right Double Click' not in self.captured_keys:
+                    self.captured_keys.append('Right Double Click')
         super().mouseDoubleClickEvent(event)
-    
-    def stop_capture(self):
-        self.capturing = False
-        self.current_action = None
-        self.current_slot = 0
-        self.releaseKeyboard()
     
     def reset_defaults(self):
         defaults = self.settings.default_settings()['shortcuts']
@@ -790,7 +803,6 @@ class ImageViewer(QMainWindow):
         self.resize_start_size = None
         self.resize_region = None
         self.resize_margin = 8
-        # 마우스 숨김 관련
         self.cursor_hide_timer = QTimer()
         self.cursor_hide_timer.setSingleShot(True)
         self.cursor_hide_timer.timeout.connect(self.hide_cursor)
@@ -818,19 +830,18 @@ class ImageViewer(QMainWindow):
                 self.windowHandle().setIcon(icon)
     
     def hide_cursor(self):
-        """마우스 커서 숨기기"""
         if self.isFullScreen():
             self.setCursor(Qt.BlankCursor)
     
     def show_cursor(self):
-        """마우스 커서 보이기"""
         self.unsetCursor()
+        if self.isFullScreen():
+            self.cursor_hide_timer.start(2000)
     
     def reset_cursor_timer(self):
-        """마우스 커서 타이머 리셋"""
         if self.isFullScreen():
             self.show_cursor()
-            self.cursor_hide_timer.start(2000)  # 2초
+            self.cursor_hide_timer.start(2000)
     
     def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
@@ -838,7 +849,6 @@ class ImageViewer(QMainWindow):
         self.raise_()
         self.activateWindow()
         QTimer.singleShot(100, self.force_foreground)
-        QTimer.singleShot(200, self.force_foreground)
     
     def force_foreground(self):
         try:
@@ -965,6 +975,7 @@ class ImageViewer(QMainWindow):
             if self.isFullScreen():
                 self.showNormal()
                 self.show_cursor()
+                self.cursor_hide_timer.stop()
                 event.accept()
                 return
         
@@ -1543,7 +1554,6 @@ def main():
         viewer.load_path(sys.argv[1])
     viewer.show()
     QTimer.singleShot(100, viewer.force_foreground)
-    QTimer.singleShot(200, viewer.force_foreground)
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
