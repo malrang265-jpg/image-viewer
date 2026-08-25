@@ -305,32 +305,39 @@ class ZipHandler:
         return images
     
     @staticmethod
-    def load_image_from_zip(zip_path, filename):
+    def load_image_from_zip(zip_path, filename, saturation=100, brightness=100, contrast=100):
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
                 ext = os.path.splitext(filename)[1].lower()
-                if ext == '.gif':
-                    temp_file = os.path.join(get_app_dir(), '.temp_gif')
-                    with open(temp_file, 'wb') as f:
-                        f.write(data)
-                    movie = QMovie(temp_file)
-                    if movie.isValid():
-                        movie.jumpToFrame(0)
-                        pixmap = movie.currentPixmap()
-                        movie.stop()
-                        return pixmap
                 
                 Image = get_pil_image()
-                img = Image.open(BytesIO(data))
+                
+                if ext == '.gif':
+                    img = Image.open(BytesIO(data))
+                    img.seek(0)
+                else:
+                    img = Image.open(BytesIO(data))
+                
                 img = img.convert('RGB')
+                
+                if saturation != 100:
+                    enhancer = get_pil_enhance().Color(img)
+                    img = enhancer.enhance(saturation / 100.0)
+                if brightness != 100:
+                    enhancer = get_pil_enhance().Brightness(img)
+                    img = enhancer.enhance(brightness / 100.0)
+                if contrast != 100:
+                    enhancer = get_pil_enhance().Contrast(img)
+                    img = enhancer.enhance(contrast / 100.0)
+                
                 data_bytes = img.tobytes('raw', 'RGB')
                 qimage = QImage(data_bytes, img.width, img.height, img.width * 3, QImage.Format_RGB888)
                 pixmap = QPixmap.fromImage(qimage.copy())
                 if not pixmap.isNull():
                     return pixmap
-        except:
-            pass
+        except Exception as e:
+            print(f"ZIP 이미지 로드 오류: {e}")
         return None
 
 class ImageListDialog(QDialog):
@@ -600,7 +607,7 @@ class SettingsDialog(QDialog):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
-        adjust_group = QGroupBox('이미지 조절 (일반 이미지만)')
+        adjust_group = QGroupBox('이미지 조절')
         adjust_layout = QFormLayout()
         
         self.saturation_slider = QSlider(Qt.Horizontal)
@@ -1079,27 +1086,27 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         current_file = self.image_list[self.current_index]
         pixmap = None
+        saturation = self.settings.get('saturation', 100)
+        brightness = self.settings.get('brightness', 100)
+        contrast = self.settings.get('contrast', 100)
+        
         try:
             if self.current_zip:
-                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
+                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file,
+                                                       saturation, brightness, contrast)
             else:
                 if ImageLoader.is_animated(current_file):
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
                         self.current_movie = movie
-                        # 원본 크기 저장
                         movie.jumpToFrame(0)
                         self.current_movie_original_size = movie.currentPixmap().size()
                         self.image_label.setMovie(movie)
                         movie.start()
-                        # 크기 적용
                         QTimer.singleShot(50, self.update_image_display)
                         self.is_loading = False
                         return
                 else:
-                    saturation = self.settings.get('saturation', 100)
-                    brightness = self.settings.get('brightness', 100)
-                    contrast = self.settings.get('contrast', 100)
                     cache_key = f"{current_file}_{saturation}_{brightness}_{contrast}"
                     pixmap = self.cache_manager.get(cache_key)
                     if pixmap is None:
@@ -1161,10 +1168,8 @@ class ImageViewer(QMainWindow):
                 self.gif_loop_count = 0
     
     def update_image_display(self):
-        # GIF/WebP 애니메이션 처리
         if self.current_movie:
             try:
-                # 원본 크기 사용
                 if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
                     original_size = self.current_movie_original_size
                 else:
@@ -1183,7 +1188,6 @@ class ImageViewer(QMainWindow):
                 pass
             return
         
-        # 일반 이미지 처리
         if self.current_pixmap:
             if self.fit_to_window:
                 scaled = self.current_pixmap.scaled(
