@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QListView, QSlider)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QCursor)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
 user32 = ctypes.windll.user32
@@ -790,6 +790,10 @@ class ImageViewer(QMainWindow):
         self.resize_start_size = None
         self.resize_region = None
         self.resize_margin = 8
+        # 마우스 숨김 관련
+        self.cursor_hide_timer = QTimer()
+        self.cursor_hide_timer.setSingleShot(True)
+        self.cursor_hide_timer.timeout.connect(self.hide_cursor)
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -812,6 +816,21 @@ class ImageViewer(QMainWindow):
             self.setWindowIcon(icon)
             if self.windowHandle():
                 self.windowHandle().setIcon(icon)
+    
+    def hide_cursor(self):
+        """마우스 커서 숨기기"""
+        if self.isFullScreen():
+            self.setCursor(Qt.BlankCursor)
+    
+    def show_cursor(self):
+        """마우스 커서 보이기"""
+        self.unsetCursor()
+    
+    def reset_cursor_timer(self):
+        """마우스 커서 타이머 리셋"""
+        if self.isFullScreen():
+            self.show_cursor()
+            self.cursor_hide_timer.start(2000)  # 2초
     
     def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
@@ -945,6 +964,7 @@ class ImageViewer(QMainWindow):
         if event.key() == Qt.Key_Escape:
             if self.isFullScreen():
                 self.showNormal()
+                self.show_cursor()
                 event.accept()
                 return
         
@@ -1281,8 +1301,11 @@ class ImageViewer(QMainWindow):
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
+            self.show_cursor()
+            self.cursor_hide_timer.stop()
         else:
             self.showFullScreen()
+            self.reset_cursor_timer()
     
     def close_program(self):
         QTimer.singleShot(150, self.close)
@@ -1395,6 +1418,7 @@ class ImageViewer(QMainWindow):
             pass
     
     def wheelEvent(self, event: QWheelEvent):
+        self.reset_cursor_timer()
         if event.angleDelta().y() > 0:
             self.prev_image()
         else:
@@ -1402,6 +1426,7 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
+        self.reset_cursor_timer()
         region = self.get_resize_region(event.pos())
         if event.button() == Qt.LeftButton and region:
             self.resizing = True
@@ -1428,6 +1453,7 @@ class ImageViewer(QMainWindow):
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
+        self.reset_cursor_timer()
         if self.resizing and self.resize_start_pos:
             delta = event.globalPos() - self.resize_start_pos
             new_w = self.resize_start_size.width()
@@ -1454,6 +1480,7 @@ class ImageViewer(QMainWindow):
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event: QMouseEvent):
+        self.reset_cursor_timer()
         if event.button() == Qt.LeftButton and self.resizing:
             self.resizing = False
             self.resize_start_pos = None
@@ -1471,6 +1498,7 @@ class ImageViewer(QMainWindow):
         super().mouseReleaseEvent(event)
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
+        self.reset_cursor_timer()
         if event.button() == Qt.LeftButton:
             self.dragging = False
             self.check_mouse_shortcut('Left Double Click')
@@ -1491,6 +1519,7 @@ class ImageViewer(QMainWindow):
             self.save_settings()
         self.stop_current_movie()
         self.slideshow.stop()
+        self.cursor_hide_timer.stop()
         super().closeEvent(event)
 
 def main():
@@ -1513,7 +1542,6 @@ def main():
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
     viewer.show()
-    # 2번만 호출
     QTimer.singleShot(100, viewer.force_foreground)
     QTimer.singleShot(200, viewer.force_foreground)
     sys.exit(app.exec_())
