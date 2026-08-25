@@ -23,6 +23,9 @@ from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
+# 키보드 훅 콜백 타입 정의
+HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.c_uintptr, ctypes.c_void_p)
+
 # 전역 키보드 훅
 WH_KEYBOARD_LL = 13
 keyboard_hook = None
@@ -30,17 +33,19 @@ keyboard_hook = None
 def low_level_keyboard_proc(nCode, wParam, lParam):
     if nCode == 0:
         vk_code = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong)).contents.value
-        # Pekoviewer가 실행 중일 때만 키 차단
         # 방향키, Delete, PageUp, PageDown 차단
         if vk_code in [0x25, 0x26, 0x27, 0x28, 0x2E, 0x21, 0x22]:
             return 1
     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+# 콜백 함수 객체 생성
+keyboard_proc = HOOKPROC(low_level_keyboard_proc)
+
 def setup_keyboard_hook():
     global keyboard_hook
     keyboard_hook = user32.SetWindowsHookExW(
         WH_KEYBOARD_LL,
-        low_level_keyboard_proc,
+        keyboard_proc,
         kernel32.GetModuleHandleW(None),
         0
     )
@@ -1267,8 +1272,11 @@ def main():
         sys.exit(0)
     single_app.start_server()
     
-    # 키보드 훅 설정 (다른 프로그램에 키 전달 차단)
-    setup_keyboard_hook()
+    # 키보드 훅 설정
+    try:
+        setup_keyboard_hook()
+    except Exception as e:
+        print(f"키보드 훅 설정 실패: {e}")
     
     viewer = ImageViewer()
     single_app.set_file_received_callback(viewer.load_path)
