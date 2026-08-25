@@ -434,6 +434,7 @@ class ShortcutSettingsDialog(QDialog):
         self.capture_timer.setSingleShot(True)
         self.capture_timer.timeout.connect(self.finish_capture)
         self.captured_keys = []
+        self.double_click_detected = False
         self.init_ui()
         self.load_shortcuts()
     
@@ -506,6 +507,7 @@ class ShortcutSettingsDialog(QDialog):
         self.current_action = action_key
         self.current_slot = slot
         self.captured_keys = []
+        self.double_click_detected = False
         button.setText('입력 중... (1초)')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
@@ -524,6 +526,7 @@ class ShortcutSettingsDialog(QDialog):
             self.current_action = None
             self.current_slot = 0
             self.captured_keys = []
+            self.double_click_detected = False
             self.releaseKeyboard()
     
     def keyPressEvent(self, event):
@@ -538,6 +541,7 @@ class ShortcutSettingsDialog(QDialog):
                 self.current_action = None
                 self.current_slot = 0
                 self.captured_keys = []
+                self.double_click_detected = False
                 self.releaseKeyboard()
                 return
             key_sequence = QKeySequence(modifiers | key).toString()
@@ -565,10 +569,10 @@ class ShortcutSettingsDialog(QDialog):
         if self.capturing and self.current_action:
             if event.button() == Qt.LeftButton:
                 if 'Left Double Click' not in self.captured_keys:
-                    self.captured_keys.append('Left Double Click')
+                    self.captured_keys.insert(0, 'Left Double Click')  # 맨 앞에 추가
             elif event.button() == Qt.RightButton:
                 if 'Right Double Click' not in self.captured_keys:
-                    self.captured_keys.append('Right Double Click')
+                    self.captured_keys.insert(0, 'Right Double Click')  # 맨 앞에 추가
         super().mouseDoubleClickEvent(event)
     
     def reset_defaults(self):
@@ -800,6 +804,9 @@ class ImageViewer(QMainWindow):
         self.resize_start_size = None
         self.resize_region = None
         self.resize_margin = 8
+        # 마우스 숨김 관련
+        self.cursor_hidden = False
+        self.cursor_move_start_time = None
         self.cursor_hide_timer = QTimer()
         self.cursor_hide_timer.setSingleShot(True)
         self.cursor_hide_timer.timeout.connect(self.hide_cursor)
@@ -829,16 +836,16 @@ class ImageViewer(QMainWindow):
     def hide_cursor(self):
         if self.isFullScreen():
             self.setCursor(Qt.BlankCursor)
+            self.cursor_hidden = True
     
     def show_cursor(self):
         self.unsetCursor()
-        if self.isFullScreen():
-            self.cursor_hide_timer.start(300)  # 0.3초
+        self.cursor_hidden = False
+        self.cursor_move_start_time = None
     
     def reset_cursor_timer(self):
         if self.isFullScreen():
-            self.show_cursor()
-            self.cursor_hide_timer.start(300)  # 0.3초
+            self.cursor_hide_timer.start(2000)  # 2초 후 숨김
     
     def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
@@ -1461,7 +1468,18 @@ class ImageViewer(QMainWindow):
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        self.reset_cursor_timer()
+        # 마우스가 숨겨져 있으면 움직임 감지
+        if self.cursor_hidden and self.isFullScreen():
+            if self.cursor_move_start_time is None:
+                self.cursor_move_start_time = __import__('time').time()
+            else:
+                elapsed = __import__('time').time() - self.cursor_move_start_time
+                if elapsed >= 0.3:  # 0.3초 이상 움직이면
+                    self.show_cursor()
+                    self.reset_cursor_timer()
+        else:
+            self.reset_cursor_timer()
+        
         if self.resizing and self.resize_start_pos:
             delta = event.globalPos() - self.resize_start_pos
             new_w = self.resize_start_size.width()
