@@ -19,7 +19,6 @@ from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PIL import Image
 
 class SingleApplication:
-    """중복 실행 방지"""
     def __init__(self, app_name="ImageViewerApp"):
         self.app_name = app_name
         self.socket = QLocalSocket()
@@ -144,6 +143,18 @@ class ImageLoader:
         except:
             pass
         return None
+    
+    @staticmethod
+    def load_gif_first_frame(filepath):
+        """GIF 첫 프레임 로드"""
+        try:
+            movie = QMovie(filepath)
+            if movie.isValid():
+                movie.jumpToFrame(0)
+                return movie.currentPixmap()
+        except:
+            pass
+        return None
 
 class CacheManager:
     def __init__(self, max_size=50):
@@ -194,6 +205,20 @@ class ZipHandler:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
+                
+                # GIF인 경우 첫 프레임만
+                ext = os.path.splitext(filename)[1].lower()
+                if ext == '.gif':
+                    temp_file = os.path.join(os.path.expanduser('~'), '.temp_gif')
+                    with open(temp_file, 'wb') as f:
+                        f.write(data)
+                    movie = QMovie(temp_file)
+                    if movie.isValid():
+                        movie.jumpToFrame(0)
+                        pixmap = movie.currentPixmap()
+                        movie.stop()
+                        return pixmap
+                
                 pixmap = QPixmap()
                 if pixmap.loadFromData(data):
                     return pixmap
@@ -572,7 +597,8 @@ class ImageViewer(QMainWindow):
         self.shortcut_objects = {}
         self.current_movie = None
         self.current_pixmap = None
-        self.is_loading = False  # 로딩 중 플래그
+        self.original_pixmap = None  # 원본 이미지 저장
+        self.is_loading = False
         
         self.init_ui()
         self.load_settings()
@@ -701,7 +727,6 @@ class ImageViewer(QMainWindow):
                 self.load_single_file(path)
     
     def natural_sort_key(self, s):
-        """자연스러운 정렬 키"""
         return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
     
     def load_directory(self, directory):
@@ -710,7 +735,6 @@ class ImageViewer(QMainWindow):
         
         try:
             files = os.listdir(directory)
-            # Windows 탐색기와 동일한 정렬
             files.sort(key=self.natural_sort_key)
             
             for filename in files:
@@ -769,24 +793,17 @@ class ImageViewer(QMainWindow):
         
         try:
             if self.current_zip:
-                if ImageLoader.is_animated(current_file):
-                    movie = ZipHandler.load_animation_from_zip(self.current_zip, current_file)
-                    if movie:
-                        self.current_movie = movie
-                        self.image_label.setMovie(movie)
-                        movie.start()
-                        self.update_image_display()
-                        self.is_loading = False
-                        return
-                else:
-                    pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
+                # ZIP 파일의 GIF는 첫 프레임만 표시
+                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
             else:
                 if ImageLoader.is_animated(current_file):
+                    # GIF/WebP 애니메이션
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
                         self.current_movie = movie
                         self.image_label.setMovie(movie)
                         movie.start()
+                        self.original_pixmap = movie.currentPixmap()
                         self.update_image_display()
                         self.is_loading = False
                         return
@@ -805,6 +822,7 @@ class ImageViewer(QMainWindow):
                     pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
                 
                 self.current_pixmap = pixmap
+                self.original_pixmap = pixmap  # 원본 저장
                 self.image_label.setPixmap(pixmap)
                 self.update_image_display()
                 
@@ -822,26 +840,37 @@ class ImageViewer(QMainWindow):
             self.is_loading = False
     
     def update_image_display(self):
-        # 애니메이션 크기 조정
-        if self.current_movie:
-            if self.fit_to_window:
-                original_size = self.current_movie.currentPixmap().size()
-                if original_size.width() > 0 and original_size.height() > 0:
-                    scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
-                    self.current_movie.setScaledSize(scaled_size)
+        # 원본 이미지 기준으로 크기 조정
+        base_pixmap = None
         
-        # 일반 이미지 크기 조정
-        if self.current_pixmap:
-            if self.fit_to_window:
-                scaled_pixmap = self.current_pixmap.scaled(
+        if self.current_movie:
+            base_pixmap = self.current_movie.currentPixmap()
+        elif self.original_pixmap:
+            base_pixmap = self.original_pixmap
+        elif self.current_pixmap:
+            base_pixmap = self.current_pixmap
+        
+        if not base_pixmap or base_pixmap.isNull():
+            return
+        
+        if self.fit_to_window:
+            # 창 크기에 맞추기
+            if self.current_movie:
+                scaled_size = base_pixmap.size().scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                self.current_movie.setScaledSize(scaled_size)
+            else:
+                scaled_pixmap = base_pixmap.scaled(
                     self.scroll_area.size(),
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation
                 )
                 self.image_label.setPixmap(scaled_pixmap)
+        else:
+            # 실제 크기
+            if self.current_movie:
+                self.current_movie.setScaledSize(base_pixmap.size())
             else:
-                # 실제 크기
-                self.image_label.setPixmap(self.current_pixmap)
+                self.image_label.setPixmap(base_pixmap)
         
         self.image_label.adjustSize()
     
@@ -1085,7 +1114,6 @@ class ImageViewer(QMainWindow):
         super().closeEvent(event)
 
 def main():
-    # 중복 실행 방지
     single_app = SingleApplication()
     if single_app.is_running():
         if len(sys.argv) > 1:
