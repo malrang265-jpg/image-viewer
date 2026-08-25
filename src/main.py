@@ -445,7 +445,7 @@ class ShortcutSettingsDialog(QDialog):
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
         layout = QVBoxLayout(self)
-        info_label = QLabel('버튼 클릭 후 키보드 또는 마우스를 누르세요.\n왼쪽 더블클릭: Left Double Click, 오른쪽 더블클릭: Right Double Click, ESC: 삭제')
+        info_label = QLabel('버튼 클릭 후 키보드 또는 마우스를 누르세요.\n왼쪽 더블클릭: Left Double Click\n오른쪽 더블클릭: Right Double Click\nESC: 삭제')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         actions = [
@@ -790,7 +790,6 @@ class ImageViewer(QMainWindow):
         self.resize_start_size = None
         self.resize_region = None
         self.resize_margin = 8
-        self.foreground_done = False  # 맨위로 한번만
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -819,10 +818,10 @@ class ImageViewer(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
-        # 한번만 force_foreground 호출
-        if not self.foreground_done:
-            self.foreground_done = True
-            QTimer.singleShot(200, self.force_foreground)
+        # 예전 방식보다 살짝 덜하게 (3번만 호출)
+        QTimer.singleShot(0, self.force_foreground)
+        QTimer.singleShot(200, self.force_foreground)
+        QTimer.singleShot(400, self.force_foreground)
     
     def force_foreground(self):
         try:
@@ -1516,8 +1515,10 @@ def main():
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
     viewer.show()
-    # 한번만 force_foreground 호출
-    QTimer.singleShot(200, viewer.force_foreground)
+    # 예전 방식보다 살짝 덜하게 (3번만 호출)
+    QTimer.singleShot(100, viewer.force_foreground)
+    QTimer.singleShot(300, viewer.force_foreground)
+    QTimer.singleShot(500, viewer.force_foreground)
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
