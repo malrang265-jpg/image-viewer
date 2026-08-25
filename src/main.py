@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
                             QListWidget, QListWidgetItem, QMessageBox,
-                            QListView, QSizeGrip)
+                            QListView)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
@@ -129,7 +129,7 @@ class Settings:
     
     def default_settings(self):
         return {
-            'window_geometry': None,
+            'window_geometry': None,  # {'x': int, 'y': int, 'width': int, 'height': int}
             'zoom_quality': 'balanced',
             'show_filename': False,
             'background_color': '#2b2b2b',
@@ -767,20 +767,18 @@ class ImageViewer(QMainWindow):
         self.current_zip = None
         self.zoom_factor = 1.0
         self.fit_to_window = True
-        self.rotation_angle = 0
-        self.current_movie = None
+        self.rotation_angle = 0        self.current_movie = None
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
-        # 드래그 관련
         self.dragging = False
         self.drag_start_pos = None
         self.window_start_pos = None
-        # 리사이즈 관련
         self.resizing = False
         self.resize_start_pos = None
         self.resize_start_size = None
-        self.resize_margin = 8  # 가장자리 감지 범위
+        self.resize_region = None
+        self.resize_margin = 8
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -830,9 +828,7 @@ class ImageViewer(QMainWindow):
         self.setWindowTitle('Pekoviewer')
         self.setMinimumSize(200, 150)
         self.setAcceptDrops(True)
-        # 제목 표시줄 제거 + 리사이즈 가능
         self.setWindowFlags(Qt.FramelessWindowHint)
-        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
@@ -853,8 +849,6 @@ class ImageViewer(QMainWindow):
         self.filename_label.hide()
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
-        
-        # 마우스 추적 활성화
         self.setMouseTracking(True)
         self.scroll_area.setMouseTracking(True)
         self.image_label.setMouseTracking(True)
@@ -868,46 +862,41 @@ class ImageViewer(QMainWindow):
         """)
     
     def get_resize_region(self, pos):
-        """마우스 위치에 따른 리사이즈 영역 확인"""
         x, y = pos.x(), pos.y()
         w, h = self.width(), self.height()
         margin = self.resize_margin
-        
         left = x < margin
         right = x > w - margin
         top = y < margin
         bottom = y > h - margin
-        
         if left and top:
-            return Qt.TopLeftCorner
+            return 'topleft'
         elif right and top:
-            return Qt.TopRightCorner
+            return 'topright'
         elif left and bottom:
-            return Qt.BottomLeftCorner
+            return 'bottomleft'
         elif right and bottom:
-            return Qt.BottomRightCorner
+            return 'bottomright'
         elif left:
-            return Qt.LeftEdge
+            return 'left'
         elif right:
-            return Qt.RightEdge
+            return 'right'
         elif top:
-            return Qt.TopEdge
+            return 'top'
         elif bottom:
-            return Qt.BottomEdge
+            return 'bottom'
         else:
             return None
     
     def update_cursor(self, pos):
-        """리사이즈 영역에 따라 커서 변경"""
         region = self.get_resize_region(pos)
-        
-        if region == Qt.LeftEdge or region == Qt.RightEdge:
+        if region in ['left', 'right']:
             self.setCursor(Qt.SizeHorCursor)
-        elif region == Qt.TopEdge or region == Qt.BottomEdge:
+        elif region in ['top', 'bottom']:
             self.setCursor(Qt.SizeVerCursor)
-        elif region == Qt.TopLeftCorner or region == Qt.BottomRightCorner:
+        elif region in ['topleft', 'bottomright']:
             self.setCursor(Qt.SizeFDiagCursor)
-        elif region == Qt.TopRightCorner or region == Qt.BottomLeftCorner:
+        elif region in ['topright', 'bottomleft']:
             self.setCursor(Qt.SizeBDiagCursor)
         else:
             self.unsetCursor()
@@ -916,7 +905,6 @@ class ImageViewer(QMainWindow):
         key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
         close_shortcuts = self.settings.get_shortcuts('close_program')
         if key_sequence in close_shortcuts:
-            # 종료 지연 150ms
             QTimer.singleShot(150, self.close)
             event.accept()
             return
@@ -970,12 +958,39 @@ class ImageViewer(QMainWindow):
     def load_settings(self):
         geometry = self.settings.get('window_geometry')
         if geometry and not self.isFullScreen():
-            self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
+            if isinstance(geometry, dict):
+                x = geometry.get('x', 100)
+                y = geometry.get('y', 100)
+                w = geometry.get('width', 800)
+                h = geometry.get('height', 600)
+                # 화면 범위 내 확인
+                screen = QApplication.primaryScreen().availableGeometry()
+                if x < screen.left():
+                    x = screen.left()
+                if y < screen.top():
+                    y = screen.top()
+                if x + w > screen.right():
+                    x = max(screen.left(), screen.right() - w)
+                if y + h > screen.bottom():
+                    y = max(screen.top(), screen.bottom() - h)
+                self.setGeometry(x, y, w, h)
+            else:
+                try:
+                    self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
+                except:
+                    pass
     
     def save_settings(self):
         if not self.isFullScreen():
-            geometry = self.saveGeometry().toBase64().data().decode()
-            self.settings.set('window_geometry', geometry)
+            pos = self.pos()
+            size = self.size()
+            geometry_data = {
+                'x': pos.x(),
+                'y': pos.y(),
+                'width': size.width(),
+                'height': size.height()
+            }
+            self.settings.set('window_geometry', geometry_data)
     
     def load_path(self, path):
         self.bring_to_front()
@@ -1169,7 +1184,6 @@ class ImageViewer(QMainWindow):
             self.showFullScreen()
     
     def close_program(self):
-        # 종료 지연 150ms
         QTimer.singleShot(150, self.close)
     
     def show_image_list_dialog(self):
@@ -1295,26 +1309,20 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
-        # 리사이즈 영역 확인
         region = self.get_resize_region(event.pos())
-        
         if event.button() == Qt.LeftButton and region:
-            # 리사이즈 시작
             self.resizing = True
             self.resize_start_pos = event.globalPos()
             self.resize_start_size = self.size()
             self.resize_region = region
             event.accept()
             return
-        
-        # 드래그 시작 (왼쪽 버튼, 리사이즈 영역 아님)
         if event.button() == Qt.LeftButton and not region:
             self.dragging = True
             self.drag_start_pos = event.globalPos()
             self.window_start_pos = self.pos()
             event.accept()
             return
-        
         button_text = ''
         if event.button() == Qt.MiddleButton:
             button_text = 'Middle Click'
@@ -1322,61 +1330,49 @@ class ImageViewer(QMainWindow):
             button_text = 'XButton1'
         elif event.button() == Qt.XButton2:
             button_text = 'XButton2'
-        
         if button_text:
             self.check_mouse_shortcut(button_text)
-        
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        # 리사이즈 중
         if self.resizing and self.resize_start_pos:
             delta = event.globalPos() - self.resize_start_pos
-            new_size = QSize(self.resize_start_size)
-            
-            if self.resize_region == Qt.LeftEdge or self.resize_region == Qt.TopLeftCorner or self.resize_region == Qt.BottomLeftCorner:
-                new_size.setWidth(max(200, self.resize_start_size.width() - delta.x()))
-            elif self.resize_region == Qt.RightEdge or self.resize_region == Qt.TopRightCorner or self.resize_region == Qt.BottomRightCorner:
-                new_size.setWidth(max(200, self.resize_start_size.width() + delta.x()))
-            
-            if self.resize_region == Qt.TopEdge or self.resize_region == Qt.TopLeftCorner or self.resize_region == Qt.TopRightCorner:
-                new_size.setHeight(max(150, self.resize_start_size.height() - delta.y()))
-            elif self.resize_region == Qt.BottomEdge or self.resize_region == Qt.BottomLeftCorner or self.resize_region == Qt.BottomRightCorner:
-                new_size.setHeight(max(150, self.resize_start_size.height() + delta.y()))
-            
-            self.resize(new_size)
+            new_w = self.resize_start_size.width()
+            new_h = self.resize_start_size.height()
+            if self.resize_region in ['left', 'topleft', 'bottomleft']:
+                new_w = max(200, self.resize_start_size.width() - delta.x())
+            elif self.resize_region in ['right', 'topright', 'bottomright']:
+                new_w = max(200, self.resize_start_size.width() + delta.x())
+            if self.resize_region in ['top', 'topleft', 'topright']:
+                new_h = max(150, self.resize_start_size.height() - delta.y())
+            elif self.resize_region in ['bottom', 'bottomleft', 'bottomright']:
+                new_h = max(150, self.resize_start_size.height() + delta.y())
+            self.resize(new_w, new_h)
             event.accept()
             return
-        
-        # 드래그 중
         if self.dragging and self.drag_start_pos:
             delta = event.globalPos() - self.drag_start_pos
             self.move(self.window_start_pos + delta)
             event.accept()
             return
-        
-        # 커서 업데이트
         self.update_cursor(event.pos())
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event: QMouseEvent):
-        # 리사이즈 종료
         if event.button() == Qt.LeftButton and self.resizing:
             self.resizing = False
             self.resize_start_pos = None
             self.resize_start_size = None
+            self.resize_region = None
             self.unsetCursor()
             event.accept()
             return
-        
-        # 드래그 종료
         if event.button() == Qt.LeftButton and self.dragging:
             self.dragging = False
             self.drag_start_pos = None
             self.window_start_pos = None
             event.accept()
             return
-        
         super().mouseReleaseEvent(event)
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -1401,25 +1397,19 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    
     single_app = SingleApplication()
     if single_app.is_running():
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
     single_app.start_server()
-    
     viewer = ImageViewer()
     single_app.set_file_received_callback(viewer.load_path)
-    
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
-    
     viewer.show()
-    
     for delay in [50, 100, 200, 400, 800, 1500]:
         QTimer.singleShot(delay, viewer.force_foreground)
-    
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
