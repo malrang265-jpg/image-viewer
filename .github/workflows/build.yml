@@ -1,4 +1,4 @@
-name: Build Fastest Pekoviewer
+name: Build Pekoviewer
 
 on:
   push:
@@ -16,23 +16,26 @@ jobs:
       with:
         python-version: '3.11'
     
-    - name: Install
+    - name: Install dependencies
       run: |
-        pip install PyQt5 Pillow nuitka ordered-set zstandard
+        python -m pip install --upgrade pip
+        pip install PyQt5 Pillow pyinstaller
     
-    - name: Build with Nuitka
+    - name: Build with icon
       working-directory: src
       shell: cmd
       run: |
-        python -m nuitka --msvc=latest --windows-console-mode=disable --standalone --enable-plugin=pyqt5 --lto=yes --assume-yes-for-downloads --output-dir=dist --output-filename=Pekoviewer.exe main.py
-        dir dist
+        if exist icon.ico (
+          pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm --clean main.py
+        ) else if exist ..\icon.ico (
+          copy ..\icon.ico .
+          pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm --clean main.py
+        ) else (
+          pyinstaller --windowed --name Pekoviewer --noconfirm --clean main.py
+        )
     
-    - name: Upload
+    - name: Upload Portable Folder
       uses: actions/upload-artifact@v5
       with:
-        name: Pekoviewer_Fastest
-        path: |
-          src/dist/Pekoviewer.dist/
-          src/dist/*.exe
-          src/dist/*.dist/
-        if-no-files-found: ignore
+        name: Pekoviewer_Portable
+        path: src/dist/Pekoviewer/
