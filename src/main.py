@@ -11,12 +11,22 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
-                            QListWidget, QListWidgetItem, QShortcut, QMessageBox)
+                            QListWidget, QListWidgetItem, QShortcut, QMessageBox,
+                            QListView)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent)
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PIL import Image
+
+def get_app_dir():
+    """프로그램 실행 파일이 있는 폴더 반환"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller로 패키징된 경우
+        return os.path.dirname(sys.executable)
+    else:
+        # 개발 환경
+        return os.path.dirname(os.path.abspath(__file__))
 
 class SingleApplication:
     def __init__(self, app_name="ImageViewerApp"):
@@ -41,7 +51,9 @@ class SingleApplication:
 
 class Settings:
     def __init__(self):
-        self.settings_file = os.path.join(os.path.expanduser('~'), '.image_viewer_settings.json')
+        # 설정 파일을 프로그램 폴더에 저장
+        app_dir = get_app_dir()
+        self.settings_file = os.path.join(app_dir, 'image_viewer_settings.json')
         self.load()
     
     def load(self):
@@ -93,7 +105,6 @@ class Settings:
         self.save()
     
     def get_shortcuts(self, action):
-        """단축키 리스트 반환"""
         shortcuts = self.data.get('shortcuts', {})
         value = shortcuts.get(action, ['', ''])
         if isinstance(value, str):
@@ -105,7 +116,6 @@ class Settings:
         return ['', '']
     
     def set_shortcuts(self, action, shortcuts_list):
-        """단축키 리스트 저장"""
         if 'shortcuts' not in self.data:
             self.data['shortcuts'] = {}
         self.data['shortcuts'][action] = shortcuts_list
@@ -139,6 +149,16 @@ class ImageLoader:
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
+    
+    @staticmethod
+    def load_thumbnail(filepath, size=(100, 100)):
+        try:
+            pixmap = QPixmap(filepath)
+            if not pixmap.isNull():
+                return pixmap.scaled(size[0], size[1], Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        except:
+            pass
+        return None
     
     @staticmethod
     def load_movie(filepath):
@@ -195,6 +215,12 @@ class ZipHandler:
         return sorted(images)
     
     @staticmethod
+    def get_temp_path(filename):
+        """임시 파일 경로를 프로그램 폴더에 생성"""
+        app_dir = get_app_dir()
+        return os.path.join(app_dir, filename)
+    
+    @staticmethod
     def load_image_from_zip(zip_path, filename):
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
@@ -202,7 +228,7 @@ class ZipHandler:
                 
                 ext = os.path.splitext(filename)[1].lower()
                 if ext == '.gif':
-                    temp_file = os.path.join(os.path.expanduser('~'), '.temp_gif')
+                    temp_file = ZipHandler.get_temp_path('.temp_gif')
                     with open(temp_file, 'wb') as f:
                         f.write(data)
                     movie = QMovie(temp_file)
@@ -225,17 +251,18 @@ class ZipHandler:
             return None
 
 class ImageListDialog(QDialog):
-    def __init__(self, image_list, current_index, parent=None):
+    def __init__(self, image_list, current_index, parent=None, current_zip=None):
         super().__init__(parent)
         self.image_list = image_list
         self.current_index = current_index
         self.selected_index = current_index
+        self.current_zip = current_zip
         self.init_ui()
     
     def init_ui(self):
         self.setWindowTitle('이미지 목록')
         self.setModal(True)
-        self.setMinimumSize(300, 400)
+        self.setMinimumSize(400, 500)
         self.setStyleSheet("""
             QDialog { background-color: #2b2b2b; color: white; }
             QListWidget { background-color: #3c3c3c; color: white; border: 1px solid #555; }
@@ -247,10 +274,23 @@ class ImageListDialog(QDialog):
         layout = QVBoxLayout(self)
         
         self.list_widget = QListWidget()
+        self.list_widget.setViewMode(QListView.IconMode)
+        self.list_widget.setIconSize(QSize(80, 80))
+        self.list_widget.setGridSize(QSize(100, 100))
+        self.list_widget.setResizeMode(QListView.Adjust)
+        self.list_widget.setMovement(QListView.Static)
+        self.list_widget.setSpacing(5)
+        
         for i, image_path in enumerate(self.image_list):
             display_name = os.path.basename(image_path)
             item = QListWidgetItem(display_name)
             item.setData(Qt.UserRole, i)
+            item.setTextAlignment(Qt.AlignCenter)
+            
+            thumbnail = self.load_thumbnail(image_path)
+            if thumbnail:
+                item.setIcon(QIcon(thumbnail))
+            
             self.list_widget.addItem(item)
         
         self.list_widget.setCurrentRow(self.current_index)
@@ -267,6 +307,19 @@ class ImageListDialog(QDialog):
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
     
+    def load_thumbnail(self, image_path):
+        try:
+            if self.current_zip:
+                pixmap = ZipHandler.load_image_from_zip(self.current_zip, image_path)
+            else:
+                pixmap = ImageLoader.load_thumbnail(image_path)
+            
+            if pixmap:
+                return pixmap
+        except:
+            pass
+        return None
+    
     def on_item_clicked(self, item):
         self.selected_index = item.data(Qt.UserRole)
     
@@ -281,10 +334,10 @@ class ShortcutSettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.shortcut_buttons = {}  # action: [button1, button2]
+        self.shortcut_buttons = {}
         self.capturing = False
         self.current_action = None
-        self.current_slot = 0  # 0 또는 1
+        self.current_slot = 0
         self.init_ui()
         self.load_shortcuts()
     
@@ -302,7 +355,6 @@ class ShortcutSettingsDialog(QDialog):
         
         layout = QVBoxLayout(self)
         
-        # 안내 라벨
         info_label = QLabel('각 기능에 최대 2개의 단축키를 설정할 수 있습니다. ESC 키는 단축키를 삭제합니다.')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
@@ -390,7 +442,6 @@ class ShortcutSettingsDialog(QDialog):
             modifiers = event.modifiers()
             
             if key == Qt.Key_Escape:
-                # ESC: 단축키 삭제
                 self.shortcut_buttons[self.current_action][self.current_slot].setText('없음')
                 self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
                 self.stop_capture()
@@ -454,7 +505,6 @@ class ShortcutSettingsDialog(QDialog):
     def save_shortcuts(self):
         for action, buttons in self.shortcut_buttons.items():
             shortcuts = [buttons[0].text(), buttons[1].text()]
-            # '없음'을 빈 문자열로 변환
             shortcuts = [s if s != '없음' else '' for s in shortcuts]
             self.settings.set_shortcuts(action, shortcuts)
         self.accept()
@@ -476,7 +526,17 @@ class SettingsDialog(QDialog):
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
             QLabel { color: #ffffff; }
             QCheckBox { color: #ffffff; }
-            QComboBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
+            QComboBox { 
+                background-color: #3c3c3c; 
+                color: #ffffff; 
+                border: 1px solid #555; 
+                padding: 3px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #3c3c3c;
+                color: #ffffff;
+                selection-background-color: #4a90d9;
+            }
             QSpinBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
             QPushButton { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 5px 10px; }
             QPushButton:hover { background-color: #4c4c4c; }
@@ -598,8 +658,22 @@ class ImageViewer(QMainWindow):
         self.init_ui()
         self.load_settings()
         self.setup_shortcuts()
+        self.setup_icon()
         
         self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
+    
+    def setup_icon(self):
+        """아이콘 설정"""
+        icon_path = os.path.join(get_app_dir(), 'icon.ico')
+        
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            # 작업 표시줄 아이콘도 설정
+            if hasattr(sys, '_MEIPASS'):
+                # PyInstaller 패키징된 경우
+                icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
+                if os.path.exists(icon_path):
+                    self.setWindowIcon(QIcon(icon_path))
     
     def init_ui(self):
         self.setWindowTitle('이미지 뷰어')
@@ -633,7 +707,6 @@ class ImageViewer(QMainWindow):
         self.customContextMenuRequested.connect(self.show_context_menu)
     
     def apply_background_color(self):
-        """배경색 적용"""
         bg_color = self.settings.get('background_color', '#2b2b2b')
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: {bg_color}; }}
@@ -919,7 +992,7 @@ class ImageViewer(QMainWindow):
         if not self.image_list:
             return
         
-        dialog = ImageListDialog(self.image_list, self.current_index, self)
+        dialog = ImageListDialog(self.image_list, self.current_index, self, self.current_zip)
         if dialog.exec_() == QDialog.Accepted:
             selected = dialog.get_selected_index()
             if selected != self.current_index:
@@ -979,57 +1052,9 @@ class ImageViewer(QMainWindow):
             QMenu::item:selected { background-color: #3c3c3c; }
         """)
         
-        prev_action = QAction('이전 이미지', self)
-        prev_action.triggered.connect(self.prev_image)
-        menu.addAction(prev_action)
-        
-        next_action = QAction('다음 이미지', self)
-        next_action.triggered.connect(self.next_image)
-        menu.addAction(next_action)
-        
-        menu.addSeparator()
-        
-        toggle_size_action = QAction('실제 크기/창 크기 토글', self)
-        toggle_size_action.triggered.connect(self.toggle_actual_size)
-        menu.addAction(toggle_size_action)
-        
-        zoom_in_action = QAction('확대', self)
-        zoom_in_action.triggered.connect(self.zoom_in)
-        menu.addAction(zoom_in_action)
-        
-        zoom_out_action = QAction('축소', self)
-        zoom_out_action.triggered.connect(self.zoom_out)
-        menu.addAction(zoom_out_action)
-        
-        menu.addSeparator()
-        
-        rotate_right_action = QAction('오른쪽으로 회전', self)
-        rotate_right_action.triggered.connect(self.rotate_right)
-        menu.addAction(rotate_right_action)
-        
-        rotate_left_action = QAction('왼쪽으로 회전', self)
-        rotate_left_action.triggered.connect(self.rotate_left)
-        menu.addAction(rotate_left_action)
-        
-        menu.addSeparator()
-        
         slideshow_action = QAction('슬라이드쇼', self)
         slideshow_action.triggered.connect(self.toggle_slideshow)
         menu.addAction(slideshow_action)
-        
-        image_list_action = QAction('이미지 목록', self)
-        image_list_action.triggered.connect(self.show_image_list_dialog)
-        menu.addAction(image_list_action)
-        
-        menu.addSeparator()
-        
-        open_action = QAction('열기...', self)
-        open_action.triggered.connect(self.open_file)
-        menu.addAction(open_action)
-        
-        delete_action = QAction('삭제', self)
-        delete_action.triggered.connect(self.delete_image)
-        menu.addAction(delete_action)
         
         menu.addSeparator()
         
