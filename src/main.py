@@ -19,6 +19,12 @@ from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PIL import Image
 
+try:
+    import winreg
+    WINDOWS = True
+except ImportError:
+    WINDOWS = False
+
 def get_app_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
@@ -90,6 +96,7 @@ class Settings:
             'slideshow_interval': 3,
             'cache_size': 50,
             'preload_next': True,
+            'associated_extensions': [],
             'shortcuts': {
                 'next_image': ['Right', ''],
                 'prev_image': ['Left', ''],
@@ -130,6 +137,104 @@ class Settings:
             self.data['shortcuts'] = {}
         self.data['shortcuts'][action] = shortcuts_list
         self.save()
+
+class FileAssociationManager:
+    """Windows 파일 연결 관리"""
+    SUPPORTED_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.zip']
+    
+    @staticmethod
+    def get_current_associations():
+        """현재 연결된 확장자 목록 반환"""
+        associated = []
+        if not WINDOWS:
+            return associated
+        
+        exe_path = os.path.join(get_app_dir(), 'Pekoviewer.exe')
+        if not os.path.exists(exe_path):
+            return associated
+        
+        try:
+            for ext in FileAssociationManager.SUPPORTED_EXTENSIONS:
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
+                                        f"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\{ext}\\UserChoice")
+                    prog_id, _ = winreg.QueryValueEx(key, "ProgId")
+                    winreg.CloseKey(key)
+                    
+                    # 현재 프로그램에 연결되어 있는지 확인
+                    if 'Pekoviewer' in prog_id:
+                        associated.append(ext)
+                except:
+                    pass
+        except:
+            pass
+        
+        return associated
+    
+    @staticmethod
+    def associate_extensions(extensions):
+        """확장자 연결"""
+        if not WINDOWS:
+            return False
+        
+        exe_path = os.path.join(get_app_dir(), 'Pekoviewer.exe')
+        if not os.path.exists(exe_path):
+            return False
+        
+        try:
+            for ext in extensions:
+                # ProgID 생성
+                prog_id = f"Pekoviewer{ext.replace('.', '')}"
+                
+                # ProgID 등록
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}")
+                winreg.SetValue(key, "", winreg.REG_SZ, f"Pekoviewer {ext} File")
+                winreg.CloseKey(key)
+                
+                # 아이콘 설정
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\DefaultIcon")
+                winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}",0')
+                winreg.CloseKey(key)
+                
+                # 실행 명령
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open\\command")
+                winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}" "%1"')
+                winreg.CloseKey(key)
+                
+                # UserChoice 설정
+                try:
+                    key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, 
+                                          f"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\{ext}\\UserChoice")
+                    winreg.SetValue(key, "ProgId", winreg.REG_SZ, prog_id)
+                    winreg.CloseKey(key)
+                except:
+                    pass
+            
+            return True
+        except Exception as e:
+            print(f"파일 연결 오류: {e}")
+            return False
+    
+    @staticmethod
+    def disassociate_extensions(extensions):
+        """확장자 연결 해제"""
+        if not WINDOWS:
+            return False
+        
+        try:
+            for ext in extensions:
+                prog_id = f"Pekoviewer{ext.replace('.', '')}"
+                try:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open\\command")
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open")
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell")
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\DefaultIcon")
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}")
+                except:
+                    pass
+            return True
+        except:
+            return False
 
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
@@ -244,7 +349,6 @@ class ZipHandler:
         except:
             pass
         
-        # 자연스러운 정렬
         def natural_key(s):
             return [int(text) if text.isdigit() else text.lower() 
                     for text in re.split(r'(\d+)', s)]
@@ -557,13 +661,14 @@ class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self.extension_checkboxes = {}
         self.init_ui()
         self.load_settings()
     
     def init_ui(self):
         self.setWindowTitle('설정')
         self.setModal(True)
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(450)
         self.setStyleSheet("""
             QDialog { background-color: #2b2b2b; color: #ffffff; }
             QGroupBox { color: #ffffff; border: 1px solid #555; margin-top: 10px; }
@@ -587,6 +692,22 @@ class SettingsDialog(QDialog):
         """)
         layout = QVBoxLayout(self)
         
+        # 파일 연결 설정
+        file_assoc_group = QGroupBox('파일 연결')
+        file_assoc_layout = QVBoxLayout()
+        
+        file_assoc_label = QLabel('Pekoviewer로 열 파일 확장자:')
+        file_assoc_layout.addWidget(file_assoc_label)
+        
+        for ext in FileAssociationManager.SUPPORTED_EXTENSIONS:
+            checkbox = QCheckBox(ext)
+            self.extension_checkboxes[ext] = checkbox
+            file_assoc_layout.addWidget(checkbox)
+        
+        file_assoc_group.setLayout(file_assoc_layout)
+        layout.addWidget(file_assoc_group)
+        
+        # 이미지 표시 설정
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         
@@ -605,6 +726,7 @@ class SettingsDialog(QDialog):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
+        # 성능 설정
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         
@@ -619,6 +741,7 @@ class SettingsDialog(QDialog):
         performance_group.setLayout(performance_layout)
         layout.addWidget(performance_group)
         
+        # 슬라이드쇼 설정
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
         
@@ -630,6 +753,7 @@ class SettingsDialog(QDialog):
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
         
+        # 배경색 설정
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
@@ -637,6 +761,7 @@ class SettingsDialog(QDialog):
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
         
+        # 버튼
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -647,6 +772,12 @@ class SettingsDialog(QDialog):
         layout.addLayout(button_layout)
     
     def load_settings(self):
+        # 파일 연결 상태 로드
+        current_associations = FileAssociationManager.get_current_associations()
+        for ext, checkbox in self.extension_checkboxes.items():
+            checkbox.setChecked(ext in current_associations)
+        
+        # 기존 설정 로드
         quality = self.settings.get('zoom_quality', 'balanced')
         index = self.zoom_quality.findData(quality)
         if index >= 0:
@@ -670,6 +801,25 @@ class SettingsDialog(QDialog):
         self.color_button.setText(self.current_color)
     
     def save_settings(self):
+        # 파일 연결 저장
+        selected_extensions = []
+        for ext, checkbox in self.extension_checkboxes.items():
+            if checkbox.isChecked():
+                selected_extensions.append(ext)
+        
+        current_associations = FileAssociationManager.get_current_associations()
+        
+        # 새로 연결할 확장자
+        to_associate = [ext for ext in selected_extensions if ext not in current_associations]
+        # 연결 해제할 확장자
+        to_disassociate = [ext for ext in current_associations if ext not in selected_extensions]
+        
+        if to_associate:
+            FileAssociationManager.associate_extensions(to_associate)
+        if to_disassociate:
+            FileAssociationManager.disassociate_extensions(to_disassociate)
+        
+        # 기존 설정 저장
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
@@ -677,6 +827,7 @@ class SettingsDialog(QDialog):
         self.settings.set('preload_next', self.preload_next.isChecked())
         self.settings.set('slideshow_interval', self.slideshow_interval.value())
         self.settings.set('background_color', self.current_color)
+        self.settings.set('associated_extensions', selected_extensions)
         self.accept()
 
 class ImageViewer(QMainWindow):
@@ -725,6 +876,13 @@ class ImageViewer(QMainWindow):
             self.setWindowIcon(icon)
             if self.windowHandle():
                 self.windowHandle().setIcon(icon)
+    
+    def bring_to_front(self):
+        """창을 맨 앞으로 가져오기"""
+        self.show()
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.raise_()
+        self.activateWindow()
     
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
@@ -847,6 +1005,7 @@ class ImageViewer(QMainWindow):
         self.settings.set('window_geometry', geometry)
     
     def load_path(self, path):
+        self.bring_to_front()  # 창 맨 앞으로
         if os.path.isdir(path):
             self.load_directory(path)
         elif os.path.isfile(path):
@@ -856,7 +1015,6 @@ class ImageViewer(QMainWindow):
                 self.load_single_file(path)
     
     def natural_sort_key(self, s):
-        """자연스러운 정렬 - 숫자를 정수로 변환"""
         return [int(text) if text.isdigit() else text.lower() 
                 for text in re.split(r'(\d+)', s)]
     
