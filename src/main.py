@@ -23,37 +23,6 @@ from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-# 키보드 훅 콜백 타입 정의 (수정됨)
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-
-# 전역 키보드 훅
-WH_KEYBOARD_LL = 13
-keyboard_hook = None
-
-def low_level_keyboard_proc(nCode, wParam, lParam):
-    if nCode == 0:
-        vk_code = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong)).contents.value
-        if vk_code in [0x25, 0x26, 0x27, 0x28, 0x2E, 0x21, 0x22]:
-            return 1
-    return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-keyboard_proc = HOOKPROC(low_level_keyboard_proc)
-
-def setup_keyboard_hook():
-    global keyboard_hook
-    keyboard_hook = user32.SetWindowsHookExW(
-        WH_KEYBOARD_LL,
-        keyboard_proc,
-        kernel32.GetModuleHandleW(None),
-        0
-    )
-
-def remove_keyboard_hook():
-    global keyboard_hook
-    if keyboard_hook:
-        user32.UnhookWindowsHookEx(keyboard_hook)
-        keyboard_hook = None
-
 PIL_Image = None
 
 def get_pil_image():
@@ -167,8 +136,8 @@ class Settings:
             'preload_next': True,
             'associated_extensions': [],
             'shortcuts': {
-                'next_image': ['Right', ''],
-                'prev_image': ['Left', ''],
+                'next_image': ['Right', 'XButton2'],
+                'prev_image': ['Left', 'XButton1'],
                 'zoom_in': ['Up', ''],
                 'zoom_out': ['Down', ''],
                 'toggle_actual_size': ['0', ''],
@@ -488,6 +457,7 @@ class ShortcutSettingsDialog(QDialog):
         self.current_slot = 0
         self.init_ui()
         self.load_shortcuts()
+        self.setMouseTracking(True)
     
     def init_ui(self):
         self.setWindowTitle('단축키 설정')
@@ -501,7 +471,7 @@ class ShortcutSettingsDialog(QDialog):
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
         layout = QVBoxLayout(self)
-        info_label = QLabel('각 기능에 최대 2개의 단축키를 설정할 수 있습니다. ESC 키는 단축키를 삭제합니다.')
+        info_label = QLabel('버튼 클릭 후 키보드 키 또는 마우스 버튼을 누르세요. ESC 키는 단축키를 삭제합니다.')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         actions = [
@@ -557,9 +527,10 @@ class ShortcutSettingsDialog(QDialog):
         self.capturing = True
         self.current_action = action_key
         self.current_slot = slot
-        button.setText('입력 대기 중...')
+        button.setText('키/마우스 입력 대기...')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
+        self.grabMouse()
         self.setFocus()
     
     def keyPressEvent(self, event):
@@ -579,11 +550,39 @@ class ShortcutSettingsDialog(QDialog):
                 return
         super().keyPressEvent(event)
     
+    def mousePressEvent(self, event):
+        if self.capturing and self.current_action:
+            button = event.button()
+            mouse_buttons = {
+                Qt.LeftButton: 'Left Click',
+                Qt.RightButton: 'Right Click',
+                Qt.MiddleButton: 'Middle Click',
+                Qt.XButton1: 'XButton1',
+                Qt.XButton2: 'XButton2'
+            }
+            if button in mouse_buttons:
+                button_text = mouse_buttons[button]
+                self.shortcut_buttons[self.current_action][self.current_slot].setText(button_text)
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+                self.stop_capture()
+                return
+        super().mousePressEvent(event)
+    
+    def mouseDoubleClickEvent(self, event):
+        if self.capturing and self.current_action:
+            if event.button() == Qt.LeftButton:
+                self.shortcut_buttons[self.current_action][self.current_slot].setText('Left Double Click')
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+                self.stop_capture()
+                return
+        super().mouseDoubleClickEvent(event)
+    
     def stop_capture(self):
         self.capturing = False
         self.current_action = None
         self.current_slot = 0
         self.releaseKeyboard()
+        self.releaseMouse()
     
     def reset_defaults(self):
         defaults = self.settings.default_settings()['shortcuts']
@@ -624,6 +623,7 @@ class SettingsDialog(QDialog):
             QPushButton:hover { background-color: #4c4c4c; }
         """)
         layout = QVBoxLayout(self)
+        
         file_assoc_group = QGroupBox('파일 연결')
         file_assoc_layout = QVBoxLayout()
         file_assoc_label = QLabel('Pekoviewer로 열 파일 확장자:')
@@ -634,6 +634,7 @@ class SettingsDialog(QDialog):
             file_assoc_layout.addWidget(checkbox)
         file_assoc_group.setLayout(file_assoc_layout)
         layout.addWidget(file_assoc_group)
+        
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         self.zoom_quality = QComboBox()
@@ -647,6 +648,7 @@ class SettingsDialog(QDialog):
         display_layout.addRow('', self.fit_to_window)
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
+        
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         self.cache_size = QSpinBox()
@@ -657,6 +659,7 @@ class SettingsDialog(QDialog):
         performance_layout.addRow('', self.preload_next)
         performance_group.setLayout(performance_layout)
         layout.addWidget(performance_group)
+        
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
         self.slideshow_mode = QComboBox()
@@ -673,12 +676,14 @@ class SettingsDialog(QDialog):
         slideshow_layout.addRow('GIF 재생 횟수:', self.slideshow_gif_loops)
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
+        
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
+        
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -1218,17 +1223,25 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
+        # XButton1/XButton2 우선 처리 (다른 프로그램에 영향 없도록)
+        if event.button() == Qt.XButton1:
+            self.prev_image()
+            event.accept()
+            return
+        elif event.button() == Qt.XButton2:
+            self.next_image()
+            event.accept()
+            return
+        
         button_text = ''
         if event.button() == Qt.LeftButton:
             button_text = 'Left Click'
         elif event.button() == Qt.MiddleButton:
             button_text = 'Middle Click'
-        elif event.button() == Qt.XButton1:
-            button_text = 'XButton1'
-        elif event.button() == Qt.XButton2:
-            button_text = 'XButton2'
+        
         if button_text:
             self.check_mouse_shortcut(button_text)
+        
         super().mousePressEvent(event)
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -1245,24 +1258,19 @@ class ImageViewer(QMainWindow):
         self.save_settings()
         self.stop_current_movie()
         self.slideshow.stop()
-        remove_keyboard_hook()
         super().closeEvent(event)
 
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    
     single_app = SingleApplication()
     if single_app.is_running():
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
     single_app.start_server()
-    
-    try:
-        setup_keyboard_hook()
-    except Exception as e:
-        print(f"키보드 훅 설정 실패: {e}")
     
     viewer = ImageViewer()
     single_app.set_file_received_callback(viewer.load_path)
@@ -1272,9 +1280,9 @@ def main():
     
     viewer.show()
     
-    QTimer.singleShot(100, viewer.force_foreground)
-    QTimer.singleShot(300, viewer.force_foreground)
-    QTimer.singleShot(500, viewer.force_foreground)
+    # 더 많은 지연 시간으로 반복 호출
+    for delay in [50, 100, 200, 400, 800, 1500]:
+        QTimer.singleShot(delay, viewer.force_foreground)
     
     sys.exit(app.exec_())
 
