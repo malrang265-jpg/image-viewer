@@ -12,13 +12,15 @@ jobs:
     steps:
     - uses: actions/checkout@v5
     
-    - name: Debug - List files
+    - name: Debug - List all files
       shell: cmd
       run: |
         echo Current directory:
         cd
-        echo All files:
-        dir /s /b
+        echo Root files:
+        dir /b
+        echo All files recursively:
+        dir /s /b *.py
     
     - uses: actions/setup-python@v6
       with:
@@ -32,14 +34,26 @@ jobs:
     - name: Build EXE
       shell: cmd
       run: |
-        pyinstaller --windowed --name Pekoviewer main.py
+        if exist main.py (
+          echo Found main.py in root
+          pyinstaller --windowed --name Pekoviewer main.py
+        ) else if exist src\main.py (
+          echo Found main.py in src folder
+          pyinstaller --windowed --name Pekoviewer src\main.py
+        ) else (
+          echo ERROR: main.py not found!
+          dir /s /b
+          exit 1
+        )
     
     - name: Create ZIP
       shell: powershell
       run: |
-        Compress-Archive -Path "dist\Pekoviewer\*" -DestinationPath "dist\Pekoviewer_Portable.zip"
+        if (Test-Path "dist\Pekoviewer") {
+          Compress-Archive -Path "dist\Pekoviewer\*" -DestinationPath "dist\Pekoviewer_Portable.zip"
+        }
     
-    - name: Upload Portable ZIP
+    - name: Upload ZIP
       uses: actions/upload-artifact@v5
       with:
         name: Pekoviewer_Portable
