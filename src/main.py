@@ -134,6 +134,8 @@ class Settings:
             'show_filename': False,
             'background_color': '#2b2b2b',
             'fit_to_window': True,
+            'snap_enabled': True,  # 자석 기능
+            'snap_threshold': 20,  # 자석 작동 거리(픽셀)
             'slideshow_interval': 3,
             'slideshow_mode': 'time',
             'slideshow_gif_loops': 2,
@@ -654,6 +656,18 @@ class SettingsDialog(QDialog):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
+        # 자석 기능 설정
+        snap_group = QGroupBox('창 자석 기능')
+        snap_layout = QFormLayout()
+        self.snap_enabled = QCheckBox('화면 가장자리에 달라붙기')
+        snap_layout.addRow('', self.snap_enabled)
+        self.snap_threshold = QSpinBox()
+        self.snap_threshold.setRange(5, 50)
+        self.snap_threshold.setSuffix(' 픽셀')
+        snap_layout.addRow('자석 작동 거리:', self.snap_threshold)
+        snap_group.setLayout(snap_layout)
+        layout.addWidget(snap_group)
+        
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         self.cache_size = QSpinBox()
@@ -708,6 +722,8 @@ class SettingsDialog(QDialog):
             self.zoom_quality.setCurrentIndex(index)
         self.show_filename.setChecked(self.settings.get('show_filename', False))
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
+        self.snap_enabled.setChecked(self.settings.get('snap_enabled', True))
+        self.snap_threshold.setValue(self.settings.get('snap_threshold', 20))
         self.cache_size.setValue(self.settings.get('cache_size', 100))
         self.preload_next.setChecked(self.settings.get('preload_next', True))
         mode = self.settings.get('slideshow_mode', 'time')
@@ -741,6 +757,8 @@ class SettingsDialog(QDialog):
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
+        self.settings.set('snap_enabled', self.snap_enabled.isChecked())
+        self.settings.set('snap_threshold', self.snap_threshold.value())
         self.settings.set('cache_size', self.cache_size.value())
         self.settings.set('preload_next', self.preload_next.isChecked())
         self.settings.set('slideshow_mode', self.slideshow_mode.currentData())
@@ -824,6 +842,31 @@ class ImageViewer(QMainWindow):
                 user32.AttachThreadInput(cur_thread, fg_thread, False)
         except:
             pass
+    
+    def snap_to_edge(self, pos):
+        """자석 기능 - 화면 가장자리에 붙이기"""
+        if not self.settings.get('snap_enabled', True):
+            return pos
+        
+        threshold = self.settings.get('snap_threshold', 20)
+        screen = QApplication.primaryScreen().availableGeometry()
+        x, y = pos.x(), pos.y()
+        w, h = self.width(), self.height()
+        
+        # 왼쪽 가장자리
+        if abs(x - screen.left()) < threshold:
+            x = screen.left()
+        # 오른쪽 가장자리
+        if abs((x + w) - screen.right()) < threshold:
+            x = screen.right() - w
+        # 위쪽 가장자리
+        if abs(y - screen.top()) < threshold:
+            y = screen.top()
+        # 아래쪽 가장자리
+        if abs((y + h) - screen.bottom()) < threshold:
+            y = screen.bottom() - h
+        
+        return QPoint(x, y)
     
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
@@ -1352,7 +1395,10 @@ class ImageViewer(QMainWindow):
             return
         if self.dragging and self.drag_start_pos:
             delta = event.globalPos() - self.drag_start_pos
-            self.move(self.window_start_pos + delta)
+            new_pos = self.window_start_pos + delta
+            # 자석 기능 적용
+            new_pos = self.snap_to_edge(new_pos)
+            self.move(new_pos)
             event.accept()
             return
         self.update_cursor(event.pos())
