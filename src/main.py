@@ -99,14 +99,31 @@ class ImageLoader:
     @staticmethod
     def load_pixmap(filepath, quality='balanced'):
         try:
+            # PIL로 이미지 로드
             with Image.open(filepath) as img:
-                if img.mode not in ('RGB', 'RGBA'):
+                # RGB/RGBA 변환
+                if img.mode == 'P':
                     img = img.convert('RGBA')
-                data = img.tobytes('raw', img.mode)
-                qimage = QImage(data, img.width, img.height, 
-                               QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
-                return QPixmap.fromImage(qimage.copy())
-        except:
+                elif img.mode == 'L':
+                    img = img.convert('RGB')
+                elif img.mode == 'CMYK':
+                    img = img.convert('RGB')
+                elif img.mode not in ('RGB', 'RGBA'):
+                    img = img.convert('RGBA')
+                
+                # QImage 변환
+                if img.mode == 'RGBA':
+                    data = img.tobytes('raw', 'RGBA')
+                    qimage = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
+                else:
+                    data = img.tobytes('raw', 'RGB')
+                    qimage = QImage(data, img.width, img.height, QImage.Format_RGB888)
+                
+                # QPixmap 변환
+                pixmap = QPixmap.fromImage(qimage.copy())
+                return pixmap
+        except Exception as e:
+            print(f"이미지 로드 실패: {filepath} - {e}")
             return None
     
     @staticmethod
@@ -169,11 +186,23 @@ class ZipHandler:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
                 img = Image.open(BytesIO(data))
-                if img.mode not in ('RGB', 'RGBA'):
+                
+                if img.mode == 'P':
                     img = img.convert('RGBA')
-                data_bytes = img.tobytes('raw', img.mode)
-                qimage = QImage(data_bytes, img.width, img.height,
-                              QImage.Format_RGBA8888 if img.mode == 'RGBA' else QImage.Format_RGB888)
+                elif img.mode == 'L':
+                    img = img.convert('RGB')
+                elif img.mode == 'CMYK':
+                    img = img.convert('RGB')
+                elif img.mode not in ('RGB', 'RGBA'):
+                    img = img.convert('RGBA')
+                
+                if img.mode == 'RGBA':
+                    data_bytes = img.tobytes('raw', 'RGBA')
+                    qimage = QImage(data_bytes, img.width, img.height, QImage.Format_RGBA8888)
+                else:
+                    data_bytes = img.tobytes('raw', 'RGB')
+                    qimage = QImage(data_bytes, img.width, img.height, QImage.Format_RGB888)
+                
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
@@ -290,7 +319,7 @@ class ShortcutSettingsDialog(QDialog):
             group = QGroupBox(action_name)
             group_layout = QHBoxLayout()
             
-            button = QPushButton('클릭하여 키 입력')
+            button = QPushButton('클릭하여 설정')
             button.setMinimumWidth(150)
             button.clicked.connect(lambda checked, k=action_key, b=button: self.start_capture(k, b))
             self.shortcut_buttons[action_key] = button
@@ -315,6 +344,9 @@ class ShortcutSettingsDialog(QDialog):
         button_layout.addWidget(cancel_button)
         
         layout.addLayout(button_layout)
+        
+        # 마우스 이벤트 추적 활성화
+        self.setMouseTracking(True)
     
     def load_shortcuts(self):
         actions = ['next_image', 'prev_image', 'toggle_fullscreen', 'close_program',
@@ -332,8 +364,10 @@ class ShortcutSettingsDialog(QDialog):
         
         self.capturing = True
         self.current_action = action_key
-        button.setText('키/마우스 버튼을 누르세요...')
+        button.setText('키/마우스 버튼 누르세요...')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
+        self.grabKeyboard()
+        self.grabMouse()
     
     def keyPressEvent(self, event):
         if self.capturing and self.current_action:
@@ -351,6 +385,8 @@ class ShortcutSettingsDialog(QDialog):
                 self.shortcut_buttons[self.current_action].setStyleSheet("")
                 self.capturing = False
                 self.current_action = None
+                self.releaseKeyboard()
+                self.releaseMouse()
         
         super().keyPressEvent(event)
     
@@ -372,9 +408,26 @@ class ShortcutSettingsDialog(QDialog):
                 self.shortcut_buttons[self.current_action].setStyleSheet("")
                 self.capturing = False
                 self.current_action = None
+                self.releaseKeyboard()
+                self.releaseMouse()
                 return
         
         super().mousePressEvent(event)
+    
+    def mouseDoubleClickEvent(self, event):
+        if self.capturing and self.current_action:
+            button = event.button()
+            
+            if button == Qt.LeftButton:
+                self.shortcut_buttons[self.current_action].setText('Left Double Click')
+                self.shortcut_buttons[self.current_action].setStyleSheet("")
+                self.capturing = False
+                self.current_action = None
+                self.releaseKeyboard()
+                self.releaseMouse()
+                return
+        
+        super().mouseDoubleClickEvent(event)
     
     def cancel_capture(self):
         if self.current_action and self.current_action in self.shortcut_buttons:
@@ -383,6 +436,8 @@ class ShortcutSettingsDialog(QDialog):
             self.shortcut_buttons[self.current_action].setStyleSheet("")
         self.capturing = False
         self.current_action = None
+        self.releaseKeyboard()
+        self.releaseMouse()
     
     def reset_defaults(self):
         defaults = self.settings.default_settings()['shortcuts']
@@ -741,7 +796,6 @@ class ImageViewer(QMainWindow):
         # 애니메이션 크기 조정
         if self.current_movie:
             if self.fit_to_window:
-                # QMovie 크기 조정
                 original_size = self.current_movie.currentPixmap().size()
                 if original_size.width() > 0 and original_size.height() > 0:
                     scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
@@ -934,6 +988,12 @@ class ImageViewer(QMainWindow):
         shortcuts_action.triggered.connect(self.show_shortcut_settings)
         menu.addAction(shortcuts_action)
         
+        menu.addSeparator()
+        
+        close_action = QAction('프로그램 종료', self)
+        close_action.triggered.connect(self.close_program)
+        menu.addAction(close_action)
+        
         menu.exec_(self.mapToGlobal(pos))
     
     def show_settings(self):
@@ -966,23 +1026,40 @@ class ImageViewer(QMainWindow):
     
     def mousePressEvent(self, event: QMouseEvent):
         # 설정된 마우스 단축키 확인
-        mouse_next = self.settings.get_shortcut('mouse_next', '')
-        mouse_prev = self.settings.get_shortcut('mouse_prev', '')
+        next_shortcut = self.settings.get_shortcut('next_image', '')
+        prev_shortcut = self.settings.get_shortcut('prev_image', '')
         
         button_text = ''
-        if event.button() == Qt.XButton1:
+        if event.button() == Qt.LeftButton:
+            button_text = 'Left Click'
+        elif event.button() == Qt.RightButton:
+            button_text = 'Right Click'
+        elif event.button() == Qt.MiddleButton:
+            button_text = 'Middle Click'
+        elif event.button() == Qt.XButton1:
             button_text = 'XButton1'
         elif event.button() == Qt.XButton2:
             button_text = 'XButton2'
-        elif event.button() == Qt.MiddleButton:
-            button_text = 'Middle Click'
         
-        if button_text == mouse_next:
+        if button_text == next_shortcut:
             self.next_image()
-        elif button_text == mouse_prev:
+        elif button_text == prev_shortcut:
             self.prev_image()
         
         super().mousePressEvent(event)
+    
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        # 더블클릭 단축키 확인
+        next_shortcut = self.settings.get_shortcut('next_image', '')
+        prev_shortcut = self.settings.get_shortcut('prev_image', '')
+        
+        if event.button() == Qt.LeftButton:
+            if next_shortcut == 'Left Double Click':
+                self.next_image()
+            elif prev_shortcut == 'Left Double Click':
+                self.prev_image()
+        
+        super().mouseDoubleClickEvent(event)
     
     def resizeEvent(self, event):
         super().resizeEvent(event)
