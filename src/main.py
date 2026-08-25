@@ -10,11 +10,37 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
-                            QListWidget, QListWidgetItem, QShortcut)
+                            QListWidget, QListWidgetItem, QShortcut, QMessageBox)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent)
+from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PIL import Image
+
+class SingleApplication:
+    """중복 실행 방지"""
+    def __init__(self, app_name="ImageViewerApp"):
+        self.app_name = app_name
+        self.socket = QLocalSocket()
+        self.server = None
+    
+    def is_running(self):
+        """이미 실행 중인지 확인"""
+        self.socket.connectToServer(self.app_name)
+        if self.socket.waitForConnected(100):
+            return True
+        return False
+    
+    def start_server(self):
+        """서버 시작"""
+        self.server = QLocalServer()
+        self.server.listen(self.app_name)
+    
+    def send_message(self, message):
+        """실행 중인 인스턴스에 메시지 전송"""
+        if self.socket.state() == QLocalSocket.ConnectedState:
+            self.socket.write(message.encode())
+            self.socket.flush()
 
 class Settings:
     def __init__(self):
@@ -99,20 +125,18 @@ class ImageLoader:
     @staticmethod
     def load_pixmap(filepath, quality='balanced'):
         try:
-            # QPixmap으로 직접 로드 시도
+            # QPixmap으로 직접 로드
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
                 return pixmap
             
-            # QPixmap으로 실패하면 PIL로 시도
+            # PIL로 폴백
             with Image.open(filepath) as img:
                 img = img.convert('RGBA')
                 data = img.tobytes('raw', 'RGBA')
                 qimage = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
-                pixmap = QPixmap.fromImage(qimage.copy())
-                return pixmap
-        except Exception as e:
-            print(f"이미지 로드 실패: {filepath} - {e}")
+                return QPixmap.fromImage(qimage.copy())
+        except:
             return None
     
     @staticmethod
@@ -174,20 +198,16 @@ class ZipHandler:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
-                
-                # QPixmap으로 직접 로드 시도
                 pixmap = QPixmap()
                 if pixmap.loadFromData(data):
                     return pixmap
                 
-                # PIL로 시도
                 img = Image.open(BytesIO(data))
                 img = img.convert('RGBA')
                 data_bytes = img.tobytes('raw', 'RGBA')
                 qimage = QImage(data_bytes, img.width, img.height, QImage.Format_RGBA8888)
                 return QPixmap.fromImage(qimage.copy())
-        except Exception as e:
-            print(f"ZIP 이미지 로드 실패: {filename} - {e}")
+        except:
             return None
     
     @staticmethod
@@ -344,9 +364,11 @@ class ShortcutSettingsDialog(QDialog):
         
         self.capturing = True
         self.current_action = action_key
-        button.setText('키/마우스 버튼 누르세요...')
+        button.setText('입력 대기 중...')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
+        self.grabMouse()
+        self.setFocus()
     
     def keyPressEvent(self, event):
         if self.capturing and self.current_action:
@@ -362,9 +384,7 @@ class ShortcutSettingsDialog(QDialog):
             if key_sequence and self.current_action in self.shortcut_buttons:
                 self.shortcut_buttons[self.current_action].setText(key_sequence)
                 self.shortcut_buttons[self.current_action].setStyleSheet("")
-                self.capturing = False
-                self.current_action = None
-                self.releaseKeyboard()
+                self.stop_capture()
         
         super().keyPressEvent(event)
     
@@ -384,9 +404,7 @@ class ShortcutSettingsDialog(QDialog):
                 button_text = mouse_buttons[button]
                 self.shortcut_buttons[self.current_action].setText(button_text)
                 self.shortcut_buttons[self.current_action].setStyleSheet("")
-                self.capturing = False
-                self.current_action = None
-                self.releaseKeyboard()
+                self.stop_capture()
                 return
         
         super().mousePressEvent(event)
@@ -396,21 +414,23 @@ class ShortcutSettingsDialog(QDialog):
             if event.button() == Qt.LeftButton:
                 self.shortcut_buttons[self.current_action].setText('Left Double Click')
                 self.shortcut_buttons[self.current_action].setStyleSheet("")
-                self.capturing = False
-                self.current_action = None
-                self.releaseKeyboard()
+                self.stop_capture()
                 return
         
         super().mouseDoubleClickEvent(event)
+    
+    def stop_capture(self):
+        self.capturing = False
+        self.current_action = None
+        self.releaseKeyboard()
+        self.releaseMouse()
     
     def cancel_capture(self):
         if self.current_action and self.current_action in self.shortcut_buttons:
             original = self.settings.get_shortcut(self.current_action, '없음')
             self.shortcut_buttons[self.current_action].setText(original)
             self.shortcut_buttons[self.current_action].setStyleSheet("")
-        self.capturing = False
-        self.current_action = None
-        self.releaseKeyboard()
+        self.stop_capture()
     
     def reset_defaults(self):
         defaults = self.settings.default_settings()['shortcuts']
@@ -619,7 +639,6 @@ class ImageViewer(QMainWindow):
         for action_name, callback in shortcut_actions.items():
             key = self.settings.get_shortcut(action_name, '')
             if key and key != '없음' and key != '':
-                # 마우스 클릭 단축키는 QShortcut으로 처리 불가
                 if 'Click' in key:
                     continue
                 
@@ -632,7 +651,6 @@ class ImageViewer(QMainWindow):
     
     def check_mouse_shortcut(self, button_text):
         """마우스 단축키 확인 및 실행"""
-        # 모든 단축키 액션 확인
         actions = {
             'next_image': self.next_image,
             'prev_image': self.prev_image,
@@ -666,6 +684,7 @@ class ImageViewer(QMainWindow):
         if urls:
             path = urls[0].toLocalFile()
             self.load_path(path)
+            event.acceptProposedAction()
     
     def load_settings(self):
         geometry = self.settings.get('window_geometry')
@@ -690,7 +709,12 @@ class ImageViewer(QMainWindow):
         self.current_zip = None
         
         try:
-            for filename in sorted(os.listdir(directory)):
+            # Windows 탐색기 정렬 순서와 동일하게 정렬
+            files = os.listdir(directory)
+            # 자연스러운 정렬 (숫자 인식)
+            files.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() for c in __import__('re').split(r'(\d+)', x)])
+            
+            for filename in files:
                 if ImageLoader.is_supported(filename):
                     self.image_list.append(os.path.join(directory, filename))
         except:
@@ -797,11 +821,6 @@ class ImageViewer(QMainWindow):
                 original_size = self.current_movie.currentPixmap().size()
                 if original_size.width() > 0 and original_size.height() > 0:
                     scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
-                    self.current_movie.setScaledSize(scaled_size)
-            else:
-                original_size = self.current_movie.currentPixmap().size()
-                if original_size.width() > 0 and original_size.height() > 0:
-                    scaled_size = original_size * self.zoom_factor
                     self.current_movie.setScaledSize(scaled_size)
         
         # 일반 이미지 크기 조정
@@ -1015,7 +1034,6 @@ class ImageViewer(QMainWindow):
             self.show_current_image()
     
     def wheelEvent(self, event: QWheelEvent):
-        # 휠 위로 = 이전 이미지, 휠 아래로 = 다음 이미지
         if event.angleDelta().y() > 0:
             self.prev_image()
         else:
@@ -1023,7 +1041,6 @@ class ImageViewer(QMainWindow):
         event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
-        # 마우스 버튼 텍스트 변환
         button_text = ''
         if event.button() == Qt.LeftButton:
             button_text = 'Left Click'
@@ -1042,7 +1059,6 @@ class ImageViewer(QMainWindow):
         super().mousePressEvent(event)
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        # 더블클릭 확인
         if event.button() == Qt.LeftButton:
             self.check_mouse_shortcut('Left Double Click')
         
@@ -1060,6 +1076,16 @@ class ImageViewer(QMainWindow):
         super().closeEvent(event)
 
 def main():
+    # 중복 실행 방지
+    single_app = SingleApplication()
+    if single_app.is_running():
+        # 이미 실행 중이면 메시지 전송 후 종료
+        if len(sys.argv) > 1:
+            single_app.send_message(sys.argv[1])
+        sys.exit(0)
+    
+    single_app.start_server()
+    
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
