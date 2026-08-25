@@ -13,26 +13,25 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
                             QListWidget, QListWidgetItem, QShortcut, QMessageBox,
                             QListView)
-from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize
+from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PIL import Image
 
 def get_app_dir():
-    """프로그램 실행 파일이 있는 폴더 반환"""
     if getattr(sys, 'frozen', False):
-        # PyInstaller로 패키징된 경우
         return os.path.dirname(sys.executable)
     else:
-        # 개발 환경
         return os.path.dirname(os.path.abspath(__file__))
 
 class SingleApplication:
+    """중복 실행 방지 및 파일 전달"""
     def __init__(self, app_name="PekoviewerApp"):
         self.app_name = app_name
         self.socket = QLocalSocket()
         self.server = None
+        self.message_received = pyqtSignal(str) if hasattr(self, 'message_received') else None
     
     def is_running(self):
         self.socket.connectToServer(self.app_name)
@@ -43,15 +42,27 @@ class SingleApplication:
     def start_server(self):
         self.server = QLocalServer()
         self.server.listen(self.app_name)
+        self.server.newConnection.connect(self.on_new_connection)
     
     def send_message(self, message):
         if self.socket.state() == QLocalSocket.ConnectedState:
             self.socket.write(message.encode())
             self.socket.flush()
+            self.socket.disconnectFromServer()
+    
+    def on_new_connection(self):
+        socket = self.server.nextPendingConnection()
+        if socket.waitForReadyRead(100):
+            data = socket.readAll().data().decode()
+            if hasattr(self, 'file_received_callback') and self.file_received_callback:
+                self.file_received_callback(data)
+        socket.disconnectFromServer()
+    
+    def set_file_received_callback(self, callback):
+        self.file_received_callback = callback
 
 class Settings:
     def __init__(self):
-        # 설정 파일을 프로그램 폴더에 저장
         app_dir = get_app_dir()
         self.settings_file = os.path.join(app_dir, 'pekoviewer_settings.json')
         self.load()
@@ -151,7 +162,7 @@ class ImageLoader:
             return None
     
     @staticmethod
-    def load_thumbnail(filepath, size=(100, 100)):
+    def load_thumbnail(filepath, size=(150, 150)):
         try:
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
@@ -169,6 +180,28 @@ class ImageLoader:
         except:
             pass
         return None
+
+class ThumbnailLoader(QThread):
+    """비동기 썸네일 로더"""
+    thumbnail_loaded = pyqtSignal(int, QPixmap)
+    
+    def __init__(self, index, filepath, current_zip=None):
+        super().__init__()
+        self.index = index
+        self.filepath = filepath
+        self.current_zip = current_zip
+    
+    def run(self):
+        try:
+            if self.current_zip:
+                pixmap = ZipHandler.load_image_from_zip(self.current_zip, self.filepath)
+            else:
+                pixmap = ImageLoader.load_thumbnail(self.filepath)
+            
+            if pixmap:
+                self.thumbnail_loaded.emit(self.index, pixmap)
+        except:
+            pass
 
 class CacheManager:
     def __init__(self, max_size=50):
@@ -216,7 +249,6 @@ class ZipHandler:
     
     @staticmethod
     def get_temp_path(filename):
-        """임시 파일 경로를 프로그램 폴더에 생성"""
         app_dir = get_app_dir()
         return os.path.join(app_dir, filename)
     
@@ -257,6 +289,7 @@ class ImageListDialog(QDialog):
         self.current_index = current_index
         self.selected_index = current_index
         self.current_zip = current_zip
+        self.thumbnail_loader = None
         self.init_ui()
     
     def init_ui(self):
@@ -267,36 +300,38 @@ class ImageListDialog(QDialog):
             QDialog { background-color: #2b2b2b; color: white; }
             QListWidget { background-color: #3c3c3c; color: white; border: 1px solid #555; }
             QListWidget::item:selected { background-color: #4a90d9; }
+            QLabel { color: white; }
             QPushButton { background-color: #3c3c3c; color: white; border: 1px solid #555; padding: 5px; }
             QPushButton:hover { background-color: #4c4c4c; }
         """)
         
         layout = QVBoxLayout(self)
         
+        # 상단 썸네일 미리보기
+        self.preview_label = QLabel('이미지를 선택하세요')
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(200)
+        self.preview_label.setStyleSheet("border: 1px solid #555; background-color: #3c3c3c;")
+        layout.addWidget(self.preview_label)
+        
+        # 파일 목록 (리스트 모드 - 빠른 로딩)
         self.list_widget = QListWidget()
-        self.list_widget.setViewMode(QListView.IconMode)
-        self.list_widget.setIconSize(QSize(80, 80))
-        self.list_widget.setGridSize(QSize(100, 100))
-        self.list_widget.setResizeMode(QListView.Adjust)
-        self.list_widget.setMovement(QListView.Static)
-        self.list_widget.setSpacing(5)
+        self.list_widget.setViewMode(QListView.ListMode)
+        self.list_widget.setSpacing(2)
         
         for i, image_path in enumerate(self.image_list):
             display_name = os.path.basename(image_path)
             item = QListWidgetItem(display_name)
             item.setData(Qt.UserRole, i)
-            item.setTextAlignment(Qt.AlignCenter)
-            
-            thumbnail = self.load_thumbnail(image_path)
-            if thumbnail:
-                item.setIcon(QIcon(thumbnail))
-            
             self.list_widget.addItem(item)
         
         self.list_widget.setCurrentRow(self.current_index)
         self.list_widget.itemDoubleClicked.connect(self.on_double_click)
         self.list_widget.itemClicked.connect(self.on_item_clicked)
         layout.addWidget(self.list_widget)
+        
+        # 현재 선택된 이미지 썸네일 표시
+        self.show_preview(self.current_index)
         
         button_layout = QHBoxLayout()
         select_button = QPushButton('선택')
@@ -307,25 +342,33 @@ class ImageListDialog(QDialog):
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
     
-    def load_thumbnail(self, image_path):
-        try:
-            if self.current_zip:
-                pixmap = ZipHandler.load_image_from_zip(self.current_zip, image_path)
-            else:
-                pixmap = ImageLoader.load_thumbnail(image_path)
-            
-            if pixmap:
-                return pixmap
-        except:
-            pass
-        return None
-    
     def on_item_clicked(self, item):
         self.selected_index = item.data(Qt.UserRole)
+        self.show_preview(self.selected_index)
     
     def on_double_click(self, item):
         self.selected_index = item.data(Qt.UserRole)
         self.accept()
+    
+    def show_preview(self, index):
+        if index < 0 or index >= len(self.image_list):
+            return
+        
+        self.preview_label.setText('로딩 중...')
+        image_path = self.image_list[index]
+        
+        # 비동기로 썸네일 로드
+        if self.thumbnail_loader and self.thumbnail_loader.isRunning():
+            self.thumbnail_loader.wait()
+        
+        self.thumbnail_loader = ThumbnailLoader(index, image_path, self.current_zip)
+        self.thumbnail_loader.thumbnail_loaded.connect(self.on_thumbnail_loaded)
+        self.thumbnail_loader.start()
+    
+    def on_thumbnail_loaded(self, index, pixmap):
+        if index == self.selected_index:
+            scaled = pixmap.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.preview_label.setPixmap(scaled)
     
     def get_selected_index(self):
         return self.selected_index
@@ -655,6 +698,7 @@ class ImageViewer(QMainWindow):
         self.original_pixmap = None
         self.is_loading = False
         
+        # 빠른 시작을 위해 UI만 먼저 초기화
         self.init_ui()
         self.load_settings()
         self.setup_shortcuts()
@@ -663,17 +707,23 @@ class ImageViewer(QMainWindow):
         self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
     
     def setup_icon(self):
-        """아이콘 설정"""
+        """아이콘 설정 - 제목 표시줄과 작업 표시줄 모두 적용"""
         icon_path = os.path.join(get_app_dir(), 'icon.ico')
         
         if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+            icon = QIcon(icon_path)
+            self.setWindowIcon(icon)
             # 작업 표시줄 아이콘도 설정
-            if hasattr(sys, '_MEIPASS'):
-                # PyInstaller 패키징된 경우
-                icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
-                if os.path.exists(icon_path):
-                    self.setWindowIcon(QIcon(icon_path))
+            if hasattr(self, 'windowHandle'):
+                self.windowHandle().setIcon(icon)
+        elif getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # PyInstaller 패키징된 경우
+            icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
+            if os.path.exists(icon_path):
+                icon = QIcon(icon_path)
+                self.setWindowIcon(icon)
+                if hasattr(self, 'windowHandle'):
+                    self.windowHandle().setIcon(icon)
     
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
@@ -745,6 +795,8 @@ class ImageViewer(QMainWindow):
                     try:
                         shortcut = QShortcut(QKeySequence(key), self)
                         shortcut.activated.connect(callback)
+                        # 단축키가 다른 프로그램에 영향 주지 않도록 설정
+                        shortcut.setContext(Qt.ApplicationShortcut)
                         self.shortcut_objects[f"{action_name}_{i}"] = shortcut
                     except:
                         pass
@@ -1136,22 +1188,31 @@ class ImageViewer(QMainWindow):
         super().closeEvent(event)
 
 def main():
+    # 중복 실행 확인
     single_app = SingleApplication()
+    
     if single_app.is_running():
+        # 이미 실행 중이면 파일 경로 전달
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
     
     single_app.start_server()
     
+    # 빠른 시작을 위해 최소한의 설정만 먼저
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
     viewer = ImageViewer()
+    
+    # 파일 수신 콜백 설정
+    single_app.set_file_received_callback(viewer.load_path)
+    
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
+    
     viewer.show()
     sys.exit(app.exec_())
 
