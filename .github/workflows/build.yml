@@ -25,9 +25,14 @@ jobs:
       shell: cmd
       run: |
         python -m nuitka --msvc=latest --windows-console-mode=disable --standalone --enable-plugin=pyqt5 --lto=yes --assume-yes-for-downloads --output-dir=dist --output-filename=Pekoviewer.exe main.py
+        dir dist
     
     - name: Upload
       uses: actions/upload-artifact@v5
       with:
         name: Pekoviewer_Fastest
-        path: src/dist/Pekoviewer.dist/
+        path: |
+          src/dist/Pekoviewer.dist/
+          src/dist/*.exe
+          src/dist/*.dist/
+        if-no-files-found: ignore
