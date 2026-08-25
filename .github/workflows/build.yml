@@ -1,4 +1,4 @@
-name: Build Pekoviewer
+name: Build
 
 on:
   push:
@@ -12,49 +12,19 @@ jobs:
     steps:
     - uses: actions/checkout@v5
     
-    - name: Debug - List all files
-      shell: cmd
-      run: |
-        echo Current directory:
-        cd
-        echo Root files:
-        dir /b
-        echo All files recursively:
-        dir /s /b *.py
-    
     - uses: actions/setup-python@v6
       with:
         python-version: '3.11'
     
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install PyQt5 Pillow pyinstaller
+    - name: Install
+      run: pip install PyQt5 Pillow pyinstaller
     
-    - name: Build EXE
-      shell: cmd
-      run: |
-        if exist main.py (
-          echo Found main.py in root
-          pyinstaller --windowed --name Pekoviewer main.py
-        ) else if exist src\main.py (
-          echo Found main.py in src folder
-          pyinstaller --windowed --name Pekoviewer src\main.py
-        ) else (
-          echo ERROR: main.py not found!
-          dir /s /b
-          exit 1
-        )
+    - name: Build
+      working-directory: src
+      run: pyinstaller --windowed --name Pekoviewer main.py
     
-    - name: Create ZIP
-      shell: powershell
-      run: |
-        if (Test-Path "dist\Pekoviewer") {
-          Compress-Archive -Path "dist\Pekoviewer\*" -DestinationPath "dist\Pekoviewer_Portable.zip"
-        }
-    
-    - name: Upload ZIP
+    - name: Upload folder
       uses: actions/upload-artifact@v5
       with:
         name: Pekoviewer_Portable
-        path: dist/Pekoviewer_Portable.zip
+        path: src/dist/Pekoviewer/
