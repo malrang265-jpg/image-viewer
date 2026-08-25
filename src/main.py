@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes
 import concurrent.futures
 import time as time_module
+import math
 from io import BytesIO
 from collections import OrderedDict
 
@@ -800,8 +801,7 @@ class ImageViewer(QMainWindow):
         self.resize_start_pos = None
         self.resize_start_size = None
         self.resize_region = None
-        self.resize_margin = 12  # 12픽셀로 변경
-        # 마우스 숨김 관련
+        self.resize_margin = 12
         self.cursor_hidden = False
         self.cursor_start_pos = None
         self.cursor_hide_timer = QTimer()
@@ -838,12 +838,13 @@ class ImageViewer(QMainWindow):
     
     def show_cursor(self):
         self.unsetCursor()
+        QApplication.restoreOverrideCursor()
         self.cursor_hidden = False
         self.cursor_start_pos = None
     
     def reset_cursor_timer(self):
         if self.isFullScreen():
-            self.cursor_hide_timer.start(2000)  # 2초 후 숨김
+            self.cursor_hide_timer.start(2000)
     
     def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
@@ -970,7 +971,9 @@ class ImageViewer(QMainWindow):
         elif region in ['topright', 'bottomleft']:
             self.setCursor(Qt.SizeBDiagCursor)
         else:
-            self.unsetCursor()  # 확실히 원상 복귀
+            # 확실히 원상 복귀
+            QApplication.restoreOverrideCursor()
+            self.unsetCursor()
     
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
@@ -1472,8 +1475,8 @@ class ImageViewer(QMainWindow):
                 self.cursor_start_pos = event.globalPos()
             else:
                 delta = event.globalPos() - self.cursor_start_pos
-                distance = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
-                if distance >= 20:  # 20픽셀 이상 움직이면
+                distance = math.sqrt(delta.x() ** 2 + delta.y() ** 2)
+                if distance >= 20:
                     self.show_cursor()
                     self.reset_cursor_timer()
         else:
@@ -1511,6 +1514,7 @@ class ImageViewer(QMainWindow):
             self.resize_start_pos = None
             self.resize_start_size = None
             self.resize_region = None
+            QApplication.restoreOverrideCursor()
             self.unsetCursor()
             event.accept()
             return
@@ -1545,6 +1549,7 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         self.slideshow.stop()
         self.cursor_hide_timer.stop()
+        QApplication.restoreOverrideCursor()
         super().closeEvent(event)
 
 def main():
