@@ -818,10 +818,8 @@ class ImageViewer(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
-        # 예전 방식보다 살짝 덜하게 (3번만 호출)
-        QTimer.singleShot(0, self.force_foreground)
+        QTimer.singleShot(100, self.force_foreground)
         QTimer.singleShot(200, self.force_foreground)
-        QTimer.singleShot(400, self.force_foreground)
     
     def force_foreground(self):
         try:
@@ -1515,10 +1513,9 @@ def main():
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
     viewer.show()
-    # 예전 방식보다 살짝 덜하게 (3번만 호출)
+    # 2번만 호출
     QTimer.singleShot(100, viewer.force_foreground)
-    QTimer.singleShot(300, viewer.force_foreground)
-    QTimer.singleShot(500, viewer.force_foreground)
+    QTimer.singleShot(200, viewer.force_foreground)
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
