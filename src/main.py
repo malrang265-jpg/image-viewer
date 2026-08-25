@@ -4,6 +4,7 @@ import json
 import zipfile
 import threading
 import re
+import ctypes
 from io import BytesIO
 from collections import OrderedDict
 
@@ -591,6 +592,7 @@ class ShortcutSettingsDialog(QDialog):
                 self.shortcut_buttons[self.current_action][self.current_slot].setText(key_sequence)
                 self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
                 self.stop_capture()
+                return
         
         super().keyPressEvent(event)
     
@@ -855,10 +857,24 @@ class ImageViewer(QMainWindow):
                 self.windowHandle().setIcon(icon)
     
     def bring_to_front(self):
-        self.show()
-        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        """창을 맨 앞으로 가져오기"""
+        # 최소화 상태 해제
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        
+        # 창 활성화
         self.raise_()
         self.activateWindow()
+        
+        # Windows API로 강제 활성화
+        if sys.platform == 'win32':
+            try:
+                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+                ctypes.windll.user32.BringWindowToTop(int(self.winId()))
+            except:
+                pass
     
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
@@ -930,7 +946,8 @@ class ImageViewer(QMainWindow):
                 event.accept()
                 return
         
-        super().keyPressEvent(event)
+        # 단축키가 아니면 이벤트 무시
+        event.accept()
     
     def check_mouse_shortcut(self, button_text):
         actions = {
@@ -1268,7 +1285,7 @@ class ImageViewer(QMainWindow):
     def show_shortcut_settings(self):
         dialog = ShortcutSettingsDialog(self.settings, self)
         if dialog.exec_():
-            pass  # keyPressEvent에서 처리하므로 별도 설정 불필요
+            pass
     
     def apply_settings(self):
         cache_size = self.settings.get('cache_size', 50)
