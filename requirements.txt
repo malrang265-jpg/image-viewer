@@ -1,2 +1,7 @@
-PyQt5==5.15.9
-Pillow==10.0.0
+PyQt5==5.15.11
+Pillow==10.3.0
+pyinstaller==6.22.2
+nuitka==2.5.9
+cython==3.0.10
+ordered-set==4.1.0
+zstandard==0.22.0
