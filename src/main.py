@@ -206,6 +206,10 @@ class ImageLoader:
         try:
             Image = get_pil_image()
             with Image.open(filepath) as img:
+                # GIF 첫 프레임 처리
+                if img.format == 'GIF':
+                    img.seek(0)
+                
                 img = img.convert('RGB')
                 
                 if saturation != 100:
@@ -232,6 +236,51 @@ class ImageLoader:
                 return pixmap
         except:
             pass
+        return None
+    
+    @staticmethod
+    def load_gif_with_adjustments(filepath, saturation=100, brightness=100, contrast=100):
+        """GIF를 조절값 적용하여 QMovie로 로드"""
+        try:
+            Image = get_pil_image()
+            gif = Image.open(filepath)
+            
+            frames = []
+            durations = []
+            
+            for frame in range(gif.n_frames):
+                gif.seek(frame)
+                frame_img = gif.convert('RGB')
+                
+                # 조절 적용
+                if saturation != 100:
+                    enhancer = get_pil_enhance().Color(frame_img)
+                    frame_img = enhancer.enhance(saturation / 100.0)
+                if brightness != 100:
+                    enhancer = get_pil_enhance().Brightness(frame_img)
+                    frame_img = enhancer.enhance(brightness / 100.0)
+                if contrast != 100:
+                    enhancer = get_pil_enhance().Contrast(frame_img)
+                    frame_img = enhancer.enhance(contrast / 100.0)
+                
+                frames.append(frame_img.copy())
+                durations.append(gif.info.get('duration', 100))
+            
+            # 임시 GIF 파일로 저장
+            temp_file = os.path.join(get_app_dir(), '.temp_adjusted.gif')
+            frames[0].save(
+                temp_file,
+                save_all=True,
+                append_images=frames[1:],
+                duration=durations,
+                loop=0
+            )
+            
+            movie = QMovie(temp_file)
+            if movie.isValid():
+                return movie
+        except Exception as e:
+            print(f"GIF 조절 오류: {e}")
         return None
     
     @staticmethod
@@ -303,25 +352,47 @@ class ZipHandler:
         return images
     
     @staticmethod
-    def load_image_from_zip(zip_path, filename):
+    def load_image_from_zip(zip_path, filename, saturation=100, brightness=100, contrast=100):
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
                 ext = os.path.splitext(filename)[1].lower()
+                
                 if ext == '.gif':
-                    temp_file = os.path.join(get_app_dir(), '.temp_gif')
-                    with open(temp_file, 'wb') as f:
-                        f.write(data)
-                    movie = QMovie(temp_file)
-                    if movie.isValid():
-                        movie.jumpToFrame(0)
-                        pixmap = movie.currentPixmap()
-                        movie.stop()
-                        return pixmap
+                    # GIF 첫 프레임 로드 (조절 적용)
+                    Image = get_pil_image()
+                    img = Image.open(BytesIO(data))
+                    img.seek(0)
+                    img = img.convert('RGB')
+                    
+                    if saturation != 100:
+                        enhancer = get_pil_enhance().Color(img)
+                        img = enhancer.enhance(saturation / 100.0)
+                    if brightness != 100:
+                        enhancer = get_pil_enhance().Brightness(img)
+                        img = enhancer.enhance(brightness / 100.0)
+                    if contrast != 100:
+                        enhancer = get_pil_enhance().Contrast(img)
+                        img = enhancer.enhance(contrast / 100.0)
+                    
+                    data_bytes = img.tobytes('raw', 'RGB')
+                    qimage = QImage(data_bytes, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+                    return QPixmap.fromImage(qimage.copy())
                 
                 Image = get_pil_image()
                 img = Image.open(BytesIO(data))
                 img = img.convert('RGB')
+                
+                if saturation != 100:
+                    enhancer = get_pil_enhance().Color(img)
+                    img = enhancer.enhance(saturation / 100.0)
+                if brightness != 100:
+                    enhancer = get_pil_enhance().Brightness(img)
+                    img = enhancer.enhance(brightness / 100.0)
+                if contrast != 100:
+                    enhancer = get_pil_enhance().Contrast(img)
+                    img = enhancer.enhance(contrast / 100.0)
+                
                 data_bytes = img.tobytes('raw', 'RGB')
                 qimage = QImage(data_bytes, img.width, img.height, img.width * 3, QImage.Format_RGB888)
                 pixmap = QPixmap.fromImage(qimage.copy())
@@ -750,8 +821,7 @@ class ImageViewer(QMainWindow):
         self.slideshow.timeout.connect(self.next_image)
         self.slideshow_playing = False
         self.slideshow_mode = 'time'
-        self.gif_loop_count = 0
-        self.gif_max_loops = 2
+        self.gif_loop_count = 0        self.gif_max_loops = 2
         self.gif_frame_connected = False
         self.current_index = 0
         self.image_list = []
@@ -760,6 +830,7 @@ class ImageViewer(QMainWindow):
         self.fit_to_window = True
         self.rotation_angle = 0
         self.current_movie = None
+        self.current_movie_filepath = None
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
@@ -1065,6 +1136,7 @@ class ImageViewer(QMainWindow):
                 self.gif_frame_connected = False
             self.current_movie.stop()
             self.current_movie = None
+        self.current_movie_filepath = None
     
     def show_current_image(self):
         if self.is_loading:
@@ -1075,22 +1147,31 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         current_file = self.image_list[self.current_index]
         pixmap = None
+        saturation = self.settings.get('saturation', 100)
+        brightness = self.settings.get('brightness', 100)
+        contrast = self.settings.get('contrast', 100)
+        
         try:
             if self.current_zip:
-                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
+                pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file,
+                                                       saturation, brightness, contrast)
             else:
                 if ImageLoader.is_animated(current_file):
-                    movie = ImageLoader.load_movie(current_file)
+                    ext = os.path.splitext(current_file)[1].lower()
+                    if ext == '.gif' and (saturation != 100 or brightness != 100 or contrast != 100):
+                        # GIF + 조절값 적용
+                        movie = ImageLoader.load_gif_with_adjustments(current_file, saturation, brightness, contrast)
+                    else:
+                        movie = ImageLoader.load_movie(current_file)
+                    
                     if movie:
                         self.current_movie = movie
+                        self.current_movie_filepath = current_file
                         self.image_label.setMovie(movie)
                         movie.start()
                         self.is_loading = False
                         return
                 else:
-                    saturation = self.settings.get('saturation', 100)
-                    brightness = self.settings.get('brightness', 100)
-                    contrast = self.settings.get('contrast', 100)
                     cache_key = f"{current_file}_{saturation}_{brightness}_{contrast}"
                     pixmap = self.cache_manager.get(cache_key)
                     if pixmap is None:
@@ -1155,15 +1236,14 @@ class ImageViewer(QMainWindow):
         # GIF/WebP 애니메이션 처리
         if self.current_movie:
             try:
-                original_size = self.current_movie.currentPixmap().size()
-                if original_size.width() > 0 and original_size.height() > 0:
+                current_frame = self.current_movie.currentPixmap()
+                if not current_frame.isNull():
                     if self.fit_to_window:
-                        scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
-                        self.current_movie.setScaledSize(scaled_size)
+                        scaled_size = current_frame.size().scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
                     else:
-                        new_size = QSize(int(original_size.width() * self.zoom_factor),
-                                        int(original_size.height() * self.zoom_factor))
-                        self.current_movie.setScaledSize(new_size)
+                        scaled_size = QSize(int(current_frame.width() * self.zoom_factor),
+                                           int(current_frame.height() * self.zoom_factor))
+                    self.current_movie.setScaledSize(scaled_size)
             except:
                 pass
             return
@@ -1197,12 +1277,16 @@ class ImageViewer(QMainWindow):
         if self.image_list and self.current_index < len(self.image_list) - 1:
             self.current_index += 1
             self.rotation_angle = 0
+            self.zoom_factor = 1.0
+            self.fit_to_window = True
             self.show_current_image()
     
     def prev_image(self):
         if self.image_list and self.current_index > 0:
             self.current_index -= 1
             self.rotation_angle = 0
+            self.zoom_factor = 1.0
+            self.fit_to_window = True
             self.show_current_image()
     
     def zoom_in(self):
