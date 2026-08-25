@@ -708,23 +708,23 @@ class ImageViewer(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
     
-    def bring_to_front(self):
+        def bring_to_front(self):
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, self.force_foreground)
+    
+    def force_foreground(self):
         try:
             hwnd = int(self.winId())
-            if self.isMinimized():
-                self.showNormal()
-            else:
-                self.show()
-            user32.ShowWindow(hwnd, 9)
             user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
             user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001)
             user32.SetForegroundWindow(hwnd)
             user32.BringWindowToTop(hwnd)
+            user32.ShowWindow(hwnd, 5)
         except:
             pass
-        self.show()
-        self.raise_()
-        self.activateWindow()
     
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
@@ -759,27 +759,40 @@ class ImageViewer(QMainWindow):
             QLabel {{ background-color: transparent; }}
         """)
     
-    def keyPressEvent(self, event: QKeyEvent):
-        key = event.key()
-        modifiers = event.modifiers()
-        key_sequence = QKeySequence(modifiers | key).toString()
+        def keyPressEvent(self, event: QKeyEvent):
+        key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
+        
+        # 종료 단축키 먼저 확인
+        close_shortcuts = self.settings.get_shortcuts('close_program')
+        if key_sequence in close_shortcuts:
+            self.close()
+            event.accept()
+            return
+        
+        # 다른 단축키
         shortcut_actions = {
-            'next_image': self.next_image, 'prev_image': self.prev_image,
-            'zoom_in': self.zoom_in, 'zoom_out': self.zoom_out,
+            'next_image': self.next_image,
+            'prev_image': self.prev_image,
+            'zoom_in': self.zoom_in,
+            'zoom_out': self.zoom_out,
             'toggle_actual_size': self.toggle_actual_size,
             'toggle_fullscreen': self.toggle_fullscreen,
-            'close_program': self.close_program,
             'show_image_list': self.show_image_list_dialog,
-            'delete_image': self.delete_image, 'open_file': self.open_file,
+            'delete_image': self.delete_image,
+            'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
-            'rotate_right': self.rotate_right, 'rotate_left': self.rotate_left,
+            'rotate_right': self.rotate_right,
+            'rotate_left': self.rotate_left,
         }
+        
         for action_name, callback in shortcut_actions.items():
             shortcuts = self.settings.get_shortcuts(action_name)
             if key_sequence in shortcuts:
                 callback()
                 event.accept()
                 return
+        
+        # 모든 키 이벤트 소비
         event.accept()
     
     def check_mouse_shortcut(self, button_text):
