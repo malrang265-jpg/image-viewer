@@ -8,6 +8,7 @@ import ctypes
 from io import BytesIO
 from collections import OrderedDict
 
+# PyQt5 - 필요한 모듈만 import
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
@@ -18,7 +19,10 @@ from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSi
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
-from PIL import Image
+
+# Windows API
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 
 try:
     import winreg
@@ -244,10 +248,13 @@ class ImageLoader:
     @staticmethod
     def load_pixmap(filepath, quality='balanced'):
         try:
+            # QPixmap으로 먼저 시도 (PIL 없이 빠르게)
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
                 return pixmap
             
+            # QPixmap 실패 시에만 PIL 로드 (지연 로딩)
+            from PIL import Image
             with Image.open(filepath) as img:
                 img = img.convert('RGBA')
                 data = img.tobytes('raw', 'RGBA')
@@ -374,6 +381,7 @@ class ZipHandler:
                 if pixmap.loadFromData(data):
                     return pixmap
                 
+                from PIL import Image
                 img = Image.open(BytesIO(data))
                 img = img.convert('RGBA')
                 data_bytes = img.tobytes('raw', 'RGBA')
@@ -841,10 +849,6 @@ class ImageViewer(QMainWindow):
         
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-        elif getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
     
     def showEvent(self, event):
         super().showEvent(event)
@@ -857,24 +861,36 @@ class ImageViewer(QMainWindow):
                 self.windowHandle().setIcon(icon)
     
     def bring_to_front(self):
-        """창을 맨 앞으로 가져오기"""
-        # 최소화 상태 해제
+        """창을 맨 앞으로 가져오기 - Windows API 사용"""
+        hwnd = int(self.winId())
+        
+        # 최소화 해제
         if self.isMinimized():
             self.showNormal()
-        else:
-            self.show()
         
-        # 창 활성화
+        # AttachThreadInput으로 포커스 제한 우회
+        try:
+            foreground_hwnd = user32.GetForegroundWindow()
+            current_thread = kernel32.GetCurrentThreadId()
+            foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+            
+            if current_thread != foreground_thread:
+                user32.AttachThreadInput(current_thread, foreground_thread, True)
+            
+            # 창 표시 및 활성화
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            
+            if current_thread != foreground_thread:
+                user32.AttachThreadInput(current_thread, foreground_thread, False)
+        except:
+            pass
+        
+        # Qt 방식으로도 시도
+        self.show()
         self.raise_()
         self.activateWindow()
-        
-        # Windows API로 강제 활성화
-        if sys.platform == 'win32':
-            try:
-                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
-                ctypes.windll.user32.BringWindowToTop(int(self.winId()))
-            except:
-                pass
     
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
@@ -917,8 +933,105 @@ class ImageViewer(QMainWindow):
         if hasattr(self, 'scroll_area'):
             self.scroll_area.setStyleSheet(f"background-color: {bg_color};")
     
+    def nativeEvent(self, eventType, message):
+        """Windows 네이티브 이벤트 처리 - 키보드 메시지 차단"""
+        if eventType == "windows_generic_MSG":
+            msg = ctypes.wintypes.MSG.from_address(message.__int__())
+            
+            # WM_KEYDOWN (0x0100) 또는 WM_SYSKEYDOWN (0x0104)
+            if msg.message == 0x0100 or msg.message == 0x0104:
+                # 가상 키 코드
+                vk_code = msg.wParam
+                
+                # 단축키 매핑
+                shortcut_map = self.get_vk_shortcut_map()
+                
+                if vk_code in shortcut_map:
+                    shortcut_map[vk_code]()
+                    return True, 0  # 메시지 소비
+                
+                # 방향키, Delete 등 브라우저/탐색기에서 사용되는 키 차단
+                if vk_code in [0x25, 0x26, 0x27, 0x28, 0x2E, 0x21, 0x22]:  # Left, Up, Right, Down, Delete, PageUp, PageDown
+                    return True, 0  # 메시지 소비
+        
+        return False, 0
+    
+    def get_vk_shortcut_map(self):
+        """가상 키 코드 → 콜백 매핑"""
+        vk_map = {
+            0x25: self.prev_image,  # Left
+            0x27: self.next_image,  # Right
+            0x26: self.zoom_in,     # Up
+            0x28: self.zoom_out,    # Down
+            0x30: self.toggle_actual_size,  # 0
+            0x7A: self.toggle_fullscreen,    # F11
+            0x2E: self.delete_image,  # Delete
+            0x09: self.show_image_list_dialog,  # Tab
+            0x53: self.toggle_slideshow,  # S
+            0x52: self.rotate_right,  # R
+            0x4C: self.rotate_left,   # L
+        }
+        
+        # 설정된 단축키로 오버라이드
+        shortcuts = self.settings.data.get('shortcuts', {})
+        
+        # 키 시퀀스를 VK 코드로 변환
+        for action, keys in shortcuts.items():
+            if isinstance(keys, list):
+                for key_str in keys:
+                    if key_str and 'Click' not in key_str:
+                        vk = self.key_sequence_to_vk(key_str)
+                        if vk:
+                            action_map = {
+                                'next_image': self.next_image,
+                                'prev_image': self.prev_image,
+                                'zoom_in': self.zoom_in,
+                                'zoom_out': self.zoom_out,
+                                'toggle_actual_size': self.toggle_actual_size,
+                                'toggle_fullscreen': self.toggle_fullscreen,
+                                'close_program': self.close_program,
+                                'show_image_list': self.show_image_list_dialog,
+                                'delete_image': self.delete_image,
+                                'open_file': self.open_file,
+                                'slideshow': self.toggle_slideshow,
+                                'rotate_right': self.rotate_right,
+                                'rotate_left': self.rotate_left,
+                            }
+                            if action in action_map:
+                                vk_map[vk] = action_map[action]
+        
+        return vk_map
+    
+    def key_sequence_to_vk(self, key_str):
+        """키 시퀀스 문자열을 VK 코드로 변환"""
+        vk_codes = {
+            'Left': 0x25, 'Right': 0x27, 'Up': 0x26, 'Down': 0x28,
+            'Delete': 0x2E, 'Tab': 0x09, 'F11': 0x7A, 'F1': 0x70,
+            'F2': 0x71, 'F3': 0x72, 'F4': 0x73, 'F5': 0x74,
+            'F6': 0x75, 'F7': 0x76, 'F8': 0x77, 'F9': 0x78,
+            'F10': 0x79, 'F12': 0x7B,
+        }
+        
+        # Ctrl+Q 같은 조합 처리
+        if '+' in key_str:
+            parts = key_str.split('+')
+            key_part = parts[-1]
+        else:
+            key_part = key_str
+        
+        if key_part in vk_codes:
+            return vk_codes[key_part]
+        
+        if len(key_part) == 1:
+            return ord(key_part.upper())
+        
+        if key_part.isdigit():
+            return ord(key_part)
+        
+        return None
+    
     def keyPressEvent(self, event: QKeyEvent):
-        """키보드 이벤트 처리 - 다른 프로그램에 영향 없음"""
+        """키보드 이벤트 - Qt 레벨 처리 (백업)"""
         key = event.key()
         modifiers = event.modifiers()
         key_sequence = QKeySequence(modifiers | key).toString()
@@ -946,7 +1059,6 @@ class ImageViewer(QMainWindow):
                 event.accept()
                 return
         
-        # 단축키가 아니면 이벤트 무시
         event.accept()
     
     def check_mouse_shortcut(self, button_text):
