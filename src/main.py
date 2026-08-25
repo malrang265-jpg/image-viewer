@@ -29,7 +29,7 @@ def get_app_dir():
         return os.path.dirname(os.path.abspath(__file__))
 
 class SingleApplication:
-    def __init__(self, app_name="ImageViewerApp"):
+    def __init__(self, app_name="PekoviewerApp"):
         self.app_name = app_name
         self.socket = QLocalSocket()
         self.server = None
@@ -53,7 +53,7 @@ class Settings:
     def __init__(self):
         # 설정 파일을 프로그램 폴더에 저장
         app_dir = get_app_dir()
-        self.settings_file = os.path.join(app_dir, 'image_viewer_settings.json')
+        self.settings_file = os.path.join(app_dir, 'pekoviewer_settings.json')
         self.load()
     
     def load(self):
@@ -676,7 +676,7 @@ class ImageViewer(QMainWindow):
                     self.setWindowIcon(QIcon(icon_path))
     
     def init_ui(self):
-        self.setWindowTitle('이미지 뷰어')
+        self.setWindowTitle('Pekoviewer')
         self.setMinimumSize(400, 300)
         self.setAcceptDrops(True)
         
