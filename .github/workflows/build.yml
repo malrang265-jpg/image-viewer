@@ -1,4 +1,4 @@
-name: Build EXE
+name: Build Pekoviewer EXE
 
 on:
   push:
@@ -10,21 +10,27 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@v6
       with:
         python-version: '3.11'
     
     - name: Install dependencies
       run: |
+        python -m pip install --upgrade pip
         pip install PyQt5 Pillow pyinstaller
     
-    - name: Build EXE with icon
+    - name: Build EXE
+      shell: cmd
       run: |
-        pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --name ImageViewer main.py
+        if exist icon.ico (
+          pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer main.py
+        ) else (
+          pyinstaller --onefile --windowed --name Pekoviewer main.py
+        )
     
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v5
       with:
-        name: ImageViewer
-        path: dist/ImageViewer.exe
+        name: Pekoviewer
+        path: dist/Pekoviewer.exe
