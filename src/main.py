@@ -14,16 +14,17 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
                             QListWidget, QListWidgetItem, QMessageBox,
-                            QListView)
+                            QListView, QSlider)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
 PIL_Image = None
+PIL_ImageEnhance = None
 
 def get_pil_image():
     global PIL_Image
@@ -31,6 +32,13 @@ def get_pil_image():
         from PIL import Image
         PIL_Image = Image
     return PIL_Image
+
+def get_pil_enhance():
+    global PIL_ImageEnhance
+    if PIL_ImageEnhance is None:
+        from PIL import ImageEnhance
+        PIL_ImageEnhance = ImageEnhance
+    return PIL_ImageEnhance
 
 try:
     import winreg
@@ -134,14 +142,16 @@ class Settings:
             'show_filename': False,
             'background_color': '#2b2b2b',
             'fit_to_window': True,
-            'snap_enabled': True,  # 자석 기능
-            'snap_threshold': 20,  # 자석 작동 거리(픽셀)
+            'snap_enabled': True,
+            'snap_threshold': 20,
+            'saturation': 100,  # 채도 (0-200, 100=원본)
+            'brightness': 100,  # 밝기 (0-200, 100=원본)
+            'contrast': 100,    # 명도/대비 (0-200, 100=원본)
             'slideshow_interval': 3,
             'slideshow_mode': 'time',
             'slideshow_gif_loops': 2,
             'cache_size': 100,
             'preload_next': True,
-            'associated_extensions': [],
             'shortcuts': {
                 'next_image': ['Right', ''],
                 'prev_image': ['Left', ''],
@@ -183,74 +193,6 @@ class Settings:
         self.data['shortcuts'][action] = shortcuts_list
         self.save()
 
-class FileAssociationManager:
-    SUPPORTED_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.zip']
-    
-    @staticmethod
-    def get_current_associations():
-        associated = []
-        if not WINDOWS:
-            return associated
-        exe_path = os.path.join(get_app_dir(), 'Pekoviewer.exe')
-        if not os.path.exists(exe_path):
-            return associated
-        try:
-            for ext in FileAssociationManager.SUPPORTED_EXTENSIONS:
-                try:
-                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
-                                        f"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\{ext}\\UserChoice")
-                    prog_id, _ = winreg.QueryValueEx(key, "ProgId")
-                    winreg.CloseKey(key)
-                    if 'Pekoviewer' in prog_id:
-                        associated.append(ext)
-                except:
-                    pass
-        except:
-            pass
-        return associated
-    
-    @staticmethod
-    def associate_extensions(extensions):
-        if not WINDOWS:
-            return False
-        exe_path = os.path.join(get_app_dir(), 'Pekoviewer.exe')
-        if not os.path.exists(exe_path):
-            return False
-        try:
-            for ext in extensions:
-                prog_id = f"Pekoviewer{ext.replace('.', '')}"
-                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}")
-                winreg.SetValue(key, "", winreg.REG_SZ, f"Pekoviewer {ext} File")
-                winreg.CloseKey(key)
-                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\DefaultIcon")
-                winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}",0')
-                winreg.CloseKey(key)
-                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open\\command")
-                winreg.SetValue(key, "", winreg.REG_SZ, f'"{exe_path}" "%1"')
-                winreg.CloseKey(key)
-            return True
-        except:
-            return False
-    
-    @staticmethod
-    def disassociate_extensions(extensions):
-        if not WINDOWS:
-            return False
-        try:
-            for ext in extensions:
-                prog_id = f"Pekoviewer{ext.replace('.', '')}"
-                try:
-                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open\\command")
-                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell\\open")
-                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\shell")
-                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}\\DefaultIcon")
-                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{prog_id}")
-                except:
-                    pass
-            return True
-        except:
-            return False
-
 class ImageLoader:
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     ANIMATED_FORMATS = {'.gif', '.webp'}
@@ -266,22 +208,36 @@ class ImageLoader:
         return ext in ImageLoader.ANIMATED_FORMATS
     
     @staticmethod
-    def load_pixmap(filepath, quality='balanced'):
+    def load_pixmap(filepath, quality='balanced', saturation=100, brightness=100, contrast=100):
         try:
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
-                return pixmap
+                # 조절값이 모두 100이면 원본 반환
+                if saturation == 100 and brightness == 100 and contrast == 100:
+                    return pixmap
+                # PIL로 조절 적용
+                Image = get_pil_image()
+                with Image.open(filepath) as img:
+                    img = img.convert('RGBA')
+                    # 채도 조절
+                    if saturation != 100:
+                        enhancer = get_pil_enhance().Color(img)
+                        img = enhancer.enhance(saturation / 100.0)
+                    # 밝기 조절
+                    if brightness != 100:
+                        enhancer = get_pil_enhance().Brightness(img)
+                        img = enhancer.enhance(brightness / 100.0)
+                    # 명도/대비 조절
+                    if contrast != 100:
+                        enhancer = get_pil_enhance().Contrast(img)
+                        img = enhancer.enhance(contrast / 100.0)
+                    
+                    data = img.tobytes('raw', 'RGBA')
+                    qimage = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
+                    return QPixmap.fromImage(qimage.copy())
         except:
             pass
-        try:
-            Image = get_pil_image()
-            with Image.open(filepath) as img:
-                img = img.convert('RGBA')
-                data = img.tobytes('raw', 'RGBA')
-                qimage = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
-                return QPixmap.fromImage(qimage.copy())
-        except:
-            return None
+        return None
     
     @staticmethod
     def load_thumbnail(filepath, size=(150, 150)):
@@ -610,7 +566,6 @@ class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.extension_checkboxes = {}
         self.init_ui()
         self.load_settings()
     
@@ -626,22 +581,14 @@ class SettingsDialog(QDialog):
             QComboBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
             QComboBox QAbstractItemView { background-color: #3c3c3c; color: #ffffff; selection-background-color: #4a90d9; }
             QSpinBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
+            QSlider::groove:horizontal { height: 6px; background: #555; }
+            QSlider::handle:horizontal { width: 16px; background: #4a90d9; border-radius: 8px; }
             QPushButton { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 5px 10px; }
             QPushButton:hover { background-color: #4c4c4c; }
         """)
         layout = QVBoxLayout(self)
         
-        file_assoc_group = QGroupBox('파일 연결')
-        file_assoc_layout = QVBoxLayout()
-        file_assoc_label = QLabel('Pekoviewer로 열 파일 확장자:')
-        file_assoc_layout.addWidget(file_assoc_label)
-        for ext in FileAssociationManager.SUPPORTED_EXTENSIONS:
-            checkbox = QCheckBox(ext)
-            self.extension_checkboxes[ext] = checkbox
-            file_assoc_layout.addWidget(checkbox)
-        file_assoc_group.setLayout(file_assoc_layout)
-        layout.addWidget(file_assoc_group)
-        
+        # 이미지 표시 설정
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         self.zoom_quality = QComboBox()
@@ -656,6 +603,40 @@ class SettingsDialog(QDialog):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
+        # 이미지 조절 설정
+        adjust_group = QGroupBox('이미지 조절')
+        adjust_layout = QFormLayout()
+        
+        self.saturation_slider = QSlider(Qt.Horizontal)
+        self.saturation_slider.setRange(0, 200)
+        self.saturation_slider.setValue(100)
+        self.saturation_label = QLabel('100%')
+        saturation_row = QHBoxLayout()
+        saturation_row.addWidget(self.saturation_slider)
+        saturation_row.addWidget(self.saturation_label)
+        adjust_layout.addRow('채도:', saturation_row)
+        
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(0, 200)
+        self.brightness_slider.setValue(100)
+        self.brightness_label = QLabel('100%')
+        brightness_row = QHBoxLayout()
+        brightness_row.addWidget(self.brightness_slider)
+        brightness_row.addWidget(self.brightness_label)
+        adjust_layout.addRow('밝기:', brightness_row)
+        
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(0, 200)
+        self.contrast_slider.setValue(100)
+        self.contrast_label = QLabel('100%')
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(self.contrast_slider)
+        contrast_row.addWidget(self.contrast_label)
+        adjust_layout.addRow('명도/대비:', contrast_row)
+        
+        adjust_group.setLayout(adjust_layout)
+        layout.addWidget(adjust_group)
+        
         # 자석 기능 설정
         snap_group = QGroupBox('창 자석 기능')
         snap_layout = QFormLayout()
@@ -668,6 +649,7 @@ class SettingsDialog(QDialog):
         snap_group.setLayout(snap_layout)
         layout.addWidget(snap_group)
         
+        # 성능 설정
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         self.cache_size = QSpinBox()
@@ -679,6 +661,7 @@ class SettingsDialog(QDialog):
         performance_group.setLayout(performance_layout)
         layout.addWidget(performance_group)
         
+        # 슬라이드쇼 설정
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
         self.slideshow_mode = QComboBox()
@@ -696,6 +679,7 @@ class SettingsDialog(QDialog):
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
         
+        # 배경색 설정
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
@@ -703,6 +687,7 @@ class SettingsDialog(QDialog):
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
         
+        # 버튼
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -711,17 +696,27 @@ class SettingsDialog(QDialog):
         button_layout.addWidget(save_button)
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
+        
+        # 슬라이더 값 변경 시 라벨 업데이트
+        self.saturation_slider.valueChanged.connect(
+            lambda v: self.saturation_label.setText(f'{v}%'))
+        self.brightness_slider.valueChanged.connect(
+            lambda v: self.brightness_label.setText(f'{v}%'))
+        self.contrast_slider.valueChanged.connect(
+            lambda v: self.contrast_label.setText(f'{v}%'))
     
     def load_settings(self):
-        current_associations = FileAssociationManager.get_current_associations()
-        for ext, checkbox in self.extension_checkboxes.items():
-            checkbox.setChecked(ext in current_associations)
         quality = self.settings.get('zoom_quality', 'balanced')
         index = self.zoom_quality.findData(quality)
         if index >= 0:
             self.zoom_quality.setCurrentIndex(index)
         self.show_filename.setChecked(self.settings.get('show_filename', False))
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
+        
+        self.saturation_slider.setValue(self.settings.get('saturation', 100))
+        self.brightness_slider.setValue(self.settings.get('brightness', 100))
+        self.contrast_slider.setValue(self.settings.get('contrast', 100))
+        
         self.snap_enabled.setChecked(self.settings.get('snap_enabled', True))
         self.snap_threshold.setValue(self.settings.get('snap_threshold', 20))
         self.cache_size.setValue(self.settings.get('cache_size', 100))
@@ -746,17 +741,12 @@ class SettingsDialog(QDialog):
         self.color_button.setText(self.current_color)
     
     def save_settings(self):
-        selected_extensions = [ext for ext, cb in self.extension_checkboxes.items() if cb.isChecked()]
-        current_associations = FileAssociationManager.get_current_associations()
-        to_associate = [ext for ext in selected_extensions if ext not in current_associations]
-        to_disassociate = [ext for ext in current_associations if ext not in selected_extensions]
-        if to_associate:
-            FileAssociationManager.associate_extensions(to_associate)
-        if to_disassociate:
-            FileAssociationManager.disassociate_extensions(to_disassociate)
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
+        self.settings.set('saturation', self.saturation_slider.value())
+        self.settings.set('brightness', self.brightness_slider.value())
+        self.settings.set('contrast', self.contrast_slider.value())
         self.settings.set('snap_enabled', self.snap_enabled.isChecked())
         self.settings.set('snap_threshold', self.snap_threshold.value())
         self.settings.set('cache_size', self.cache_size.value())
@@ -765,7 +755,6 @@ class SettingsDialog(QDialog):
         self.settings.set('slideshow_interval', self.slideshow_interval.value())
         self.settings.set('slideshow_gif_loops', self.slideshow_gif_loops.value())
         self.settings.set('background_color', self.current_color)
-        self.settings.set('associated_extensions', selected_extensions)
         self.accept()
 
 class ImageViewer(QMainWindow):
@@ -844,28 +833,20 @@ class ImageViewer(QMainWindow):
             pass
     
     def snap_to_edge(self, pos):
-        """자석 기능 - 화면 가장자리에 붙이기"""
         if not self.settings.get('snap_enabled', True):
             return pos
-        
         threshold = self.settings.get('snap_threshold', 20)
         screen = QApplication.primaryScreen().availableGeometry()
         x, y = pos.x(), pos.y()
         w, h = self.width(), self.height()
-        
-        # 왼쪽 가장자리
         if abs(x - screen.left()) < threshold:
             x = screen.left()
-        # 오른쪽 가장자리
         if abs((x + w) - screen.right()) < threshold:
             x = screen.right() - w
-        # 위쪽 가장자리
         if abs(y - screen.top()) < threshold:
             y = screen.top()
-        # 아래쪽 가장자리
         if abs((y + h) - screen.bottom()) < threshold:
             y = screen.bottom() - h
-        
         return QPoint(x, y)
     
     def init_ui(self):
@@ -1127,7 +1108,13 @@ class ImageViewer(QMainWindow):
                     cache_key = current_file
                     pixmap = self.cache_manager.get(cache_key)
                     if pixmap is None:
-                        pixmap = ImageLoader.load_pixmap(current_file)
+                        saturation = self.settings.get('saturation', 100)
+                        brightness = self.settings.get('brightness', 100)
+                        contrast = self.settings.get('contrast', 100)
+                        pixmap = ImageLoader.load_pixmap(current_file, 
+                                                        saturation=saturation,
+                                                        brightness=brightness,
+                                                        contrast=contrast)
                         if pixmap:
                             self.cache_manager.put(cache_key, pixmap)
             if pixmap:
@@ -1136,6 +1123,7 @@ class ImageViewer(QMainWindow):
                     pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
                 self.current_pixmap = pixmap
                 self.original_pixmap = pixmap
+                # 이미지를 먼저 로드한 후 크기 조절
                 self.image_label.setPixmap(pixmap)
                 self.update_image_display()
                 if self.settings.get('show_filename', False):
@@ -1396,7 +1384,6 @@ class ImageViewer(QMainWindow):
         if self.dragging and self.drag_start_pos:
             delta = event.globalPos() - self.drag_start_pos
             new_pos = self.window_start_pos + delta
-            # 자석 기능 적용
             new_pos = self.snap_to_edge(new_pos)
             self.move(new_pos)
             event.accept()
