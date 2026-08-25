@@ -24,7 +24,7 @@ jobs:
       working-directory: src
       shell: cmd
       run: |
-        python -m nuitka --msvc=latest --windows-disable-console --standalone --enable-plugin=pyqt5 --lto=yes --output-dir=dist --output-filename=Pekoviewer.exe main.py
+        python -m nuitka --msvc=latest --windows-console-mode=disable --standalone --enable-plugin=pyqt5 --lto=yes --assume-yes-for-downloads --output-dir=dist --output-filename=Pekoviewer.exe main.py
     
     - name: Upload
       uses: actions/upload-artifact@v5
