@@ -20,11 +20,11 @@ jobs:
       run: |
         pip install PyQt5 Pillow nuitka ordered-set zstandard
     
-    - name: Build with Nuitka (Fastest)
+    - name: Build with Nuitka
       working-directory: src
       shell: cmd
       run: |
-        python -m nuitka --msvc --windows-disable-console --standalone --enable-plugin=pyqt5 --lto=yes --output-dir=dist --output-filename=Pekoviewer.exe main.py
+        python -m nuitka --msvc=latest --windows-disable-console --standalone --enable-plugin=pyqt5 --lto=yes --output-dir=dist --output-filename=Pekoviewer.exe main.py
     
     - name: Upload
       uses: actions/upload-artifact@v5
