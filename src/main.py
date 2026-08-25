@@ -3,6 +3,7 @@ import os
 import json
 import zipfile
 import threading
+import re
 from io import BytesIO
 from collections import OrderedDict
 
@@ -25,19 +26,16 @@ class SingleApplication:
         self.server = None
     
     def is_running(self):
-        """이미 실행 중인지 확인"""
         self.socket.connectToServer(self.app_name)
         if self.socket.waitForConnected(100):
             return True
         return False
     
     def start_server(self):
-        """서버 시작"""
         self.server = QLocalServer()
         self.server.listen(self.app_name)
     
     def send_message(self, message):
-        """실행 중인 인스턴스에 메시지 전송"""
         if self.socket.state() == QLocalSocket.ConnectedState:
             self.socket.write(message.encode())
             self.socket.flush()
@@ -76,7 +74,7 @@ class Settings:
                 'prev_image': 'Left',
                 'zoom_in': 'Up',
                 'zoom_out': 'Down',
-                'actual_size': '0',
+                'toggle_actual_size': '0',
                 'toggle_fullscreen': 'F11',
                 'close_program': 'Ctrl+Q',
                 'show_image_list': 'Tab',
@@ -125,12 +123,10 @@ class ImageLoader:
     @staticmethod
     def load_pixmap(filepath, quality='balanced'):
         try:
-            # QPixmap으로 직접 로드
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
                 return pixmap
             
-            # PIL로 폴백
             with Image.open(filepath) as img:
                 img = img.convert('RGBA')
                 data = img.tobytes('raw', 'RGBA')
@@ -310,7 +306,7 @@ class ShortcutSettingsDialog(QDialog):
             ('show_image_list', '이미지 목록 표시'),
             ('zoom_in', '확대'),
             ('zoom_out', '축소'),
-            ('actual_size', '실제 크기'),
+            ('toggle_actual_size', '실제 크기/창 크기 토글'),
             ('delete_image', '삭제'),
             ('open_file', '열기'),
             ('slideshow', '슬라이드쇼'),
@@ -350,7 +346,7 @@ class ShortcutSettingsDialog(QDialog):
     
     def load_shortcuts(self):
         actions = ['next_image', 'prev_image', 'toggle_fullscreen', 'close_program',
-                  'show_image_list', 'zoom_in', 'zoom_out', 'actual_size',
+                  'show_image_list', 'zoom_in', 'zoom_out', 'toggle_actual_size',
                   'delete_image', 'open_file', 'slideshow', 'rotate_right', 'rotate_left']
         
         for action in actions:
@@ -576,6 +572,7 @@ class ImageViewer(QMainWindow):
         self.shortcut_objects = {}
         self.current_movie = None
         self.current_pixmap = None
+        self.is_loading = False  # 로딩 중 플래그
         
         self.init_ui()
         self.load_settings()
@@ -625,7 +622,7 @@ class ImageViewer(QMainWindow):
             'prev_image': self.prev_image,
             'zoom_in': self.zoom_in,
             'zoom_out': self.zoom_out,
-            'actual_size': self.actual_size,
+            'toggle_actual_size': self.toggle_actual_size,
             'toggle_fullscreen': self.toggle_fullscreen,
             'close_program': self.close,
             'show_image_list': self.show_image_list_dialog,
@@ -650,7 +647,6 @@ class ImageViewer(QMainWindow):
                     pass
     
     def check_mouse_shortcut(self, button_text):
-        """마우스 단축키 확인 및 실행"""
         actions = {
             'next_image': self.next_image,
             'prev_image': self.prev_image,
@@ -659,7 +655,7 @@ class ImageViewer(QMainWindow):
             'show_image_list': self.show_image_list_dialog,
             'zoom_in': self.zoom_in,
             'zoom_out': self.zoom_out,
-            'actual_size': self.actual_size,
+            'toggle_actual_size': self.toggle_actual_size,
             'delete_image': self.delete_image,
             'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
@@ -704,15 +700,18 @@ class ImageViewer(QMainWindow):
             else:
                 self.load_single_file(path)
     
+    def natural_sort_key(self, s):
+        """자연스러운 정렬 키"""
+        return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
+    
     def load_directory(self, directory):
         self.image_list = []
         self.current_zip = None
         
         try:
-            # Windows 탐색기 정렬 순서와 동일하게 정렬
             files = os.listdir(directory)
-            # 자연스러운 정렬 (숫자 인식)
-            files.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() for c in __import__('re').split(r'(\d+)', x)])
+            # Windows 탐색기와 동일한 정렬
+            files.sort(key=self.natural_sort_key)
             
             for filename in files:
                 if ImageLoader.is_supported(filename):
@@ -756,9 +755,13 @@ class ImageViewer(QMainWindow):
             self.current_movie = None
     
     def show_current_image(self):
+        if self.is_loading:
+            return
+        
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
             return
         
+        self.is_loading = True
         self.stop_current_movie()
         
         current_file = self.image_list[self.current_index]
@@ -773,6 +776,7 @@ class ImageViewer(QMainWindow):
                         self.image_label.setMovie(movie)
                         movie.start()
                         self.update_image_display()
+                        self.is_loading = False
                         return
                 else:
                     pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
@@ -784,6 +788,7 @@ class ImageViewer(QMainWindow):
                         self.image_label.setMovie(movie)
                         movie.start()
                         self.update_image_display()
+                        self.is_loading = False
                         return
                 else:
                     cache_key = current_file
@@ -813,6 +818,8 @@ class ImageViewer(QMainWindow):
                     self.filename_label.hide()
         except Exception as e:
             print(f"이미지 로드 오류: {e}")
+        finally:
+            self.is_loading = False
     
     def update_image_display(self):
         # 애니메이션 크기 조정
@@ -833,15 +840,17 @@ class ImageViewer(QMainWindow):
                 )
                 self.image_label.setPixmap(scaled_pixmap)
             else:
-                new_size = self.current_pixmap.size() * self.zoom_factor
-                scaled_pixmap = self.current_pixmap.scaled(
-                    new_size,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-                self.image_label.setPixmap(scaled_pixmap)
+                # 실제 크기
+                self.image_label.setPixmap(self.current_pixmap)
         
         self.image_label.adjustSize()
+    
+    def toggle_actual_size(self):
+        """실제 크기/창 크기 토글"""
+        self.fit_to_window = not self.fit_to_window
+        if self.fit_to_window:
+            self.zoom_factor = 1.0
+        self.update_image_display()
     
     def next_image(self):
         if self.image_list and self.current_index < len(self.image_list) - 1:
@@ -953,6 +962,10 @@ class ImageViewer(QMainWindow):
         
         menu.addSeparator()
         
+        toggle_size_action = QAction('실제 크기/창 크기 토글', self)
+        toggle_size_action.triggered.connect(self.toggle_actual_size)
+        menu.addAction(toggle_size_action)
+        
         zoom_in_action = QAction('확대', self)
         zoom_in_action.triggered.connect(self.zoom_in)
         menu.addAction(zoom_in_action)
@@ -960,10 +973,6 @@ class ImageViewer(QMainWindow):
         zoom_out_action = QAction('축소', self)
         zoom_out_action.triggered.connect(self.zoom_out)
         menu.addAction(zoom_out_action)
-        
-        actual_size_action = QAction('실제 크기', self)
-        actual_size_action.triggered.connect(self.actual_size)
-        menu.addAction(actual_size_action)
         
         menu.addSeparator()
         
@@ -1079,7 +1088,6 @@ def main():
     # 중복 실행 방지
     single_app = SingleApplication()
     if single_app.is_running():
-        # 이미 실행 중이면 메시지 전송 후 종료
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
