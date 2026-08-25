@@ -44,6 +44,19 @@ def get_app_dir():
     else:
         return os.path.dirname(os.path.abspath(__file__))
 
+def get_icon_path():
+    """아이콘 파일 경로 찾기"""
+    possible_paths = [
+        os.path.join(get_app_dir(), 'icon.ico'),
+        os.path.join(getattr(sys, '_MEIPASS', ''), 'icon.ico') if hasattr(sys, '_MEIPASS') else '',
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico'),
+        os.path.join(os.path.dirname(get_app_dir()), 'icon.ico'),
+    ]
+    for path in possible_paths:
+        if path and os.path.exists(path):
+            return path
+    return None
+
 class SingleApplication:
     def __init__(self, app_name="PekoviewerApp"):
         self.app_name = app_name
@@ -118,6 +131,8 @@ class Settings:
             'background_color': '#2b2b2b',
             'fit_to_window': True,
             'slideshow_interval': 3,
+            'slideshow_mode': 'time',
+            'slideshow_gif_loops': 2,
             'cache_size': 100,
             'preload_next': True,
             'associated_extensions': [],
@@ -579,6 +594,7 @@ class SettingsDialog(QDialog):
             QPushButton:hover { background-color: #4c4c4c; }
         """)
         layout = QVBoxLayout(self)
+        
         file_assoc_group = QGroupBox('파일 연결')
         file_assoc_layout = QVBoxLayout()
         file_assoc_label = QLabel('Pekoviewer로 열 파일 확장자:')
@@ -589,6 +605,7 @@ class SettingsDialog(QDialog):
             file_assoc_layout.addWidget(checkbox)
         file_assoc_group.setLayout(file_assoc_layout)
         layout.addWidget(file_assoc_group)
+        
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
         self.zoom_quality = QComboBox()
@@ -602,6 +619,7 @@ class SettingsDialog(QDialog):
         display_layout.addRow('', self.fit_to_window)
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
+        
         performance_group = QGroupBox('성능')
         performance_layout = QFormLayout()
         self.cache_size = QSpinBox()
@@ -612,20 +630,31 @@ class SettingsDialog(QDialog):
         performance_layout.addRow('', self.preload_next)
         performance_group.setLayout(performance_layout)
         layout.addWidget(performance_group)
+        
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
+        self.slideshow_mode = QComboBox()
+        self.slideshow_mode.addItem('시간 기반', 'time')
+        self.slideshow_mode.addItem('GIF 재생 횟수', 'loop')
+        slideshow_layout.addRow('모드:', self.slideshow_mode)
         self.slideshow_interval = QSpinBox()
         self.slideshow_interval.setRange(1, 60)
         self.slideshow_interval.setSuffix(' 초')
-        slideshow_layout.addRow('간격:', self.slideshow_interval)
+        slideshow_layout.addRow('시간 간격:', self.slideshow_interval)
+        self.slideshow_gif_loops = QSpinBox()
+        self.slideshow_gif_loops.setRange(1, 10)
+        self.slideshow_gif_loops.setSuffix(' 회')
+        slideshow_layout.addRow('GIF 재생 횟수:', self.slideshow_gif_loops)
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
+        
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
+        
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
         save_button.clicked.connect(self.save_settings)
@@ -647,7 +676,14 @@ class SettingsDialog(QDialog):
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
         self.cache_size.setValue(self.settings.get('cache_size', 100))
         self.preload_next.setChecked(self.settings.get('preload_next', True))
+        
+        mode = self.settings.get('slideshow_mode', 'time')
+        index = self.slideshow_mode.findData(mode)
+        if index >= 0:
+            self.slideshow_mode.setCurrentIndex(index)
         self.slideshow_interval.setValue(self.settings.get('slideshow_interval', 3))
+        self.slideshow_gif_loops.setValue(self.settings.get('slideshow_gif_loops', 2))
+        
         self.current_color = self.settings.get('background_color', '#2b2b2b')
         self.update_color_button()
     
@@ -670,12 +706,15 @@ class SettingsDialog(QDialog):
             FileAssociationManager.associate_extensions(to_associate)
         if to_disassociate:
             FileAssociationManager.disassociate_extensions(to_disassociate)
+        
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
         self.settings.set('cache_size', self.cache_size.value())
         self.settings.set('preload_next', self.preload_next.isChecked())
+        self.settings.set('slideshow_mode', self.slideshow_mode.currentData())
         self.settings.set('slideshow_interval', self.slideshow_interval.value())
+        self.settings.set('slideshow_gif_loops', self.slideshow_gif_loops.value())
         self.settings.set('background_color', self.current_color)
         self.settings.set('associated_extensions', selected_extensions)
         self.accept()
@@ -688,6 +727,10 @@ class ImageViewer(QMainWindow):
         self.slideshow = QTimer()
         self.slideshow.timeout.connect(self.next_image)
         self.slideshow_playing = False
+        self.slideshow_mode = 'time'
+        self.gif_loop_count = 0
+        self.gif_max_loops = 2
+        self.gif_frame_connected = False
         self.current_index = 0
         self.image_list = []
         self.current_zip = None
@@ -704,9 +747,18 @@ class ImageViewer(QMainWindow):
         self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
     
     def setup_icon(self):
-        icon_path = os.path.join(get_app_dir(), 'icon.ico')
-        if os.path.exists(icon_path):
+        icon_path = get_icon_path()
+        if icon_path:
             self.setWindowIcon(QIcon(icon_path))
+    
+    def showEvent(self, event):
+        super().showEvent(event)
+        icon_path = get_icon_path()
+        if icon_path:
+            icon = QIcon(icon_path)
+            self.setWindowIcon(icon)
+            if self.windowHandle():
+                self.windowHandle().setIcon(icon)
     
     def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
@@ -718,22 +770,18 @@ class ImageViewer(QMainWindow):
     def force_foreground(self):
         try:
             hwnd = int(self.winId())
+            fg_hwnd = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
+            cur_thread = kernel32.GetCurrentThreadId()
+            if cur_thread != fg_thread:
+                user32.AttachThreadInput(cur_thread, fg_thread, True)
+            user32.ShowWindow(hwnd, 9)
             user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
             user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001)
             user32.SetForegroundWindow(hwnd)
             user32.BringWindowToTop(hwnd)
-            user32.ShowWindow(hwnd, 5)
-        except:
-            pass
-    
-    def force_foreground(self):
-        try:
-            hwnd = int(self.winId())
-            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
-            user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001)
-            user32.SetForegroundWindow(hwnd)
-            user32.BringWindowToTop(hwnd)
-            user32.ShowWindow(hwnd, 5)
+            if cur_thread != fg_thread:
+                user32.AttachThreadInput(cur_thread, fg_thread, False)
         except:
             pass
     
@@ -773,27 +821,22 @@ class ImageViewer(QMainWindow):
     def keyPressEvent(self, event: QKeyEvent):
         key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
         
-        # 종료 단축키 먼저 확인
+        # 종료 단축키 우선 처리
         close_shortcuts = self.settings.get_shortcuts('close_program')
         if key_sequence in close_shortcuts:
             self.close()
             event.accept()
             return
         
-        # 다른 단축키
         shortcut_actions = {
-            'next_image': self.next_image,
-            'prev_image': self.prev_image,
-            'zoom_in': self.zoom_in,
-            'zoom_out': self.zoom_out,
+            'next_image': self.next_image, 'prev_image': self.prev_image,
+            'zoom_in': self.zoom_in, 'zoom_out': self.zoom_out,
             'toggle_actual_size': self.toggle_actual_size,
             'toggle_fullscreen': self.toggle_fullscreen,
             'show_image_list': self.show_image_list_dialog,
-            'delete_image': self.delete_image,
-            'open_file': self.open_file,
+            'delete_image': self.delete_image, 'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
-            'rotate_right': self.rotate_right,
-            'rotate_left': self.rotate_left,
+            'rotate_right': self.rotate_right, 'rotate_left': self.rotate_left,
         }
         
         for action_name, callback in shortcut_actions.items():
@@ -803,7 +846,6 @@ class ImageViewer(QMainWindow):
                 event.accept()
                 return
         
-        # 모든 키 이벤트 소비
         event.accept()
     
     def check_mouse_shortcut(self, button_text):
@@ -898,6 +940,12 @@ class ImageViewer(QMainWindow):
     
     def stop_current_movie(self):
         if self.current_movie:
+            if self.gif_frame_connected:
+                try:
+                    self.current_movie.frameChanged.disconnect(self.on_gif_frame_changed)
+                except:
+                    pass
+                self.gif_frame_connected = False
             self.current_movie.stop()
             self.current_movie = None
     
@@ -922,6 +970,8 @@ class ImageViewer(QMainWindow):
                         movie.start()
                         self.original_pixmap = movie.currentPixmap()
                         self.update_image_display()
+                        if self.slideshow_playing and self.slideshow_mode == 'loop':
+                            self.connect_gif_loop()
                         self.is_loading = False
                         return
                 else:
@@ -951,6 +1001,23 @@ class ImageViewer(QMainWindow):
             print(f"이미지 로드 오류: {e}")
         finally:
             self.is_loading = False
+    
+    def connect_gif_loop(self):
+        if self.current_movie and not self.gif_frame_connected:
+            self.current_movie.frameChanged.connect(self.on_gif_frame_changed)
+            self.gif_frame_connected = True
+            self.gif_loop_count = 0
+    
+    def on_gif_frame_changed(self, frame_number):
+        if not self.slideshow_playing:
+            return
+        if self.slideshow_mode != 'loop':
+            return
+        if frame_number == 0:
+            self.gif_loop_count += 1
+            if self.gif_loop_count >= self.gif_max_loops:
+                self.next_image()
+                self.gif_loop_count = 0
     
     def update_image_display(self):
         base_pixmap = None
@@ -1052,11 +1119,31 @@ class ImageViewer(QMainWindow):
     
     def toggle_slideshow(self):
         if self.slideshow_playing:
-            self.slideshow.stop()
-            self.slideshow_playing = False
+            self.stop_slideshow()
         else:
-            self.slideshow.start()
-            self.slideshow_playing = True
+            self.start_slideshow()
+    
+    def start_slideshow(self):
+        self.slideshow_playing = True
+        self.slideshow_mode = self.settings.get('slideshow_mode', 'time')
+        self.gif_max_loops = self.settings.get('slideshow_gif_loops', 2)
+        self.gif_loop_count = 0
+        
+        if self.slideshow_mode == 'loop' and self.current_movie:
+            self.connect_gif_loop()
+        else:
+            interval = self.settings.get('slideshow_interval', 3)
+            self.slideshow.start(interval * 1000)
+    
+    def stop_slideshow(self):
+        self.slideshow_playing = False
+        self.slideshow.stop()
+        if self.gif_frame_connected and self.current_movie:
+            try:
+                self.current_movie.frameChanged.disconnect(self.on_gif_frame_changed)
+            except:
+                pass
+            self.gif_frame_connected = False
     
     def rotate_right(self):
         self.rotation_angle = (self.rotation_angle + 90) % 360
