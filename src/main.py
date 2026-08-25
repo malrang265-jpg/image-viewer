@@ -752,17 +752,31 @@ class ImageViewer(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
     
-    def bring_to_front(self):
+        def bring_to_front(self):
         """창을 맨 앞으로 가져오기"""
         try:
             hwnd = int(self.winId())
+            
+            # 최소화 상태 해제
             if self.isMinimized():
                 self.showNormal()
+            else:
+                self.show()
+            
+            # Windows API 호출
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            
+            # TOPMOST 설정 후 해제 (깜빡임 방지)
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)  # HWND_TOPMOST
+            user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001)  # HWND_NOTOPMOST
+            
+            # 포커스 설정
             user32.SetForegroundWindow(hwnd)
             user32.BringWindowToTop(hwnd)
-        except:
-            pass
+        except Exception as e:
+            print(f"bring_to_front 오류: {e}")
+        
+        # Qt 방식 백업
         self.show()
         self.raise_()
         self.activateWindow()
@@ -806,22 +820,26 @@ class ImageViewer(QMainWindow):
             QLabel {{ background-color: transparent; }}
         """)
     
-    def keyPressEvent(self, event: QKeyEvent):
-        """키보드 이벤트 - 프로그램 내부에서만 처리"""
+        def keyPressEvent(self, event: QKeyEvent):
+        """키보드 이벤트 처리 - 완전히 소비"""
         key = event.key()
         modifiers = event.modifiers()
         key_sequence = QKeySequence(modifiers | key).toString()
         
         shortcut_actions = {
-            'next_image': self.next_image, 'prev_image': self.prev_image,
-            'zoom_in': self.zoom_in, 'zoom_out': self.zoom_out,
+            'next_image': self.next_image,
+            'prev_image': self.prev_image,
+            'zoom_in': self.zoom_in,
+            'zoom_out': self.zoom_out,
             'toggle_actual_size': self.toggle_actual_size,
             'toggle_fullscreen': self.toggle_fullscreen,
             'close_program': self.close_program,
             'show_image_list': self.show_image_list_dialog,
-            'delete_image': self.delete_image, 'open_file': self.open_file,
+            'delete_image': self.delete_image,
+            'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
-            'rotate_right': self.rotate_right, 'rotate_left': self.rotate_left,
+            'rotate_right': self.rotate_right,
+            'rotate_left': self.rotate_left,
         }
         
         for action_name, callback in shortcut_actions.items():
@@ -831,7 +849,7 @@ class ImageViewer(QMainWindow):
                 event.accept()
                 return
         
-        # 단축키가 아니면 이벤트 소비 (다른 프로그램에 전달 방지)
+        # 처리되지 않은 키도 소비
         event.accept()
     
     def check_mouse_shortcut(self, button_text):
