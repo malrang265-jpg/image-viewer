@@ -69,19 +69,19 @@ class Settings:
             'cache_size': 50,
             'preload_next': True,
             'shortcuts': {
-                'next_image': 'Right',
-                'prev_image': 'Left',
-                'zoom_in': 'Up',
-                'zoom_out': 'Down',
-                'toggle_actual_size': '0',
-                'toggle_fullscreen': 'F11',
-                'close_program': 'Ctrl+Q',
-                'show_image_list': 'Tab',
-                'delete_image': 'Delete',
-                'open_file': 'Ctrl+O',
-                'slideshow': 'S',
-                'rotate_right': 'R',
-                'rotate_left': 'L'
+                'next_image': ['Right', ''],
+                'prev_image': ['Left', ''],
+                'zoom_in': ['Up', ''],
+                'zoom_out': ['Down', ''],
+                'toggle_actual_size': ['0', ''],
+                'toggle_fullscreen': ['F11', ''],
+                'close_program': ['Ctrl+Q', ''],
+                'show_image_list': ['Tab', ''],
+                'delete_image': ['Delete', ''],
+                'open_file': ['Ctrl+O', ''],
+                'slideshow': ['S', ''],
+                'rotate_right': ['R', ''],
+                'rotate_left': ['L', '']
             }
         }
     
@@ -92,17 +92,23 @@ class Settings:
         self.data[key] = value
         self.save()
     
-    def get_shortcut(self, action, default=''):
+    def get_shortcuts(self, action):
+        """단축키 리스트 반환"""
         shortcuts = self.data.get('shortcuts', {})
-        value = shortcuts.get(action, default)
+        value = shortcuts.get(action, ['', ''])
+        if isinstance(value, str):
+            return [value, '']
         if isinstance(value, list):
-            return value[0] if value else default
-        return value
+            while len(value) < 2:
+                value.append('')
+            return value[:2]
+        return ['', '']
     
-    def set_shortcut(self, action, key_sequence):
+    def set_shortcuts(self, action, shortcuts_list):
+        """단축키 리스트 저장"""
         if 'shortcuts' not in self.data:
             self.data['shortcuts'] = {}
-        self.data['shortcuts'][action] = key_sequence
+        self.data['shortcuts'][action] = shortcuts_list
         self.save()
 
 class ImageLoader:
@@ -140,18 +146,6 @@ class ImageLoader:
             movie = QMovie(filepath)
             if movie.isValid():
                 return movie
-        except:
-            pass
-        return None
-    
-    @staticmethod
-    def load_gif_first_frame(filepath):
-        """GIF 첫 프레임 로드"""
-        try:
-            movie = QMovie(filepath)
-            if movie.isValid():
-                movie.jumpToFrame(0)
-                return movie.currentPixmap()
         except:
             pass
         return None
@@ -206,7 +200,6 @@ class ZipHandler:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 data = zf.read(filename)
                 
-                # GIF인 경우 첫 프레임만
                 ext = os.path.splitext(filename)[1].lower()
                 if ext == '.gif':
                     temp_file = os.path.join(os.path.expanduser('~'), '.temp_gif')
@@ -230,21 +223,6 @@ class ZipHandler:
                 return QPixmap.fromImage(qimage.copy())
         except:
             return None
-    
-    @staticmethod
-    def load_animation_from_zip(zip_path, filename):
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                data = zf.read(filename)
-                temp_file = os.path.join(os.path.expanduser('~'), '.temp_animation')
-                with open(temp_file, 'wb') as f:
-                    f.write(data)
-                movie = QMovie(temp_file)
-                if movie.isValid():
-                    return movie
-        except:
-            pass
-        return None
 
 class ImageListDialog(QDialog):
     def __init__(self, image_list, current_index, parent=None):
@@ -303,16 +281,17 @@ class ShortcutSettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.shortcut_buttons = {}
+        self.shortcut_buttons = {}  # action: [button1, button2]
         self.capturing = False
         self.current_action = None
+        self.current_slot = 0  # 0 또는 1
         self.init_ui()
         self.load_shortcuts()
     
     def init_ui(self):
         self.setWindowTitle('단축키 설정')
         self.setModal(True)
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(500)
         self.setStyleSheet("""
             QDialog { background-color: #2b2b2b; color: white; }
             QLabel { color: white; }
@@ -322,6 +301,11 @@ class ShortcutSettingsDialog(QDialog):
         """)
         
         layout = QVBoxLayout(self)
+        
+        # 안내 라벨
+        info_label = QLabel('각 기능에 최대 2개의 단축키를 설정할 수 있습니다. ESC 키는 단축키를 삭제합니다.')
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
         
         actions = [
             ('next_image', '다음 이미지'),
@@ -343,11 +327,17 @@ class ShortcutSettingsDialog(QDialog):
             group = QGroupBox(action_name)
             group_layout = QHBoxLayout()
             
-            button = QPushButton('클릭하여 설정')
-            button.setMinimumWidth(150)
-            button.clicked.connect(lambda checked, k=action_key, b=button: self.start_capture(k, b))
-            self.shortcut_buttons[action_key] = button
-            group_layout.addWidget(button)
+            button1 = QPushButton('단축키 1')
+            button1.setMinimumWidth(120)
+            button1.clicked.connect(lambda checked, k=action_key, s=0, b=button1: self.start_capture(k, s, b))
+            
+            button2 = QPushButton('단축키 2')
+            button2.setMinimumWidth(120)
+            button2.clicked.connect(lambda checked, k=action_key, s=1, b=button2: self.start_capture(k, s, b))
+            
+            self.shortcut_buttons[action_key] = [button1, button2]
+            group_layout.addWidget(button1)
+            group_layout.addWidget(button2)
             
             group.setLayout(group_layout)
             layout.addWidget(group)
@@ -375,16 +365,19 @@ class ShortcutSettingsDialog(QDialog):
                   'delete_image', 'open_file', 'slideshow', 'rotate_right', 'rotate_left']
         
         for action in actions:
-            shortcut = self.settings.get_shortcut(action, '없음')
+            shortcuts = self.settings.get_shortcuts(action)
             if action in self.shortcut_buttons:
-                self.shortcut_buttons[action].setText(shortcut)
+                for i, button in enumerate(self.shortcut_buttons[action]):
+                    text = shortcuts[i] if i < len(shortcuts) and shortcuts[i] else '없음'
+                    button.setText(text)
     
-    def start_capture(self, action_key, button):
+    def start_capture(self, action_key, slot, button):
         if self.capturing:
             return
         
         self.capturing = True
         self.current_action = action_key
+        self.current_slot = slot
         button.setText('입력 대기 중...')
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
@@ -397,14 +390,17 @@ class ShortcutSettingsDialog(QDialog):
             modifiers = event.modifiers()
             
             if key == Qt.Key_Escape:
-                self.cancel_capture()
+                # ESC: 단축키 삭제
+                self.shortcut_buttons[self.current_action][self.current_slot].setText('없음')
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
+                self.stop_capture()
                 return
             
             key_sequence = QKeySequence(modifiers | key).toString()
             
             if key_sequence and self.current_action in self.shortcut_buttons:
-                self.shortcut_buttons[self.current_action].setText(key_sequence)
-                self.shortcut_buttons[self.current_action].setStyleSheet("")
+                self.shortcut_buttons[self.current_action][self.current_slot].setText(key_sequence)
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
                 self.stop_capture()
         
         super().keyPressEvent(event)
@@ -423,8 +419,8 @@ class ShortcutSettingsDialog(QDialog):
             
             if button in mouse_buttons:
                 button_text = mouse_buttons[button]
-                self.shortcut_buttons[self.current_action].setText(button_text)
-                self.shortcut_buttons[self.current_action].setStyleSheet("")
+                self.shortcut_buttons[self.current_action][self.current_slot].setText(button_text)
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
                 self.stop_capture()
                 return
         
@@ -433,8 +429,8 @@ class ShortcutSettingsDialog(QDialog):
     def mouseDoubleClickEvent(self, event):
         if self.capturing and self.current_action:
             if event.button() == Qt.LeftButton:
-                self.shortcut_buttons[self.current_action].setText('Left Double Click')
-                self.shortcut_buttons[self.current_action].setStyleSheet("")
+                self.shortcut_buttons[self.current_action][self.current_slot].setText('Left Double Click')
+                self.shortcut_buttons[self.current_action][self.current_slot].setStyleSheet("")
                 self.stop_capture()
                 return
         
@@ -443,25 +439,24 @@ class ShortcutSettingsDialog(QDialog):
     def stop_capture(self):
         self.capturing = False
         self.current_action = None
+        self.current_slot = 0
         self.releaseKeyboard()
         self.releaseMouse()
     
-    def cancel_capture(self):
-        if self.current_action and self.current_action in self.shortcut_buttons:
-            original = self.settings.get_shortcut(self.current_action, '없음')
-            self.shortcut_buttons[self.current_action].setText(original)
-            self.shortcut_buttons[self.current_action].setStyleSheet("")
-        self.stop_capture()
-    
     def reset_defaults(self):
         defaults = self.settings.default_settings()['shortcuts']
-        for action, shortcut in defaults.items():
+        for action, shortcuts in defaults.items():
             if action in self.shortcut_buttons:
-                self.shortcut_buttons[action].setText(shortcut)
+                for i, button in enumerate(self.shortcut_buttons[action]):
+                    text = shortcuts[i] if i < len(shortcuts) and shortcuts[i] else '없음'
+                    button.setText(text)
     
     def save_shortcuts(self):
-        for action, button in self.shortcut_buttons.items():
-            self.settings.set_shortcut(action, button.text())
+        for action, buttons in self.shortcut_buttons.items():
+            shortcuts = [buttons[0].text(), buttons[1].text()]
+            # '없음'을 빈 문자열로 변환
+            shortcuts = [s if s != '없음' else '' for s in shortcuts]
+            self.settings.set_shortcuts(action, shortcuts)
         self.accept()
 
 class SettingsDialog(QDialog):
@@ -597,7 +592,7 @@ class ImageViewer(QMainWindow):
         self.shortcut_objects = {}
         self.current_movie = None
         self.current_pixmap = None
-        self.original_pixmap = None  # 원본 이미지 저장
+        self.original_pixmap = None
         self.is_loading = False
         
         self.init_ui()
@@ -627,8 +622,7 @@ class ImageViewer(QMainWindow):
         self.image_label.setScaledContents(False)
         self.scroll_area.setWidget(self.image_label)
         
-        bg_color = self.settings.get('background_color', '#2b2b2b')
-        self.setStyleSheet(f"QMainWindow {{ background-color: {bg_color}; }}")
+        self.apply_background_color()
         
         self.filename_label = QLabel('')
         self.filename_label.setAlignment(Qt.AlignCenter)
@@ -637,6 +631,17 @@ class ImageViewer(QMainWindow):
         
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
+    
+    def apply_background_color(self):
+        """배경색 적용"""
+        bg_color = self.settings.get('background_color', '#2b2b2b')
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {bg_color}; }}
+            QScrollArea {{ background-color: {bg_color}; }}
+            QLabel {{ background-color: transparent; }}
+        """)
+        if hasattr(self, 'scroll_area'):
+            self.scroll_area.setStyleSheet(f"background-color: {bg_color};")
     
     def setup_shortcuts(self):
         for shortcut in self.shortcut_objects.values():
@@ -660,17 +665,16 @@ class ImageViewer(QMainWindow):
         }
         
         for action_name, callback in shortcut_actions.items():
-            key = self.settings.get_shortcut(action_name, '')
-            if key and key != '없음' and key != '':
-                if 'Click' in key:
-                    continue
-                
-                try:
-                    shortcut = QShortcut(QKeySequence(key), self)
-                    shortcut.activated.connect(callback)
-                    self.shortcut_objects[action_name] = shortcut
-                except:
-                    pass
+            shortcuts = self.settings.get_shortcuts(action_name)
+            
+            for i, key in enumerate(shortcuts):
+                if key and key != '' and 'Click' not in key:
+                    try:
+                        shortcut = QShortcut(QKeySequence(key), self)
+                        shortcut.activated.connect(callback)
+                        self.shortcut_objects[f"{action_name}_{i}"] = shortcut
+                    except:
+                        pass
     
     def check_mouse_shortcut(self, button_text):
         actions = {
@@ -690,8 +694,8 @@ class ImageViewer(QMainWindow):
         }
         
         for action_name, callback in actions.items():
-            shortcut = self.settings.get_shortcut(action_name, '')
-            if shortcut == button_text:
+            shortcuts = self.settings.get_shortcuts(action_name)
+            if button_text in shortcuts:
                 callback()
                 return True
         
@@ -793,11 +797,9 @@ class ImageViewer(QMainWindow):
         
         try:
             if self.current_zip:
-                # ZIP 파일의 GIF는 첫 프레임만 표시
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, current_file)
             else:
                 if ImageLoader.is_animated(current_file):
-                    # GIF/WebP 애니메이션
                     movie = ImageLoader.load_movie(current_file)
                     if movie:
                         self.current_movie = movie
@@ -822,7 +824,7 @@ class ImageViewer(QMainWindow):
                     pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
                 
                 self.current_pixmap = pixmap
-                self.original_pixmap = pixmap  # 원본 저장
+                self.original_pixmap = pixmap
                 self.image_label.setPixmap(pixmap)
                 self.update_image_display()
                 
@@ -840,7 +842,6 @@ class ImageViewer(QMainWindow):
             self.is_loading = False
     
     def update_image_display(self):
-        # 원본 이미지 기준으로 크기 조정
         base_pixmap = None
         
         if self.current_movie:
@@ -854,7 +855,6 @@ class ImageViewer(QMainWindow):
             return
         
         if self.fit_to_window:
-            # 창 크기에 맞추기
             if self.current_movie:
                 scaled_size = base_pixmap.size().scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
                 self.current_movie.setScaledSize(scaled_size)
@@ -866,7 +866,6 @@ class ImageViewer(QMainWindow):
                 )
                 self.image_label.setPixmap(scaled_pixmap)
         else:
-            # 실제 크기
             if self.current_movie:
                 self.current_movie.setScaledSize(base_pixmap.size())
             else:
@@ -875,7 +874,6 @@ class ImageViewer(QMainWindow):
         self.image_label.adjustSize()
     
     def toggle_actual_size(self):
-        """실제 크기/창 크기 토글"""
         self.fit_to_window = not self.fit_to_window
         if self.fit_to_window:
             self.zoom_factor = 1.0
@@ -1054,6 +1052,7 @@ class ImageViewer(QMainWindow):
     def show_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec_():
+            self.apply_background_color()
             self.apply_settings()
     
     def show_shortcut_settings(self):
@@ -1062,8 +1061,6 @@ class ImageViewer(QMainWindow):
             self.setup_shortcuts()
     
     def apply_settings(self):
-        bg_color = self.settings.get('background_color', '#2b2b2b')
-        self.setStyleSheet(f"QMainWindow {{ background-color: {bg_color}; }}")
         cache_size = self.settings.get('cache_size', 50)
         self.cache_manager = CacheManager(cache_size)
         interval = self.settings.get('slideshow_interval', 3)
