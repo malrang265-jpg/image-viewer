@@ -767,7 +767,8 @@ class ImageViewer(QMainWindow):
         self.current_zip = None
         self.zoom_factor = 1.0
         self.fit_to_window = True
-        self.rotation_angle = 0        self.current_movie = None
+        self.rotation_angle = 0        
+        self.current_movie = None
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
