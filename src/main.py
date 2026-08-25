@@ -7,7 +7,6 @@ import re
 import ctypes
 import ctypes.wintypes
 import concurrent.futures
-import math
 from io import BytesIO
 from collections import OrderedDict
 
@@ -802,7 +801,6 @@ class ImageViewer(QMainWindow):
         self.resize_region = None
         self.resize_margin = 12
         self.cursor_hidden = False
-        self.cursor_start_pos = None
         self.cursor_hide_timer = QTimer()
         self.cursor_hide_timer.setSingleShot(True)
         self.cursor_hide_timer.timeout.connect(self.hide_cursor)
@@ -833,14 +831,12 @@ class ImageViewer(QMainWindow):
         if self.isFullScreen() and not self.cursor_hidden:
             self.setCursor(Qt.BlankCursor)
             self.cursor_hidden = True
-            self.cursor_start_pos = None
     
     def show_cursor(self):
         if self.cursor_hidden:
             self.unsetCursor()
             self.setCursor(Qt.ArrowCursor)
             self.cursor_hidden = False
-            self.cursor_start_pos = None
     
     def reset_cursor_timer(self):
         if self.isFullScreen():
@@ -1470,17 +1466,8 @@ class ImageViewer(QMainWindow):
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        if self.cursor_hidden and self.isFullScreen():
-            if self.cursor_start_pos is None:
-                self.cursor_start_pos = event.globalPos()
-            else:
-                delta = event.globalPos() - self.cursor_start_pos
-                distance = math.sqrt(delta.x() ** 2 + delta.y() ** 2)
-                if distance >= 20:
-                    self.show_cursor()
-                    self.reset_cursor_timer()
-        else:
-            self.reset_cursor_timer()
+        self.show_cursor()
+        self.reset_cursor_timer()
         
         if self.resizing and self.resize_start_pos:
             delta = event.globalPos() - self.resize_start_pos
