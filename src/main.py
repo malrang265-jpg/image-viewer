@@ -204,30 +204,28 @@ class ImageLoader:
     @staticmethod
     def load_pixmap(filepath, quality='balanced', saturation=100, brightness=100, contrast=100):
         try:
-            # PIL로 로드 (조절값 적용)
             Image = get_pil_image()
             with Image.open(filepath) as img:
                 img = img.convert('RGB')
-                # 채도 조절
+                
                 if saturation != 100:
                     enhancer = get_pil_enhance().Color(img)
                     img = enhancer.enhance(saturation / 100.0)
-                # 밝기 조절
                 if brightness != 100:
                     enhancer = get_pil_enhance().Brightness(img)
                     img = enhancer.enhance(brightness / 100.0)
-                # 명도/대비 조절
                 if contrast != 100:
                     enhancer = get_pil_enhance().Contrast(img)
                     img = enhancer.enhance(contrast / 100.0)
                 
                 data = img.tobytes('raw', 'RGB')
-                qimage = QImage(data, img.width, img.height, QImage.Format_RGB888)
-                return QPixmap.fromImage(qimage.copy())
+                qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qimage.copy())
+                if not pixmap.isNull():
+                    return pixmap
         except Exception as e:
-            print(f"PIL 로드 실패: {e}")
+            print(f"PIL 로드 오류: {e}")
         
-        # QPixmap 폴백
         try:
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
@@ -320,17 +318,18 @@ class ZipHandler:
                         pixmap = movie.currentPixmap()
                         movie.stop()
                         return pixmap
-                pixmap = QPixmap()
-                if pixmap.loadFromData(data):
-                    return pixmap
+                
                 Image = get_pil_image()
                 img = Image.open(BytesIO(data))
                 img = img.convert('RGB')
                 data_bytes = img.tobytes('raw', 'RGB')
-                qimage = QImage(data_bytes, img.width, img.height, QImage.Format_RGB888)
-                return QPixmap.fromImage(qimage.copy())
+                qimage = QImage(data_bytes, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qimage.copy())
+                if not pixmap.isNull():
+                    return pixmap
         except:
-            return None
+            pass
+        return None
 
 class ImageListDialog(QDialog):
     def __init__(self, image_list, current_index, parent=None, current_zip=None):
@@ -398,7 +397,7 @@ class ImageListDialog(QDialog):
                 pixmap = ZipHandler.load_image_from_zip(self.current_zip, self.image_list[index])
             else:
                 pixmap = ImageLoader.load_thumbnail(self.image_list[index])
-            if pixmap:
+            if pixmap and not pixmap.isNull():
                 scaled = pixmap.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.preview_label.setPixmap(scaled)
         except:
@@ -629,10 +628,9 @@ class SettingsDialog(QDialog):
         contrast_row.addWidget(self.contrast_label)
         adjust_layout.addRow('명도/대비:', contrast_row)
         
-        # 실시간 미리보기 버튼
-        preview_button = QPushButton('현재 이미지에 적용')
-        preview_button.clicked.connect(self.apply_preview)
-        adjust_layout.addRow('', preview_button)
+        apply_button = QPushButton('현재 이미지에 즉시 적용')
+        apply_button.clicked.connect(self.apply_immediately)
+        adjust_layout.addRow('', apply_button)
         
         adjust_group.setLayout(adjust_layout)
         layout.addWidget(adjust_group)
@@ -688,10 +686,11 @@ class SettingsDialog(QDialog):
         self.contrast_slider.valueChanged.connect(
             lambda v: self.contrast_label.setText(f'{v}%'))
     
-    def apply_preview(self):
-        """현재 이미지에 조절값 적용"""
-        if self.parent() and hasattr(self.parent(), 'apply_image_adjustments'):
-            self.parent().apply_image_adjustments(
+    def apply_immediately(self):
+        """현재 이미지에 즉시 적용"""
+        parent = self.parent()
+        if parent and hasattr(parent, 'apply_image_adjustments'):
+            parent.apply_image_adjustments(
                 self.saturation_slider.value(),
                 self.brightness_slider.value(),
                 self.contrast_slider.value()
@@ -835,6 +834,15 @@ class ImageViewer(QMainWindow):
             y = screen.bottom() - h
         return QPoint(x, y)
     
+    def apply_image_adjustments(self, saturation, brightness, contrast):
+        """이미지 조절값 즉시 적용"""
+        self.settings.set('saturation', saturation)
+        self.settings.set('brightness', brightness)
+        self.settings.set('contrast', contrast)
+        self.cache_manager.clear()
+        if self.image_list:
+            self.show_current_image()
+    
     def init_ui(self):
         self.setWindowTitle('Pekoviewer')
         self.setMinimumSize(200, 150)
@@ -871,15 +879,6 @@ class ImageViewer(QMainWindow):
             QScrollArea {{ background-color: {bg_color}; }}
             QLabel {{ background-color: transparent; }}
         """)
-    
-    def apply_image_adjustments(self, saturation, brightness, contrast):
-        """이미지 조절값 적용"""
-        self.settings.set('saturation', saturation)
-        self.settings.set('brightness', brightness)
-        self.settings.set('contrast', contrast)
-        self.cache_manager.clear()
-        if self.image_list:
-            self.show_current_image()
     
     def get_resize_region(self, pos):
         x, y = pos.x(), pos.y()
@@ -1088,42 +1087,41 @@ class ImageViewer(QMainWindow):
                         self.current_movie = movie
                         self.image_label.setMovie(movie)
                         movie.start()
-                        self.original_pixmap = movie.currentPixmap()
-                        self.update_image_display()
-                        if self.slideshow_playing and self.slideshow_mode == 'loop':
-                            self.connect_gif_loop()
                         self.is_loading = False
                         return
                 else:
-                    cache_key = f"{current_file}_{self.settings.get('saturation',100)}_{self.settings.get('brightness',100)}_{self.settings.get('contrast',100)}"
+                    saturation = self.settings.get('saturation', 100)
+                    brightness = self.settings.get('brightness', 100)
+                    contrast = self.settings.get('contrast', 100)
+                    cache_key = f"{current_file}_{saturation}_{brightness}_{contrast}"
                     pixmap = self.cache_manager.get(cache_key)
                     if pixmap is None:
-                        saturation = self.settings.get('saturation', 100)
-                        brightness = self.settings.get('brightness', 100)
-                        contrast = self.settings.get('contrast', 100)
                         pixmap = ImageLoader.load_pixmap(current_file,
                                                         saturation=saturation,
                                                         brightness=brightness,
                                                         contrast=contrast)
-                        if pixmap:
+                        if pixmap and not pixmap.isNull():
                             self.cache_manager.put(cache_key, pixmap)
-            if pixmap:
+            
+            if pixmap and not pixmap.isNull():
                 if self.rotation_angle != 0:
                     transform = QTransform().rotate(self.rotation_angle)
                     pixmap = pixmap.transformed(transform, Qt.SmoothTransformation)
+                
                 self.current_pixmap = pixmap
                 self.original_pixmap = pixmap
                 
-                # 이미지를 먼저 표시
+                # 직접 크기 조절하여 표시
                 if self.fit_to_window:
-                    scaled_pixmap = pixmap.scaled(
+                    scaled = pixmap.scaled(
                         self.scroll_area.size(),
                         Qt.KeepAspectRatio,
                         Qt.SmoothTransformation
                     )
-                    self.image_label.setPixmap(scaled_pixmap)
+                    self.image_label.setPixmap(scaled)
                 else:
                     self.image_label.setPixmap(pixmap)
+                
                 self.image_label.adjustSize()
                 
                 if self.settings.get('show_filename', False):
@@ -1156,35 +1154,24 @@ class ImageViewer(QMainWindow):
                 self.next_image()
                 self.gif_loop_count = 0
     
-    def update_image_display(self):
-        base_pixmap = None
-        if self.current_movie:
-            base_pixmap = self.current_movie.currentPixmap()
-        elif self.original_pixmap:
-            base_pixmap = self.original_pixmap
-        elif self.current_pixmap:
-            base_pixmap = self.current_pixmap
-        if not base_pixmap or base_pixmap.isNull():
-            return
-        if self.fit_to_window:
-            if self.current_movie:
-                scaled_size = base_pixmap.size().scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
-                self.current_movie.setScaledSize(scaled_size)
-            else:
-                scaled_pixmap = base_pixmap.scaled(self.scroll_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.image_label.setPixmap(scaled_pixmap)
-        else:
-            if self.current_movie:
-                self.current_movie.setScaledSize(base_pixmap.size())
-            else:
-                self.image_label.setPixmap(base_pixmap)
-        self.image_label.adjustSize()
-    
     def toggle_actual_size(self):
         self.fit_to_window = not self.fit_to_window
         if self.fit_to_window:
             self.zoom_factor = 1.0
         self.update_image_display()
+    
+    def update_image_display(self):
+        if self.current_pixmap:
+            if self.fit_to_window:
+                scaled = self.current_pixmap.scaled(
+                    self.scroll_area.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.image_label.setPixmap(scaled)
+            else:
+                self.image_label.setPixmap(self.current_pixmap)
+            self.image_label.adjustSize()
     
     def next_image(self):
         if self.image_list and self.current_index < len(self.image_list) - 1:
@@ -1312,7 +1299,7 @@ class ImageViewer(QMainWindow):
         menu.exec_(self.mapToGlobal(pos))
     
     def show_settings(self):
-        dialog = SettingsDialog(self.settings, self)
+        dialog = SettingsDialog(self, self.settings)
         if dialog.exec_():
             self.apply_background_color()
             self.cache_manager.clear()
