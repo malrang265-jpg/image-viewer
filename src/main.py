@@ -34,7 +34,7 @@ class SingleApplication:
     
     def is_running(self):
         self.socket.connectToServer(self.app_name)
-        if self.socket.waitForConnected(100):
+        if self.socket.waitForConnected(50):
             return True
         return False
     
@@ -47,12 +47,11 @@ class SingleApplication:
         if self.socket.state() == QLocalSocket.ConnectedState:
             self.socket.write(message.encode())
             self.socket.flush()
-            self.socket.waitForBytesWritten(100)
             self.socket.disconnectFromServer()
     
     def on_new_connection(self):
         socket = self.server.nextPendingConnection()
-        if socket.waitForReadyRead(200):
+        if socket.waitForReadyRead(50):
             data = socket.readAll().data().decode('utf-8', errors='ignore')
             if self.file_received_callback and data:
                 self.file_received_callback(data)
@@ -244,7 +243,14 @@ class ZipHandler:
                         images.append(filename)
         except:
             pass
-        return sorted(images)
+        
+        # 자연스러운 정렬
+        def natural_key(s):
+            return [int(text) if text.isdigit() else text.lower() 
+                    for text in re.split(r'(\d+)', s)]
+        
+        images.sort(key=natural_key)
+        return images
     
     @staticmethod
     def get_temp_path(filename):
@@ -790,7 +796,6 @@ class ImageViewer(QMainWindow):
                     try:
                         shortcut = QShortcut(QKeySequence(key), self)
                         shortcut.activated.connect(callback)
-                        # 프로그램 내에서만 동작하도록 설정
                         shortcut.setContext(Qt.WidgetWithChildrenShortcut)
                         self.shortcut_objects[f"{action_name}_{i}"] = shortcut
                     except:
@@ -851,7 +856,9 @@ class ImageViewer(QMainWindow):
                 self.load_single_file(path)
     
     def natural_sort_key(self, s):
-        return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
+        """자연스러운 정렬 - 숫자를 정수로 변환"""
+        return [int(text) if text.isdigit() else text.lower() 
+                for text in re.split(r'(\d+)', s)]
     
     def load_directory(self, directory):
         self.image_list = []
@@ -1183,13 +1190,11 @@ class ImageViewer(QMainWindow):
         super().closeEvent(event)
 
 def main():
-    # 빠른 시작을 위해 최소한의 초기화
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    # 중복 실행 확인
     single_app = SingleApplication()
     
     if single_app.is_running():
