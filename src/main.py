@@ -449,7 +449,7 @@ class ShortcutSettingsDialog(QDialog):
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
         layout = QVBoxLayout(self)
-        info_label = QLabel('버튼 클릭 후 1초 동안 입력한 모든 키/마우스 버튼이 단축키로 설정됩니다.\n왼쪽 더블클릭: Left Double Click\n오른쪽 더블클릭: Right Double Click\nESC: 삭제')
+        info_label = QLabel('버튼 클릭 후 1초 동안 입력한 모든 키/마우스 버튼이 단축키로 설정됩니다.\n더블클릭: Left Double Click / Right Double Click\nESC: 삭제')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         actions = [
@@ -510,14 +510,11 @@ class ShortcutSettingsDialog(QDialog):
         button.setStyleSheet("background-color: #4a90d9; color: white; border: 1px solid #555; padding: 5px 10px;")
         self.grabKeyboard()
         self.setFocus()
-        # 1초 후 캡처 완료
         self.capture_timer.start(1000)
     
     def finish_capture(self):
-        """1초 후 캡처 완료"""
         if self.capturing and self.current_action:
             if self.captured_keys:
-                # 첫 번째 입력만 사용
                 shortcut_text = self.captured_keys[0]
                 self.shortcut_buttons[self.current_action][self.current_slot].setText(shortcut_text)
             else:
@@ -836,12 +833,12 @@ class ImageViewer(QMainWindow):
     def show_cursor(self):
         self.unsetCursor()
         if self.isFullScreen():
-            self.cursor_hide_timer.start(2000)
+            self.cursor_hide_timer.start(300)  # 0.3초
     
     def reset_cursor_timer(self):
         if self.isFullScreen():
             self.show_cursor()
-            self.cursor_hide_timer.start(2000)
+            self.cursor_hide_timer.start(300)  # 0.3초
     
     def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
