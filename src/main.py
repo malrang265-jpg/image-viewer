@@ -687,7 +687,6 @@ class SettingsDialog(QDialog):
             lambda v: self.contrast_label.setText(f'{v}%'))
     
     def apply_immediately(self):
-        """현재 이미지에 즉시 적용"""
         parent = self.parent()
         if parent and hasattr(parent, 'apply_image_adjustments'):
             parent.apply_image_adjustments(
@@ -835,7 +834,6 @@ class ImageViewer(QMainWindow):
         return QPoint(x, y)
     
     def apply_image_adjustments(self, saturation, brightness, contrast):
-        """이미지 조절값 즉시 적용"""
         self.settings.set('saturation', saturation)
         self.settings.set('brightness', brightness)
         self.settings.set('contrast', contrast)
@@ -1111,7 +1109,6 @@ class ImageViewer(QMainWindow):
                 self.current_pixmap = pixmap
                 self.original_pixmap = pixmap
                 
-                # 직접 크기 조절하여 표시
                 if self.fit_to_window:
                     scaled = pixmap.scaled(
                         self.scroll_area.size(),
@@ -1154,13 +1151,24 @@ class ImageViewer(QMainWindow):
                 self.next_image()
                 self.gif_loop_count = 0
     
-    def toggle_actual_size(self):
-        self.fit_to_window = not self.fit_to_window
-        if self.fit_to_window:
-            self.zoom_factor = 1.0
-        self.update_image_display()
-    
     def update_image_display(self):
+        # GIF/WebP 애니메이션 처리
+        if self.current_movie:
+            try:
+                original_size = self.current_movie.currentPixmap().size()
+                if original_size.width() > 0 and original_size.height() > 0:
+                    if self.fit_to_window:
+                        scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                        self.current_movie.setScaledSize(scaled_size)
+                    else:
+                        new_size = QSize(int(original_size.width() * self.zoom_factor),
+                                        int(original_size.height() * self.zoom_factor))
+                        self.current_movie.setScaledSize(new_size)
+            except:
+                pass
+            return
+        
+        # 일반 이미지 처리
         if self.current_pixmap:
             if self.fit_to_window:
                 scaled = self.current_pixmap.scaled(
@@ -1170,8 +1178,20 @@ class ImageViewer(QMainWindow):
                 )
                 self.image_label.setPixmap(scaled)
             else:
-                self.image_label.setPixmap(self.current_pixmap)
+                new_size = self.current_pixmap.size() * self.zoom_factor
+                scaled = self.current_pixmap.scaled(
+                    new_size,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.image_label.setPixmap(scaled)
             self.image_label.adjustSize()
+    
+    def toggle_actual_size(self):
+        self.fit_to_window = not self.fit_to_window
+        if self.fit_to_window:
+            self.zoom_factor = 1.0
+        self.update_image_display()
     
     def next_image(self):
         if self.image_list and self.current_index < len(self.image_list) - 1:
@@ -1299,7 +1319,7 @@ class ImageViewer(QMainWindow):
         menu.exec_(self.mapToGlobal(pos))
     
     def show_settings(self):
-        dialog = SettingsDialog(self, self.settings)
+        dialog = SettingsDialog(self.settings, self)
         if dialog.exec_():
             self.apply_background_color()
             self.cache_manager.clear()
