@@ -23,6 +23,34 @@ from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
+# 전역 키보드 훅
+WH_KEYBOARD_LL = 13
+keyboard_hook = None
+
+def low_level_keyboard_proc(nCode, wParam, lParam):
+    if nCode == 0:
+        vk_code = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong)).contents.value
+        # Pekoviewer가 실행 중일 때만 키 차단
+        # 방향키, Delete, PageUp, PageDown 차단
+        if vk_code in [0x25, 0x26, 0x27, 0x28, 0x2E, 0x21, 0x22]:
+            return 1
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+def setup_keyboard_hook():
+    global keyboard_hook
+    keyboard_hook = user32.SetWindowsHookExW(
+        WH_KEYBOARD_LL,
+        low_level_keyboard_proc,
+        kernel32.GetModuleHandleW(None),
+        0
+    )
+
+def remove_keyboard_hook():
+    global keyboard_hook
+    if keyboard_hook:
+        user32.UnhookWindowsHookEx(keyboard_hook)
+        keyboard_hook = None
+
 PIL_Image = None
 
 def get_pil_image():
@@ -45,7 +73,6 @@ def get_app_dir():
         return os.path.dirname(os.path.abspath(__file__))
 
 def get_icon_path():
-    """아이콘 파일 경로 찾기"""
     possible_paths = [
         os.path.join(get_app_dir(), 'icon.ico'),
         os.path.join(getattr(sys, '_MEIPASS', ''), 'icon.ico') if hasattr(sys, '_MEIPASS') else '',
@@ -766,6 +793,7 @@ class ImageViewer(QMainWindow):
         self.raise_()
         self.activateWindow()
         QTimer.singleShot(0, self.force_foreground)
+        QTimer.singleShot(100, self.force_foreground)
     
     def force_foreground(self):
         try:
@@ -820,14 +848,11 @@ class ImageViewer(QMainWindow):
     
     def keyPressEvent(self, event: QKeyEvent):
         key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
-        
-        # 종료 단축키 우선 처리
         close_shortcuts = self.settings.get_shortcuts('close_program')
         if key_sequence in close_shortcuts:
             self.close()
             event.accept()
             return
-        
         shortcut_actions = {
             'next_image': self.next_image, 'prev_image': self.prev_image,
             'zoom_in': self.zoom_in, 'zoom_out': self.zoom_out,
@@ -838,14 +863,12 @@ class ImageViewer(QMainWindow):
             'slideshow': self.toggle_slideshow,
             'rotate_right': self.rotate_right, 'rotate_left': self.rotate_left,
         }
-        
         for action_name, callback in shortcut_actions.items():
             shortcuts = self.settings.get_shortcuts(action_name)
             if key_sequence in shortcuts:
                 callback()
                 event.accept()
                 return
-        
         event.accept()
     
     def check_mouse_shortcut(self, button_text):
@@ -1229,23 +1252,37 @@ class ImageViewer(QMainWindow):
         self.save_settings()
         self.stop_current_movie()
         self.slideshow.stop()
+        remove_keyboard_hook()
         super().closeEvent(event)
 
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    
     single_app = SingleApplication()
     if single_app.is_running():
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
     single_app.start_server()
+    
+    # 키보드 훅 설정 (다른 프로그램에 키 전달 차단)
+    setup_keyboard_hook()
+    
     viewer = ImageViewer()
     single_app.set_file_received_callback(viewer.load_path)
+    
     if len(sys.argv) > 1:
         viewer.load_path(sys.argv[1])
+    
     viewer.show()
+    
+    # 창이 표시된 후 강제로 맨 앞으로
+    QTimer.singleShot(100, viewer.force_foreground)
+    QTimer.singleShot(300, viewer.force_foreground)
+    QTimer.singleShot(500, viewer.force_foreground)
+    
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
