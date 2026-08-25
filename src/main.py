@@ -708,12 +708,23 @@ class ImageViewer(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
     
-        def bring_to_front(self):
+    def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
         self.show()
         self.raise_()
         self.activateWindow()
         QTimer.singleShot(0, self.force_foreground)
+    
+    def force_foreground(self):
+        try:
+            hwnd = int(self.winId())
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
+            user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001)
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            user32.ShowWindow(hwnd, 5)
+        except:
+            pass
     
     def force_foreground(self):
         try:
