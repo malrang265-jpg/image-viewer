@@ -711,10 +711,25 @@ class SettingsDialog(QDialog):
         contrast_row.addWidget(self.contrast_slider)
         contrast_row.addWidget(self.contrast_label)
         adjust_layout.addRow('명도/대비:', contrast_row)
-        
+
+        # Larger slider handle/groove makes fine adjustment much easier on
+        # desktop displays while keeping the control compact.
+        slider_style = (
+            'QSlider::groove:horizontal { height: 10px; }'
+            'QSlider::handle:horizontal { width: 22px; margin: -7px 0; }'
+        )
+        for slider in (self.saturation_slider, self.brightness_slider, self.contrast_slider):
+            slider.setStyleSheet(slider_style)
+            slider.setMinimumHeight(28)
+
+        adjustment_buttons = QHBoxLayout()
         apply_button = QPushButton('현재 이미지에 즉시 적용')
         apply_button.clicked.connect(self.apply_immediately)
-        adjust_layout.addRow('', apply_button)
+        reset_button = QPushButton('초기화')
+        reset_button.clicked.connect(self.reset_image_adjustments)
+        adjustment_buttons.addWidget(apply_button)
+        adjustment_buttons.addWidget(reset_button)
+        adjust_layout.addRow('', adjustment_buttons)
         
         adjust_group.setLayout(adjust_layout)
         layout.addWidget(adjust_group)
@@ -778,6 +793,13 @@ class SettingsDialog(QDialog):
                 self.brightness_slider.value(),
                 self.contrast_slider.value()
             )
+
+    def reset_image_adjustments(self):
+        self.saturation_slider.setValue(100)
+        self.brightness_slider.setValue(100)
+        self.contrast_slider.setValue(100)
+        # Reset immediately so the user can compare without closing settings.
+        self.apply_immediately()
     
     def load_settings(self):
         quality = self.settings.get('zoom_quality', 'balanced')
@@ -864,7 +886,14 @@ class ImageViewer(QMainWindow):
         self.current_movie_original_size = None
         self.current_movie_generation = 0
         self.animated_frame_cache = OrderedDict()
-        self.animated_frame_cache_limit = 24
+        self.animated_frame_cache_limit = 32
+        # Raw, already color-corrected animation frames produced by the
+        # background preprocessor. QPixmap objects are created only on the GUI
+        # thread. This avoids doing expensive Pillow work during playback.
+        self.animated_raw_cache = OrderedDict()
+        self.animated_raw_cache_limit = 16
+        self.animated_preload_count = 8
+        self.animated_preload_anchor = -1
         self.current_movie_frame = -1
         self.current_pixmap = None
         self.original_pixmap = None
@@ -1214,6 +1243,8 @@ class ImageViewer(QMainWindow):
         self.current_movie_frame = -1
         self.gif_last_frame = -1
         self.animated_frame_cache.clear()
+        self.animated_raw_cache.clear()
+        self.animated_preload_anchor = -1
     
     def _cache_key(self, filepath, saturation, brightness, contrast, max_size):
         size_key = 'full' if not max_size else f'{max_size[0]}x{max_size[1]}'
@@ -1399,12 +1430,15 @@ class ImageViewer(QMainWindow):
                             movie.setScaledSize(scaled_size)
                     self.current_movie_frame = -1
                     self.animated_frame_cache.clear()
+                    self.animated_raw_cache.clear()
+                    self.animated_preload_anchor = -1
                     movie.frameChanged.connect(self.on_animated_frame_changed)
                     # A new movie must reconnect slideshow loop counting.
                     if self.slideshow_playing and self.slideshow_mode == 'loop':
                         self.connect_gif_loop()
                     movie.start()
                     self._render_animated_frame(movie.currentFrameNumber(), movie_generation)
+                    self._start_animated_preload(movie.currentFrameNumber(), movie_generation)
                     self.is_loading = False
                     return
 
@@ -1439,6 +1473,42 @@ class ImageViewer(QMainWindow):
         self.current_movie_frame = frame_number
         self._render_animated_frame(frame_number, self.current_movie_generation)
 
+    def _animated_processing_size(self, qimage):
+        """Choose a practical processing size to keep animation playback smooth."""
+        w, h = qimage.width(), qimage.height()
+        if w <= 0 or h <= 0:
+            return (w, h)
+        # When fitting to the window, QMovie has already been scaled to the
+        # actual display size. For huge actual-size animations, cap processing
+        # to 1920px on the long edge; the original QMovie frame remains intact.
+        if self.fit_to_window:
+            return (w, h)
+        cap = 1920
+        if max(w, h) <= cap:
+            return (w, h)
+        scale = cap / float(max(w, h))
+        return (max(1, int(w * scale)), max(1, int(h * scale)))
+
+    def _animated_cache_key(self, frame_number, size=None):
+        if size is None:
+            size = self.scroll_area.size()
+        return (frame_number,
+                self.settings.get('saturation', 100),
+                self.settings.get('brightness', 100),
+                self.settings.get('contrast', 100),
+                self.fit_to_window,
+                size[0] if isinstance(size, tuple) else size.width(),
+                size[1] if isinstance(size, tuple) else size.height())
+
+    def on_animated_frame_changed(self, frame_number):
+        if not self.current_movie:
+            return
+        self.current_movie_frame = frame_number
+        self._render_animated_frame(frame_number, self.current_movie_generation)
+        # Keep a rolling pipeline of frames ahead of the playback position.
+        if frame_number >= self.animated_preload_anchor + 4:
+            self._start_animated_preload(frame_number, self.current_movie_generation)
+
     def _render_animated_frame(self, frame_number, generation):
         if not self.current_movie or generation != self.current_movie_generation:
             return
@@ -1448,13 +1518,21 @@ class ImageViewer(QMainWindow):
             qimage = movie.currentPixmap().toImage()
         if qimage.isNull():
             return
-        key = self._animated_cache_key(frame_number)
+
+        proc_size = self._animated_processing_size(qimage)
+        key = self._animated_cache_key(frame_number, proc_size)
         cached = self.animated_frame_cache.get(key)
         if cached is not None:
             self.animated_frame_cache.move_to_end(key)
             self.current_pixmap = cached
             self.image_label.setPixmap(cached)
             self.image_label.adjustSize()
+            return
+
+        raw_entry = self.animated_raw_cache.get(key)
+        if raw_entry is not None:
+            self.animated_raw_cache.move_to_end(key)
+            self._display_animated_raw(frame_number, key, raw_entry, generation)
             return
 
         saturation = self.settings.get('saturation', 100)
@@ -1468,20 +1546,27 @@ class ImageViewer(QMainWindow):
             self.image_label.adjustSize()
             return
 
-        # Process the current frame in the worker pool. QMovie itself remains
-        # on the GUI thread because it is a Qt object. The expensive Pillow
-        # color work happens off the UI thread and never creates a temp file.
+        self._submit_animated_frame_job(qimage, frame_number, key, generation)
+
+    def _submit_animated_frame_job(self, qimage, frame_number, key, generation):
         try:
+            target_w, target_h = key[-2], key[-1]
             rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
-            w, h = rgba.width(), rgba.height()
+            if rgba.width() != target_w or rgba.height() != target_h:
+                rgba = rgba.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation)
+                target_w, target_h = rgba.width(), rgba.height()
+                key = self._animated_cache_key(frame_number, (target_w, target_h))
             ptr = rgba.bits()
             ptr.setsize(rgba.byteCount())
             raw = bytes(ptr)
-            settings = (saturation, brightness, contrast)
+            saturation = self.settings.get('saturation', 100)
+            brightness = self.settings.get('brightness', 100)
+            contrast = self.settings.get('contrast', 100)
+
             def worker():
                 try:
                     from PIL import Image, ImageEnhance
-                    src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
+                    src = Image.frombuffer('RGBA', (target_w, target_h), raw, 'raw', 'RGBA', 0, 1)
                     rgb = src.convert('RGB')
                     if saturation != 100:
                         rgb = ImageEnhance.Color(rgb).enhance(saturation / 100.0)
@@ -1490,36 +1575,133 @@ class ImageViewer(QMainWindow):
                     if contrast != 100:
                         rgb = ImageEnhance.Contrast(rgb).enhance(contrast / 100.0)
                     out = rgb.convert('RGBA')
-                    return out.tobytes('raw', 'RGBA'), w, h
+                    return out.tobytes('raw', 'RGBA'), target_w, target_h
                 except Exception:
                     return None
+
             future = ImageLoader._executor.submit(worker)
-            def done(fut, gen=generation, frame=frame_number, key=key):
+            def done(fut, gen=generation, frame=frame_number, cache_key=key):
                 try:
                     result = fut.result()
                 except Exception:
                     result = None
-                self.load_bridge.animated_frame.emit(gen, frame, (key, result))
+                self.load_bridge.animated_frame.emit(gen, frame, (cache_key, result))
             future.add_done_callback(done)
         except Exception:
             pass
 
-    def _on_animated_frame_ready(self, generation, frame_number, payload):
-        if generation != self.current_movie_generation or not self.current_movie:
+    def _start_animated_preload(self, current_frame, generation):
+        """Preprocess several upcoming frames in one sequential Pillow pass."""
+        movie = self.current_movie
+        if not movie or generation != self.current_movie_generation:
             return
-        key, result = payload
-        if not result:
+        filepath = getattr(movie, 'fileName', lambda: '')()
+        if not filepath or not os.path.isfile(filepath):
             return
-        raw, w, h = result
+        try:
+            frame_count = max(1, movie.frameCount())
+        except Exception:
+            frame_count = 1
+        if frame_count <= 1:
+            return
+        if current_frame < self.animated_preload_anchor + 1 and self.animated_preload_anchor >= 0:
+            return
+        self.animated_preload_anchor = current_frame
+        count = min(self.animated_preload_count, max(0, frame_count - 1))
+        if count <= 0:
+            return
+
+        saturation = self.settings.get('saturation', 100)
+        brightness = self.settings.get('brightness', 100)
+        contrast = self.settings.get('contrast', 100)
+        if saturation == 100 and brightness == 100 and contrast == 100:
+            return
+        # Use the current QMovie frame size as the processing target. This is
+        # especially important for 4K/8K animations displayed in a small window.
+        qimg = movie.currentImage()
+        if qimg.isNull():
+            return
+        target_w, target_h = self._animated_processing_size(qimg)
+
+        def worker():
+            results = []
+            try:
+                from PIL import Image, ImageEnhance
+                with Image.open(filepath) as src:
+                    for offset in range(1, count + 1):
+                        if generation != self.current_movie_generation:
+                            break
+                        frame = (current_frame + offset) % frame_count
+                        try:
+                            src.seek(frame)
+                            img = src.convert('RGBA')
+                            if img.width != target_w or img.height != target_h:
+                                img.thumbnail((target_w, target_h), Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR)
+                            rgb = img.convert('RGB')
+                            if saturation != 100:
+                                rgb = ImageEnhance.Color(rgb).enhance(saturation / 100.0)
+                            if brightness != 100:
+                                rgb = ImageEnhance.Brightness(rgb).enhance(brightness / 100.0)
+                            if contrast != 100:
+                                rgb = ImageEnhance.Contrast(rgb).enhance(contrast / 100.0)
+                            out = rgb.convert('RGBA')
+                            results.append((frame, out.tobytes('raw', 'RGBA'), out.width, out.height))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            return results
+
+        try:
+            future = ImageLoader._executor.submit(worker)
+            def done(fut, gen=generation):
+                try:
+                    results = fut.result()
+                except Exception:
+                    results = []
+                self.load_bridge.animated_frame.emit(gen, -1, ('__preload__', results))
+            future.add_done_callback(done)
+        except Exception:
+            pass
+
+    def _display_animated_raw(self, frame_number, key, raw_entry, generation):
+        raw, w, h = raw_entry
         qimg = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888).copy()
         pixmap = QPixmap.fromImage(qimg)
         if pixmap.isNull():
             return
         self._store_animated_frame(key, pixmap)
-        if self.current_movie_frame == frame_number:
+        if self.current_movie_frame == frame_number and generation == self.current_movie_generation:
             self.current_pixmap = pixmap
             self.image_label.setPixmap(pixmap)
             self.image_label.adjustSize()
+
+    def _on_animated_frame_ready(self, generation, frame_number, payload):
+        if generation != self.current_movie_generation or not self.current_movie:
+            return
+        key, result = payload
+        if key == '__preload__':
+            if not result:
+                return
+            saturation = self.settings.get('saturation', 100)
+            brightness = self.settings.get('brightness', 100)
+            contrast = self.settings.get('contrast', 100)
+            for frame, raw, w, h in result:
+                cache_key = self._animated_cache_key(frame, (w, h))
+                self._store_animated_raw(cache_key, (raw, w, h))
+            return
+        if not result:
+            return
+        raw, w, h = result
+        self._store_animated_raw(key, (raw, w, h))
+        if self.current_movie_frame == frame_number:
+            self._display_animated_raw(frame_number, key, (raw, w, h), generation)
+
+    def _store_animated_raw(self, key, raw_entry):
+        self.animated_raw_cache[key] = raw_entry
+        self.animated_raw_cache.move_to_end(key)
+        while len(self.animated_raw_cache) > self.animated_raw_cache_limit:
+            self.animated_raw_cache.popitem(last=False)
 
     def _store_animated_frame(self, key, pixmap):
         self.animated_frame_cache[key] = pixmap
