@@ -127,82 +127,11 @@ class Settings:
             self.load()
     
     def load(self):
-        defaults = self.default_settings()
         try:
             with open(self.settings_file, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-            self.data = self._normalize(loaded, defaults)
-        except Exception:
-            self.data = defaults
-            self.save()
-
-    @staticmethod
-    def _safe_int(value, default, minimum=None, maximum=None):
-        try:
-            if isinstance(value, bool):
-                raise ValueError
-            value = int(float(value))
-        except (TypeError, ValueError):
-            value = default
-        if minimum is not None:
-            value = max(minimum, value)
-        if maximum is not None:
-            value = min(maximum, value)
-        return value
-
-    def _normalize(self, loaded, defaults):
-        if not isinstance(loaded, dict):
-            return defaults
-        data = dict(defaults)
-        data.update(loaded)
-        data['zoom_quality'] = data['zoom_quality'] if data['zoom_quality'] in ('speed','balanced','quality') else 'balanced'
-        data['show_filename'] = self._to_bool(data['show_filename'], False)
-        data['fit_to_window'] = self._to_bool(data['fit_to_window'], True)
-        data['snap_enabled'] = self._to_bool(data['snap_enabled'], True)
-        data['preload_next'] = self._to_bool(data['preload_next'], True)
-        data['snap_threshold'] = self._safe_int(data['snap_threshold'], 20, 5, 50)
-        data['saturation'] = self._safe_int(data['saturation'], 100, 0, 200)
-        data['brightness'] = self._safe_int(data['brightness'], 100, 0, 200)
-        data['contrast'] = self._safe_int(data['contrast'], 100, 0, 200)
-        data['slideshow_interval'] = self._safe_int(data['slideshow_interval'], 3, 1, 60)
-        data['slideshow_gif_loops'] = self._safe_int(data['slideshow_gif_loops'], 2, 1, 10)
-        data['cache_size'] = self._safe_int(data['cache_size'], 200, 20, 2000)
-        data['cache_mb'] = self._safe_int(data['cache_mb'], 768, 128, 8192)
-        data['preload_count'] = self._safe_int(data['preload_count'], 3, 0, 10)
-        if data['slideshow_mode'] not in ('time','loop'):
-            data['slideshow_mode'] = 'time'
-        color = data.get('background_color', '#2b2b2b')
-        if not isinstance(color, str) or not color.strip():
-            data['background_color'] = '#2b2b2b'
-        shortcuts = data.get('shortcuts')
-        if not isinstance(shortcuts, dict):
-            data['shortcuts'] = dict(defaults['shortcuts'])
-        else:
-            clean = {}
-            for action, default_value in defaults['shortcuts'].items():
-                value = shortcuts.get(action, default_value)
-                if isinstance(value, str):
-                    value = [value, '']
-                elif isinstance(value, list):
-                    value = [str(x) if x is not None else '' for x in value[:2]]
-                    while len(value) < 2:
-                        value.append('')
-                else:
-                    value = list(default_value)
-                clean[action] = value
-            data['shortcuts'] = clean
-        return data
-
-    @staticmethod
-    def _to_bool(value, default):
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            v=value.strip().lower()
-            if v in ('true','1','yes','on','예','사용'): return True
-            if v in ('false','0','no','off','아니오','사용 안 함'): return False
-        if isinstance(value, (int,float)): return bool(value)
-        return default
+                self.data = json.load(f)
+        except:
+            self.data = self.default_settings()
     
     def save(self):
         try:
@@ -250,15 +179,9 @@ class Settings:
     def get(self, key, default=None):
         return self.data.get(key, default)
     
-    def set(self, key, value, save=True):
+    def set(self, key, value):
         self.data[key] = value
-        if save:
-            self.save()
-
-    def update_many(self, values):
-        if isinstance(values, dict):
-            self.data.update(values)
-            self.save()
+        self.save()
     
     def get_shortcuts(self, action):
         shortcuts = self.data.get('shortcuts', {})
@@ -289,15 +212,6 @@ class ImageLoader:
     @staticmethod
     def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None):
         try:
-            # Fast path: when no color processing is requested, let Qt's native
-            # decoders handle PNG/JPEG/WebP. This avoids a Pillow decode + RGB
-            # conversion + byte copy for the common viewing case.
-            if saturation == 100 and brightness == 100 and contrast == 100:
-                image = QImage(filepath)
-                if not image.isNull():
-                    if max_size and max_size[0] > 0 and max_size[1] > 0 and (image.width() > max_size[0] or image.height() > max_size[1]):
-                        image = image.scaled(max_size[0], max_size[1], Qt.KeepAspectRatio, Qt.FastTransformation)
-                    return image
             Image = get_pil_image()
             with Image.open(filepath) as src:
                 if getattr(src, 'is_animated', False):
@@ -739,8 +653,16 @@ class SettingsDialog(QDialog):
             QComboBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
             QComboBox QAbstractItemView { background-color: #3c3c3c; color: #ffffff; selection-background-color: #4a90d9; }
             QSpinBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
-            QSlider::groove:horizontal { height: 6px; background: #555; }
-            QSlider::handle:horizontal { width: 16px; background: #4a90d9; border-radius: 8px; }
+            QSlider::groove:horizontal { height: 10px; background: #555; border-radius: 5px; }
+            QSlider::sub-page:horizontal { background: #4a90d9; border-radius: 5px; }
+            QSlider::add-page:horizontal { background: #444; border-radius: 5px; }
+            QSlider::handle:horizontal {
+                width: 24px; height: 24px; margin: -7px 0;
+                background: #6bb6ff; border: 2px solid #ffffff; border-radius: 12px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #8bc8ff; border: 2px solid #ffffff;
+            }
             QPushButton { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 5px 10px; }
             QPushButton:hover { background-color: #4c4c4c; }
         """)
@@ -798,23 +720,15 @@ class SettingsDialog(QDialog):
         contrast_row.addWidget(self.contrast_label)
         adjust_layout.addRow('명도/대비:', contrast_row)
         
-        # Larger slider handle/groove makes fine adjustment much easier on
-        # desktop displays while keeping the control compact.
-        slider_style = (
-            'QSlider::groove:horizontal { height: 10px; }'
-            'QSlider::handle:horizontal { width: 22px; margin: -7px 0; }'
-        )
-        for slider in (self.saturation_slider, self.brightness_slider, self.contrast_slider):
-            slider.setStyleSheet(slider_style)
-            slider.setMinimumHeight(28)
-
         adjustment_buttons = QHBoxLayout()
+        reset_adjustments_button = QPushButton('채도·밝기·명도 초기화')
+        reset_adjustments_button.setMinimumHeight(32)
+        reset_adjustments_button.clicked.connect(self.reset_adjustments)
+        adjustment_buttons.addWidget(reset_adjustments_button)
         apply_button = QPushButton('현재 이미지에 즉시 적용')
+        apply_button.setMinimumHeight(32)
         apply_button.clicked.connect(self.apply_immediately)
-        reset_button = QPushButton('초기화')
-        reset_button.clicked.connect(self.reset_image_adjustments)
         adjustment_buttons.addWidget(apply_button)
-        adjustment_buttons.addWidget(reset_button)
         adjust_layout.addRow('', adjustment_buttons)
         
         adjust_group.setLayout(adjust_layout)
@@ -871,6 +785,12 @@ class SettingsDialog(QDialog):
         self.contrast_slider.valueChanged.connect(
             lambda v: self.contrast_label.setText(f'{v}%'))
     
+    def reset_adjustments(self):
+        self.saturation_slider.setValue(100)
+        self.brightness_slider.setValue(100)
+        self.contrast_slider.setValue(100)
+        self.apply_immediately()
+
     def apply_immediately(self):
         parent = self.parent()
         if parent and hasattr(parent, 'apply_image_adjustments'):
@@ -880,104 +800,31 @@ class SettingsDialog(QDialog):
                 self.contrast_slider.value()
             )
     
-    @staticmethod
-    def _safe_int(value, default, minimum=None, maximum=None):
-        try:
-            if isinstance(value, bool):
-                raise ValueError
-            value = int(float(value))
-        except (TypeError, ValueError):
-            value = default
-        if minimum is not None:
-            value = max(minimum, value)
-        if maximum is not None:
-            value = min(maximum, value)
-        return value
-
-    @staticmethod
-    def _safe_bool(value, default):
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            text = value.strip().lower()
-            if text in ('true', '1', 'yes', 'on', '예', '사용'):
-                return True
-            if text in ('false', '0', 'no', 'off', '아니오', '사용 안 함'):
-                return False
-        if isinstance(value, (int, float)):
-            return bool(value)
-        return default
-
     def load_settings(self):
-        # 설정 파일의 값이 문자열/null/범위 밖이어도 설정창이 죽지 않도록
-        # 모든 값을 Qt 위젯에 넣기 전에 안전하게 정규화한다.
         quality = self.settings.get('zoom_quality', 'balanced')
-        if quality not in ('speed', 'balanced', 'quality'):
-            quality = 'balanced'
         index = self.zoom_quality.findData(quality)
-        if index < 0:
-            index = 1
-        self.zoom_quality.setCurrentIndex(index)
-
-        self.show_filename.setChecked(
-            self._safe_bool(self.settings.get('show_filename', False), False)
-        )
-        self.fit_to_window.setChecked(
-            self._safe_bool(self.settings.get('fit_to_window', True), True)
-        )
-        self.preload_enabled.setChecked(
-            self._safe_bool(self.settings.get('preload_next', True), True)
-        )
-
-        preload_count = self._safe_int(self.settings.get('preload_count', 3), 3, 0, 10)
+        if index >= 0:
+            self.zoom_quality.setCurrentIndex(index)
+        self.show_filename.setChecked(self.settings.get('show_filename', False))
+        self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
+        self.preload_enabled.setChecked(self.settings.get('preload_next', True))
+        preload_count = int(self.settings.get('preload_count', 3))
         preload_index = self.preload_count.findData(preload_count)
         if preload_index < 0:
             preload_index = self.preload_count.findData(3)
-        if preload_index < 0:
-            preload_index = 0
         self.preload_count.setCurrentIndex(preload_index)
-
-        self.saturation_slider.setValue(
-            self._safe_int(self.settings.get('saturation', 100), 100, 0, 200)
-        )
-        self.brightness_slider.setValue(
-            self._safe_int(self.settings.get('brightness', 100), 100, 0, 200)
-        )
-        self.contrast_slider.setValue(
-            self._safe_int(self.settings.get('contrast', 100), 100, 0, 200)
-        )
-
-        self.snap_enabled.setChecked(
-            self._safe_bool(self.settings.get('snap_enabled', True), True)
-        )
-        self.snap_threshold.setValue(
-            self._safe_int(self.settings.get('snap_threshold', 20), 20, 5, 50)
-        )
-
+        self.saturation_slider.setValue(self.settings.get('saturation', 100))
+        self.brightness_slider.setValue(self.settings.get('brightness', 100))
+        self.contrast_slider.setValue(self.settings.get('contrast', 100))
+        self.snap_enabled.setChecked(self.settings.get('snap_enabled', True))
+        self.snap_threshold.setValue(self.settings.get('snap_threshold', 20))
         mode = self.settings.get('slideshow_mode', 'time')
-        if mode not in ('time', 'loop'):
-            mode = 'time'
         index = self.slideshow_mode.findData(mode)
-        if index < 0:
-            index = 0
-        self.slideshow_mode.setCurrentIndex(index)
-
-        self.slideshow_interval.setValue(
-            self._safe_int(self.settings.get('slideshow_interval', 3), 3, 1, 60)
-        )
-        self.slideshow_gif_loops.setValue(
-            self._safe_int(self.settings.get('slideshow_gif_loops', 2), 2, 1, 10)
-        )
-
-        color = self.settings.get('background_color', '#2b2b2b')
-        if not isinstance(color, str) or not color.strip():
-            color = '#2b2b2b'
-        # QColor가 인식할 수 있는 색상인지 확인하고, 잘못된 값이면 기본값으로 복구
-        from PyQt5.QtGui import QColor
-        qcolor = QColor(color)
-        if not qcolor.isValid():
-            color = '#2b2b2b'
-        self.current_color = color
+        if index >= 0:
+            self.slideshow_mode.setCurrentIndex(index)
+        self.slideshow_interval.setValue(self.settings.get('slideshow_interval', 3))
+        self.slideshow_gif_loops.setValue(self.settings.get('slideshow_gif_loops', 2))
+        self.current_color = self.settings.get('background_color', '#2b2b2b')
         self.update_color_button()
     
     def choose_color(self):
@@ -991,24 +838,20 @@ class SettingsDialog(QDialog):
         self.color_button.setText(self.current_color)
     
     def save_settings(self):
-        # Write the dialog settings once instead of performing one disk write per
-        # control. This makes saving effectively instantaneous and reduces SSD I/O.
-        self.settings.update_many({
-            'zoom_quality': self.zoom_quality.currentData(),
-            'show_filename': self.show_filename.isChecked(),
-            'fit_to_window': self.fit_to_window.isChecked(),
-            'preload_next': self.preload_enabled.isChecked(),
-            'preload_count': self.preload_count.currentData(),
-            'saturation': self.saturation_slider.value(),
-            'brightness': self.brightness_slider.value(),
-            'contrast': self.contrast_slider.value(),
-            'snap_enabled': self.snap_enabled.isChecked(),
-            'snap_threshold': self.snap_threshold.value(),
-            'slideshow_mode': self.slideshow_mode.currentData(),
-            'slideshow_interval': self.slideshow_interval.value(),
-            'slideshow_gif_loops': self.slideshow_gif_loops.value(),
-            'background_color': self.current_color
-        })
+        self.settings.set('zoom_quality', self.zoom_quality.currentData())
+        self.settings.set('show_filename', self.show_filename.isChecked())
+        self.settings.set('fit_to_window', self.fit_to_window.isChecked())
+        self.settings.set('preload_next', self.preload_enabled.isChecked())
+        self.settings.set('preload_count', self.preload_count.currentData())
+        self.settings.set('saturation', self.saturation_slider.value())
+        self.settings.set('brightness', self.brightness_slider.value())
+        self.settings.set('contrast', self.contrast_slider.value())
+        self.settings.set('snap_enabled', self.snap_enabled.isChecked())
+        self.settings.set('snap_threshold', self.snap_threshold.value())
+        self.settings.set('slideshow_mode', self.slideshow_mode.currentData())
+        self.settings.set('slideshow_interval', self.slideshow_interval.value())
+        self.settings.set('slideshow_gif_loops', self.slideshow_gif_loops.value())
+        self.settings.set('background_color', self.current_color)
         self.accept()
 
 class ImageViewer(QMainWindow):
@@ -1023,7 +866,7 @@ class ImageViewer(QMainWindow):
         self.loading_keys = set()
         self.load_retry_counts = {}
         self.preload_enabled = self.settings.get('preload_next', True)
-        self.preload_count = max(0, min(10, Settings._safe_int(self.settings.get('preload_count', 3), 3, 0, 10)))
+        self.preload_count = max(0, min(10, int(self.settings.get('preload_count', 3))))
         self.slideshow = QTimer()
         self.slideshow.timeout.connect(self.next_image)
         self.slideshow_playing = False
@@ -1062,7 +905,7 @@ class ImageViewer(QMainWindow):
         self.init_ui()
         self.load_settings()
         self.setup_icon()
-        self.slideshow.setInterval(Settings._safe_int(self.settings.get('slideshow_interval', 3), 3, 1, 60) * 1000)
+        self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
     
     def setup_icon(self):
         icon_path = get_icon_path()
