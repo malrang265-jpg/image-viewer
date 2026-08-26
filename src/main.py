@@ -1518,6 +1518,12 @@ class ImageViewer(QMainWindow):
                 if 0 <= idx < len(self.image_list):
                     self._submit_image_load(idx, generation)
 
+    def _set_display_pixmap(self, pixmap):
+        if pixmap is None or pixmap.isNull():
+            return False
+        self.image_label.setPixmap(pixmap)
+        return True
+
     def show_current_image(self):
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
             return
@@ -1917,7 +1923,16 @@ class ImageViewer(QMainWindow):
             self.preload_enabled = self.settings.get('preload_next', True)
             self.preload_count = max(0, min(10, int(self.settings.get('preload_count', 3))))
             self.apply_background_color()
-            self.cache_manager.clear()
+            display_settings = (
+                self.settings.get('fit_to_window', True),
+                self.settings.get('zoom_quality', 'balanced'),
+                self.settings.get('saturation', 100),
+                self.settings.get('brightness', 100),
+                self.settings.get('contrast', 100),
+            )
+            if getattr(self, '_last_display_settings', None) != display_settings:
+                self.cache_manager.clear()
+                self._last_display_settings = display_settings
             if self.image_list:
                 self.show_current_image()
     
