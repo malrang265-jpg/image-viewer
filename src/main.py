@@ -882,8 +882,6 @@ class ImageViewer(QMainWindow):
         self.is_loading = False
         self.dragging = False
         self.drag_start_pos = None
-        # Image panning: when zoomed beyond the viewport, drag the image itself.
-        # Only scrollbar offsets change during a pan; the pixmap is never re-scaled.
         self.panning = False
         self.pan_start_pos = None
         self.pan_start_h = 0
@@ -1017,12 +1015,6 @@ class ImageViewer(QMainWindow):
         self.scroll_area.viewport().setMouseTracking(True)
         self.image_label.installEventFilter(self)
         self.scroll_area.viewport().installEventFilter(self)
-        # Capture mouse events before child widgets / frameless-window dragging.
-        # This is what makes image panning reliable even when the QLabel/QScrollArea
-        # consumes the mouse event first.
-        QApplication.instance().installEventFilter(self)
-        # Capture mouse events at the application level so frameless-window
-        # dragging cannot steal the left-button drag when panning an image.
         QApplication.instance().installEventFilter(self)
     
     def apply_background_color(self):
@@ -1251,7 +1243,6 @@ class ImageViewer(QMainWindow):
         if not self.fit_to_window:
             return None
         size = self.scroll_area.size()
-        # Small safety margin prevents repeated reloads caused by tiny widget changes.
         return (max(64, size.width() + 64), max(64, size.height() + 64))
 
     def _submit_image_load(self, index, generation=None, force=False):
@@ -1291,9 +1282,6 @@ class ImageViewer(QMainWindow):
             print(f"백그라운드 로딩 시작 오류: {e}")
 
     def _on_background_loaded(self, generation, key, image, was_current):
-        # A preload may have been started for an older navigation generation.
-        # Its result is still valuable: keep it in cache. Only the paint decision
-        # must be based on the image that is current *now*.
         self.loading_keys.discard(key)
 
         current_key = None
@@ -1307,8 +1295,6 @@ class ImageViewer(QMainWindow):
             )
 
         if image is None or image.isNull():
-            # Never blank the viewer because a background decode failed.
-            # Retry the currently requested image once, after a short delay.
             if key == current_key:
                 count = self.load_retry_counts.get(key, 0)
                 if count < 1:
@@ -1342,8 +1328,6 @@ class ImageViewer(QMainWindow):
         self.load_retry_counts.pop(key, None)
         self.cache_manager.put(key, pixmap)
 
-        # Display only if this result matches what is visible right now.
-        # This fixes rapid navigation races where an older worker finishes late.
         if key == current_key:
             self._display_pixmap(pixmap)
             self.is_loading = False
@@ -1388,8 +1372,6 @@ class ImageViewer(QMainWindow):
         if count <= 0:
             return
 
-        # Preload symmetrically around the current image. Nearer images are
-        # submitted first so the immediately-next image gets priority.
         generation = self.load_generation
         for distance in range(1, count + 1):
             for direction in (1, -1):
@@ -1408,8 +1390,6 @@ class ImageViewer(QMainWindow):
         brightness = self.settings.get('brightness', 100)
         contrast = self.settings.get('contrast', 100)
 
-        # Animated GIF/WebP: keep QMovie for timing/decoding, but render each
-        # frame through an in-memory filter when color adjustments are active.
         if not self.current_zip:
             ext = os.path.splitext(current_file)[1].lower()
             if ext == '.gif' or (ext == '.webp' and is_animated_webp(current_file)):
@@ -1427,7 +1407,6 @@ class ImageViewer(QMainWindow):
                     self.current_movie_frame = -1
                     self.animated_frame_cache.clear()
                     movie.frameChanged.connect(self.on_animated_frame_changed)
-                    # A new movie must reconnect slideshow loop counting.
                     if self.slideshow_playing and self.slideshow_mode == 'loop':
                         self.connect_gif_loop()
                     movie.start()
@@ -1445,9 +1424,6 @@ class ImageViewer(QMainWindow):
             return
 
         self.is_loading = True
-        # Keep the previous frame visible while the new image is decoding.
-        # Clearing the label here caused the frequent black-screen effect during
-        # rapid navigation. A successful decode will replace it atomically.
         self._submit_image_load(self.current_index, generation)
         self._preload_neighbors()
 
@@ -1495,9 +1471,6 @@ class ImageViewer(QMainWindow):
             self.image_label.adjustSize()
             return
 
-        # Process the current frame in the worker pool. QMovie itself remains
-        # on the GUI thread because it is a Qt object. The expensive Pillow
-        # color work happens off the UI thread and never creates a temp file.
         try:
             rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
             w, h = rgba.width(), rgba.height()
@@ -1563,9 +1536,6 @@ class ImageViewer(QMainWindow):
         if not self.slideshow_playing or self.slideshow_mode != 'loop':
             self.gif_last_frame = frame_number
             return
-        # Count a completed cycle only when the movie actually wraps from a
-        # later frame back to frame 0. This avoids counting the initial frame
-        # as a completed playback.
         if frame_number == 0 and self.gif_last_frame > 0:
             self.gif_loop_count += 1
             if self.gif_loop_count >= self.gif_max_loops:
@@ -1576,8 +1546,6 @@ class ImageViewer(QMainWindow):
         self.gif_last_frame = frame_number
     
     def update_image_display(self):
-        # A new scaled pixmap invalidates the old pan position. Qt will clamp
-        # scrollbars to the new image bounds after the label is resized.
         if self.panning:
             self._end_image_pan()
         if self.current_movie:
@@ -1624,7 +1592,6 @@ class ImageViewer(QMainWindow):
         self.fit_to_window = not self.fit_to_window
         if self.fit_to_window:
             self.zoom_factor = 1.0
-        # The fit-to-window cache may be a reduced decode; actual-size needs the full source.
         self.show_current_image()
     
     def next_image(self):
@@ -1650,8 +1617,6 @@ class ImageViewer(QMainWindow):
         viewport = self.scroll_area.viewport()
         viewport_pos = viewport.mapFromGlobal(global_pos)
 
-        # Capture the image-space point under the cursor before scaling.
-        # For a large image this is simply viewport position + scroll offset.
         old_h = self.scroll_area.horizontalScrollBar().value()
         old_v = self.scroll_area.verticalScrollBar().value()
         label_pos = self.image_label.mapFrom(viewport, viewport_pos)
@@ -1666,7 +1631,6 @@ class ImageViewer(QMainWindow):
         self.zoom_factor = new_zoom
         self.update_image_display()
 
-        # Keep the same image pixel underneath the cursor.
         ratio = new_zoom / old_zoom
         new_anchor_x = anchor_x * ratio
         new_anchor_y = anchor_y * ratio
@@ -1824,8 +1788,6 @@ class ImageViewer(QMainWindow):
         if not self.panning or self.pan_start_pos is None:
             return False
         delta = QPoint(global_pos) - self.pan_start_pos
-        # Move in the same direction as the hand drag. Scrollbar values are
-        # therefore decreased by the mouse delta. Qt clamps them to valid bounds.
         self.scroll_area.horizontalScrollBar().setValue(self.pan_start_h - delta.x())
         self.scroll_area.verticalScrollBar().setValue(self.pan_start_v - delta.y())
         return True
@@ -1845,8 +1807,6 @@ class ImageViewer(QMainWindow):
         if widget is self.image_label or widget is viewport:
             return True
         try:
-            # widgetAt() can return a child widget inside the viewport.
-            # What matters is whether the pointer is inside our image area.
             return viewport.isAncestorOf(widget) or self.image_label.isAncestorOf(widget)
         except Exception:
             return False
@@ -1854,44 +1814,26 @@ class ImageViewer(QMainWindow):
     def eventFilter(self, obj, event):
         event_type = event.type()
 
-        # Handle the image pan before the frameless QMainWindow drag logic.
-        # QApplication-level interception is intentional: mouse events sent to
-        # child widgets do not reliably reach QMainWindow.mousePressEvent().
-        if event_type in (QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.MouseButtonRelease):
-            if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+        # 마우스 눌림 이벤트 처리
+        if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            # 창 크기 조절 영역(테두리)이 아닌 경우 마우스 팬 시도
+            local_pos = self.mapFromGlobal(event.globalPos())
+            if not self.get_resize_region(local_pos) and self._can_pan_image():
                 target = QApplication.widgetAt(event.globalPos())
-                if (self._is_pan_target(target)
-                        and self._can_pan_image()
-                        and self._start_image_pan(event.globalPos())):
-                    event.accept()
-                    return True
+                if self._is_pan_target(target):
+                    if self._start_image_pan(event.globalPos()):
+                        return True
 
-            elif event_type == QEvent.MouseMove and self.panning:
-                if self._move_image_pan(event.globalPos()):
-                    event.accept()
-                    return True
+        # 마우스 이동 이벤트 처리 (팬 중일 때)
+        elif event_type == QEvent.MouseMove and self.panning:
+            if self._move_image_pan(event.globalPos()):
+                return True
 
-            elif event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                if self.panning:
-                    self._end_image_pan()
-                    event.accept()
-                    return True
-
-        if obj in (self.image_label, self.scroll_area.viewport()):
-            # Keep the local filter as a fallback for platforms where widgetAt()
-            # is temporarily unavailable during a mouse transition.
-            if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                if self._start_image_pan(event.globalPos()):
-                    event.accept()
-                    return True
-            elif event_type == QEvent.MouseMove and self.panning:
-                if self._move_image_pan(event.globalPos()):
-                    event.accept()
-                    return True
-            elif event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                if self._end_image_pan():
-                    event.accept()
-                    return True
+        # 마우스 뗌 이벤트 처리
+        elif event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if self.panning:
+                self._end_image_pan()
+                return True
 
         return super().eventFilter(obj, event)
 
@@ -1916,8 +1858,7 @@ class ImageViewer(QMainWindow):
             event.accept()
             return
         if event.button() == Qt.LeftButton and not region:
-            # Fullscreen has no window-position dragging.
-            if self.isFullScreen():
+            if self.isFullScreen() or self.panning:
                 event.accept()
                 return
             self.dragging = True
@@ -2010,9 +1951,6 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         self.slideshow.stop()
         self.cursor_hide_timer.stop()
-        # Stop creating new background work and release all worker threads.
-        # This is important on Windows: ThreadPoolExecutor worker threads can
-        # keep the process alive and retain large decoded images/ZIP handles.
         try:
             self.load_generation += 1
             self.loading_keys.clear()
