@@ -2137,10 +2137,14 @@ class ImageViewer(QMainWindow):
         return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent):
-        self.show_cursor()
-        self.reset_cursor_timer()
         if self._handle_tilt_wheel(event):
+            # Tilt wheel acts as a button shortcut, so it still wakes the cursor.
+            self.show_cursor()
+            self.reset_cursor_timer()
             return
+        # Plain up/down wheel scroll (prev/next image) must NOT un-hide the
+        # cursor while it's hidden — applies in both windowed and fullscreen
+        # mode since this handler is shared by both.
         if event.angleDelta().y() > 0:
             self.prev_image()
         else:
