@@ -637,7 +637,9 @@ class ShortcutSettingsDialog(QDialog):
         if self.capturing and self.current_action:
             dx = event.angleDelta().x()
             if dx != 0:
-                button_text = 'Tilt Right' if dx > 0 else 'Tilt Left'
+                # Match the physical tilt direction used by the viewer:
+                # positive Qt horizontal delta corresponds to physical Tilt Left.
+                button_text = 'Tilt Left' if dx > 0 else 'Tilt Right'
                 if button_text not in self.captured_keys:
                     self.captured_keys.append(button_text)
                 event.accept()
