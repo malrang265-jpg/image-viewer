@@ -844,209 +844,62 @@ class SettingsDialog(QDialog):
         self.settings.set('background_color', self.current_color)
         self.accept()
 
-from PyQt5.QtWidgets import QMainWindow, QLabel, QScrollArea, QApplication
-from PyQt5.QtCore import Qt, QPoint
-from PyQt5.QtGui import QMouseEvent, QCursor
-
 class ImageViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        
-        # 상태 플래그 초기화
-        self.resizing = False
-        self.panning = False
-        self.dragging = False
-        self.fit_to_window = False
+        self.settings = Settings()
+        self.cache_manager = CacheManager(self.settings.get('cache_size', 200), self.settings.get('cache_mb', 768))
+        self.load_bridge = ImageLoadBridge()
+        self.load_bridge.loaded.connect(self._on_background_loaded)
+        self.load_bridge.animated_frame.connect(self._on_animated_frame_ready)
+        self.load_generation = 0
+        self.loading_keys = set()
+        self.load_retry_counts = {}
+        self.preload_enabled = self.settings.get('preload_next', True)
+        self.preload_count = max(0, min(10, int(self.settings.get('preload_count', 3))))
+        self.slideshow = QTimer()
+        self.slideshow.timeout.connect(self.next_image)
+        self.slideshow_playing = False
+        self.slideshow_mode = 'time'
+        self.gif_loop_count = 0
+        self.gif_max_loops = 2
+        self.gif_frame_connected = False
+        self.gif_last_frame = -1
+        self.current_index = 0
+        self.image_list = []
+        self.current_zip = None
+        self.zoom_factor = 1.0
+        self.fit_to_window = True
+        self.rotation_angle = 0
         self.current_movie = None
+        self.current_movie_original_size = None
+        self.current_movie_generation = 0
+        self.animated_frame_cache = OrderedDict()
+        self.animated_frame_cache_limit = 24
+        self.current_movie_frame = -1
+        self.current_pixmap = None
+        self.original_pixmap = None
+        self.is_loading = False
+        self.dragging = False
+        self.drag_start_pos = None
         
-        # 마우스 위치 저장용 변수
+        self.panning = False
+        self.pan_start_pos = None
+        
+        self.window_start_pos = None
+        self.resizing = False
         self.resize_start_pos = None
         self.resize_start_size = None
         self.resize_region = None
-        self.pan_start_pos = None
-        self.drag_start_pos = None
-        self.window_start_pos = None
-        
+        self.resize_margin = 12
+        self.cursor_hidden = False
+        self.cursor_hide_timer = QTimer()
+        self.cursor_hide_timer.setSingleShot(True)
+        self.cursor_hide_timer.timeout.connect(self.hide_cursor)
         self.init_ui()
-
-    def init_ui(self):
-        # (기존 UI 설정 코드들 - 레이아웃, 스크롤 에어리어 등)
-        # 예시:
-        # self.scroll_area = QScrollArea()
-        # self.image_label = QLabel()
-        # self.scroll_area.setWidget(self.image_label)
-        # self.setCentralWidget(self.scroll_area)
-        
-        # 마우스 트래킹 활성화
-        self.image_label.setMouseTracking(True)
-        self.scroll_area.viewport().setMouseTracking(True)
-        
-        # 주의: 앱 전역 이벤트 필터는 여기서 제거되었습니다!
-        self.image_label.installEventFilter(self)
-        self.scroll_area.viewport().installEventFilter(self)
-
-    # ---------------------------------------------------------
-    # 1. 이벤트 필터 (단순화)
-    # ---------------------------------------------------------
-    def eventFilter(self, obj, event):
-        return super().eventFilter(obj, event)
-
-    # ---------------------------------------------------------
-    # 2. 팬(Pan) 기능 조건 및 헬퍼 메서드
-    # ---------------------------------------------------------
-    def _can_pan_image(self):
-        if self.fit_to_window:
-            return False
-        viewport = self.scroll_area.viewport().size()
-        label_size = self.image_label.size()
-        return label_size.width() > viewport.width() or label_size.height() > viewport.height()
-
-    def _start_image_pan(self, global_pos):
-        self.panning = True
-        self.pan_start_pos = global_pos
-        self.setCursor(Qt.ClosedHandCursor)
-
-    def _move_image_pan(self, global_pos):
-        delta = global_pos - self.pan_start_pos
-        h_bar = self.scroll_area.horizontalScrollBar()
-        v_bar = self.scroll_area.verticalScrollBar()
-        h_bar.setValue(h_bar.value() - delta.x())
-        v_bar.setValue(v_bar.value() - delta.y())
-        self.pan_start_pos = global_pos # 위치 갱신
-
-    def _end_image_pan(self):
-        self.panning = False
-        self.pan_start_pos = None
-        self.setCursor(Qt.ArrowCursor)
-
-    # ---------------------------------------------------------
-    # 3. 마우스 이벤트 3대장 (우선순위: 크기조절 > 팬 > 창이동)
-    # ---------------------------------------------------------
-    def mousePressEvent(self, event: QMouseEvent):
-        # self.show_cursor()
-        # self.reset_cursor_timer()
-        
-        # get_resize_region은 기존에 구현하신 창 테두리 감지 메서드를 사용합니다.
-        region = self.get_resize_region(event.pos()) if hasattr(self, 'get_resize_region') else None
-        
-        if event.button() == Qt.LeftButton:
-            # 1순위: 창 테두리 클릭 시 -> 창 크기 조절
-            if region:
-                self.resizing = True
-                self.resize_start_pos = event.globalPos()
-                self.resize_start_size = self.size()
-                self.resize_region = region
-                event.accept()
-                return
-            
-            # 2순위: 이미지가 창보다 클 때 -> 이미지 팬(이동)
-            if self._can_pan_image():
-                self._start_image_pan(event.globalPos())
-                event.accept()
-                return
-                
-            # 3순위: 그 외 윈도우 내부 클릭 시 -> 창 이동(드래그)
-            if not self.isFullScreen():
-                self.dragging = True
-                self.drag_start_pos = event.globalPos()
-                self.window_start_pos = self.pos()
-                event.accept()
-                return
-
-        # 마우스 부가 버튼 단축키 처리 (기존 코드)
-        button_text = ''
-        if event.button() == Qt.MiddleButton:
-            button_text = 'Middle Click'
-        elif event.button() == Qt.XButton1:
-            button_text = 'XButton1'
-        elif event.button() == Qt.XButton2:
-            button_text = 'XButton2'
-        
-        if button_text and hasattr(self, 'check_mouse_shortcut'):
-            self.check_mouse_shortcut(button_text)
-            
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        # self.show_cursor()
-        # self.reset_cursor_timer()
-        
-        # 1. 창 크기 조절 중
-        if self.resizing and self.resize_start_pos:
-            delta = event.globalPos() - self.resize_start_pos
-            new_w = self.resize_start_size.width()
-            new_h = self.resize_start_size.height()
-            
-            if self.resize_region in ['left', 'topleft', 'bottomleft']:
-                new_w = max(200, self.resize_start_size.width() - delta.x())
-            elif self.resize_region in ['right', 'topright', 'bottomright']:
-                new_w = max(200, self.resize_start_size.width() + delta.x())
-                
-            if self.resize_region in ['top', 'topleft', 'topright']:
-                new_h = max(150, self.resize_start_size.height() - delta.y())
-            elif self.resize_region in ['bottom', 'bottomleft', 'bottomright']:
-                new_h = max(150, self.resize_start_size.height() + delta.y())
-                
-            self.resize(new_w, new_h)
-            event.accept()
-            return
-            
-        # 2. 이미지 팬(이동) 중
-        if self.panning and self.pan_start_pos:
-            self._move_image_pan(event.globalPos())
-            event.accept()
-            return
-            
-        # 3. 창 이동(드래그) 중
-        if self.dragging and self.drag_start_pos and not self.isFullScreen():
-            delta = event.globalPos() - self.drag_start_pos
-            new_pos = self.window_start_pos + delta
-            
-            # 스냅 기능이 있다면 적용, 없다면 그냥 이동
-            if hasattr(self, 'snap_to_edge'):
-                new_pos = self.snap_to_edge(new_pos)
-                
-            self.move(new_pos)
-            event.accept()
-            return
-            
-        # 마우스 커서 업데이트 (가장자리 커서 모양 변경 등)
-        if hasattr(self, 'update_cursor'):
-            self.update_cursor(event.pos())
-            
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        # self.show_cursor()
-        # self.reset_cursor_timer()
-        
-        if event.button() == Qt.LeftButton:
-            # 떼는 순간 진행 중이던 모든 작업을 종료합니다.
-            if self.resizing:
-                self.resizing = False
-                self.resize_start_pos = None
-                self.resize_start_size = None
-                self.resize_region = None
-                self.unsetCursor()
-                self.setCursor(Qt.ArrowCursor)
-                event.accept()
-                return
-                
-            if self.panning:
-                self._end_image_pan()
-                event.accept()
-                return
-                
-            if self.dragging:
-                self.dragging = False
-                self.drag_start_pos = None
-                self.window_start_pos = None
-                event.accept()
-                return
-                
-        super().mouseReleaseEvent(event)
-
-    # (이 아래로는 원래 가지고 계시던 이미지 열기, 단축키 처리 등의 메서드를 그대로 두시면 됩니다.)
+        self.load_settings()
+        self.setup_icon()
+        self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
     
     def setup_icon(self):
         icon_path = get_icon_path()
@@ -1162,7 +1015,6 @@ class ImageViewer(QMainWindow):
         self.scroll_area.viewport().setMouseTracking(True)
         self.image_label.installEventFilter(self)
         self.scroll_area.viewport().installEventFilter(self)
-        QApplication.instance().installEventFilter(self)
     
     def apply_background_color(self):
         bg_color = self.settings.get('background_color', '#2b2b2b')
@@ -1430,7 +1282,6 @@ class ImageViewer(QMainWindow):
 
     def _on_background_loaded(self, generation, key, image, was_current):
         self.loading_keys.discard(key)
-
         current_key = None
         if self.image_list and 0 <= self.current_index < len(self.image_list):
             current_key = self._cache_key(
@@ -1624,7 +1475,6 @@ class ImageViewer(QMainWindow):
             ptr = rgba.bits()
             ptr.setsize(rgba.byteCount())
             raw = bytes(ptr)
-            settings = (saturation, brightness, contrast)
             def worker():
                 try:
                     from PIL import Image, ImageEnhance
@@ -1764,8 +1614,6 @@ class ImageViewer(QMainWindow):
         viewport = self.scroll_area.viewport()
         viewport_pos = viewport.mapFromGlobal(global_pos)
 
-        old_h = self.scroll_area.horizontalScrollBar().value()
-        old_v = self.scroll_area.verticalScrollBar().value()
         label_pos = self.image_label.mapFrom(viewport, viewport_pos)
         anchor_x = label_pos.x()
         anchor_y = label_pos.y()
@@ -1913,75 +1761,33 @@ class ImageViewer(QMainWindow):
         dialog = ShortcutSettingsDialog(self.settings, self)
         if dialog.exec_():
             pass
-    
+            
     def _can_pan_image(self):
-        if self.current_movie or not self.current_pixmap or self.fit_to_window:
+        if self.fit_to_window:
             return False
         viewport = self.scroll_area.viewport().size()
         label_size = self.image_label.size()
         return label_size.width() > viewport.width() or label_size.height() > viewport.height()
 
     def _start_image_pan(self, global_pos):
-        if not self._can_pan_image():
-            return False
         self.panning = True
-        self.pan_start_pos = QPoint(global_pos)
-        self.pan_start_h = self.scroll_area.horizontalScrollBar().value()
-        self.pan_start_v = self.scroll_area.verticalScrollBar().value()
+        self.pan_start_pos = global_pos
         self.setCursor(Qt.ClosedHandCursor)
-        return True
 
     def _move_image_pan(self, global_pos):
-        if not self.panning or self.pan_start_pos is None:
-            return False
-        delta = QPoint(global_pos) - self.pan_start_pos
-        self.scroll_area.horizontalScrollBar().setValue(self.pan_start_h - delta.x())
-        self.scroll_area.verticalScrollBar().setValue(self.pan_start_v - delta.y())
-        return True
+        delta = global_pos - self.pan_start_pos
+        h_bar = self.scroll_area.horizontalScrollBar()
+        v_bar = self.scroll_area.verticalScrollBar()
+        h_bar.setValue(h_bar.value() - delta.x())
+        v_bar.setValue(v_bar.value() - delta.y())
+        self.pan_start_pos = global_pos
 
     def _end_image_pan(self):
-        if not self.panning:
-            return False
         self.panning = False
         self.pan_start_pos = None
         self.setCursor(Qt.ArrowCursor)
-        return True
-
-    def _is_pan_target(self, widget):
-        if widget is None:
-            return False
-        viewport = self.scroll_area.viewport()
-        if widget is self.image_label or widget is viewport:
-            return True
-        try:
-            return viewport.isAncestorOf(widget) or self.image_label.isAncestorOf(widget)
-        except Exception:
-            return False
 
     def eventFilter(self, obj, event):
-        event_type = event.type()
-
-        # 마우스 눌림 이벤트 처리
-        if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            # 창 크기 조절 영역(테두리)이 아닌 경우 마우스 팬 시도
-            local_pos = self.mapFromGlobal(event.globalPos())
-            if not self.get_resize_region(local_pos) and self._can_pan_image():
-                target = QApplication.widgetAt(event.globalPos())
-                if self._is_pan_target(target):
-                    if self._start_image_pan(event.globalPos()):
-                        return True
-
-        # 마우스 이동 이벤트 처리 (팬 중일 때)
-        elif event_type == QEvent.MouseMove and self.panning:
-            if self._move_image_pan(event.globalPos()):
-                return True
-
-        # 마우스 뗌 이벤트 처리
-        elif event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-            if self.panning:
-                self._end_image_pan()
-                return True
-
         return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent):
@@ -1996,23 +1802,30 @@ class ImageViewer(QMainWindow):
     def mousePressEvent(self, event: QMouseEvent):
         self.show_cursor()
         self.reset_cursor_timer()
+        
         region = self.get_resize_region(event.pos())
-        if event.button() == Qt.LeftButton and region:
-            self.resizing = True
-            self.resize_start_pos = event.globalPos()
-            self.resize_start_size = self.size()
-            self.resize_region = region
-            event.accept()
-            return
-        if event.button() == Qt.LeftButton and not region:
-            if self.isFullScreen() or self.panning:
+        
+        if event.button() == Qt.LeftButton:
+            if region:
+                self.resizing = True
+                self.resize_start_pos = event.globalPos()
+                self.resize_start_size = self.size()
+                self.resize_region = region
                 event.accept()
                 return
-            self.dragging = True
-            self.drag_start_pos = event.globalPos()
-            self.window_start_pos = self.pos()
-            event.accept()
-            return
+            
+            if self._can_pan_image():
+                self._start_image_pan(event.globalPos())
+                event.accept()
+                return
+                
+            if not self.isFullScreen():
+                self.dragging = True
+                self.drag_start_pos = event.globalPos()
+                self.window_start_pos = self.pos()
+                event.accept()
+                return
+
         button_text = ''
         if event.button() == Qt.MiddleButton:
             button_text = 'Middle Click'
@@ -2020,8 +1833,10 @@ class ImageViewer(QMainWindow):
             button_text = 'XButton1'
         elif event.button() == Qt.XButton2:
             button_text = 'XButton2'
+        
         if button_text:
             self.check_mouse_shortcut(button_text)
+            
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -2032,17 +1847,26 @@ class ImageViewer(QMainWindow):
             delta = event.globalPos() - self.resize_start_pos
             new_w = self.resize_start_size.width()
             new_h = self.resize_start_size.height()
+            
             if self.resize_region in ['left', 'topleft', 'bottomleft']:
                 new_w = max(200, self.resize_start_size.width() - delta.x())
             elif self.resize_region in ['right', 'topright', 'bottomright']:
                 new_w = max(200, self.resize_start_size.width() + delta.x())
+                
             if self.resize_region in ['top', 'topleft', 'topright']:
                 new_h = max(150, self.resize_start_size.height() - delta.y())
             elif self.resize_region in ['bottom', 'bottomleft', 'bottomright']:
                 new_h = max(150, self.resize_start_size.height() + delta.y())
+                
             self.resize(new_w, new_h)
             event.accept()
             return
+            
+        if self.panning and self.pan_start_pos:
+            self._move_image_pan(event.globalPos())
+            event.accept()
+            return
+            
         if self.dragging and self.drag_start_pos and not self.isFullScreen():
             delta = event.globalPos() - self.drag_start_pos
             new_pos = self.window_start_pos + delta
@@ -2050,27 +1874,37 @@ class ImageViewer(QMainWindow):
             self.move(new_pos)
             event.accept()
             return
+            
         self.update_cursor(event.pos())
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event: QMouseEvent):
         self.show_cursor()
         self.reset_cursor_timer()
-        if event.button() == Qt.LeftButton and self.resizing:
-            self.resizing = False
-            self.resize_start_pos = None
-            self.resize_start_size = None
-            self.resize_region = None
-            self.unsetCursor()
-            self.setCursor(Qt.ArrowCursor)
-            event.accept()
-            return
-        if event.button() == Qt.LeftButton and self.dragging:
-            self.dragging = False
-            self.drag_start_pos = None
-            self.window_start_pos = None
-            event.accept()
-            return
+        
+        if event.button() == Qt.LeftButton:
+            if self.resizing:
+                self.resizing = False
+                self.resize_start_pos = None
+                self.resize_start_size = None
+                self.resize_region = None
+                self.unsetCursor()
+                self.setCursor(Qt.ArrowCursor)
+                event.accept()
+                return
+                
+            if self.panning:
+                self._end_image_pan()
+                event.accept()
+                return
+                
+            if self.dragging:
+                self.dragging = False
+                self.drag_start_pos = None
+                self.window_start_pos = None
+                event.accept()
+                return
+                
         super().mouseReleaseEvent(event)
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
