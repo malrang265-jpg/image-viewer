@@ -980,6 +980,14 @@ class ImageViewer(QMainWindow):
         self.load_bridge.animated_frame.connect(self._on_animated_frame_ready)
         self.load_generation = 0
         self.loading_keys = set()
+        # Cache the expensive color-adjusted source separately from the
+        # display-size cache. This prevents repeated Pillow work when navigating.
+        self._adjusted_image_cache = {}
+        self._adjusted_image_cache_order = []
+        self._adjusted_image_cache_limit = 24
+        self._source_image_cache = {}
+        self._source_image_cache_order = []
+        self._source_image_cache_limit = 12
         self.load_retry_counts = {}
         self.preload_enabled = self.settings.get('preload_next', True)
         self.preload_count = max(0, min(10, int(self.settings.get('preload_count', 3))))
@@ -1377,6 +1385,81 @@ class ImageViewer(QMainWindow):
         # Small safety margin prevents repeated reloads caused by tiny widget changes.
         return (max(64, size.width() + 64), max(64, size.height() + 64))
 
+    def _source_cache_get(self, key):
+        value = self._source_image_cache.get(key)
+        if value is not None:
+            try:
+                self._source_image_cache_order.remove(key)
+            except ValueError:
+                pass
+            self._source_image_cache_order.append(key)
+        return value
+
+    def _source_cache_put(self, key, image):
+        if image is None:
+            return
+        self._source_image_cache[key] = image
+        try:
+            self._source_image_cache_order.remove(key)
+        except ValueError:
+            pass
+        self._source_image_cache_order.append(key)
+        while len(self._source_image_cache_order) > self._source_image_cache_limit:
+            old = self._source_image_cache_order.pop(0)
+            self._source_image_cache.pop(old, None)
+
+    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast):
+        source = f'{self.current_zip}|{filepath}' if self.current_zip else filepath
+        return (source, int(saturation), int(brightness), int(contrast))
+
+    def _adjusted_cache_get(self, key):
+        value = self._adjusted_image_cache.get(key)
+        if value is not None:
+            try:
+                self._adjusted_image_cache_order.remove(key)
+            except ValueError:
+                pass
+            self._adjusted_image_cache_order.append(key)
+        return value
+
+    def _adjusted_cache_put(self, key, image):
+        if image is None:
+            return
+        self._adjusted_image_cache[key] = image
+        try:
+            self._adjusted_image_cache_order.remove(key)
+        except ValueError:
+            pass
+        self._adjusted_image_cache_order.append(key)
+        while len(self._adjusted_image_cache_order) > self._adjusted_image_cache_limit:
+            old = self._adjusted_image_cache_order.pop(0)
+            self._adjusted_image_cache.pop(old, None)
+
+    def _apply_color_adjustment_to_image(self, source_image, saturation, brightness, contrast):
+        try:
+            from PIL import Image, ImageEnhance
+            qimage = source_image.toImage() if isinstance(source_image, QPixmap) else source_image
+            if not isinstance(qimage, QImage):
+                return source_image
+            rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
+            w, h = rgba.width(), rgba.height()
+            ptr = rgba.bits()
+            ptr.setsize(rgba.byteCount())
+            raw = bytes(ptr)
+            pil_image = Image.frombuffer(
+                'RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1
+            ).copy()
+            if saturation != 100:
+                pil_image = ImageEnhance.Color(pil_image).enhance(saturation / 100.0)
+            if brightness != 100:
+                pil_image = ImageEnhance.Brightness(pil_image).enhance(brightness / 100.0)
+            if contrast != 100:
+                pil_image = ImageEnhance.Contrast(pil_image).enhance(contrast / 100.0)
+            data = pil_image.tobytes('raw', 'RGBA')
+            return QImage(data, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        except Exception:
+            return source_image
+
     def _submit_image_load(self, index, generation=None, force=False):
         if ImageLoader._shutdown:
             ImageLoader.restart_executor()
@@ -1397,6 +1480,26 @@ class ImageViewer(QMainWindow):
         self.loading_keys.add(key)
         source_zip = self.current_zip
         def worker():
+            source_fast_key = ((source_zip, filename), max_size)
+            if (saturation, brightness, contrast) == (100, 100, 100):
+                source_cached = self._source_cache_get(source_fast_key)
+                if source_cached is not None:
+                    self.load_bridge.loaded.emit(
+                        generation, key, source_cached, index == self.current_index
+                    )
+                    return
+
+            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast)
+            # For non-default adjustments, reuse the expensive color-adjusted
+            # source when available. The existing display cache still handles
+            # the fit-to-window/full-size distinction.
+            if (saturation, brightness, contrast) != (100, 100, 100):
+                cached_adjusted = self._adjusted_cache_get(adjustment_key)
+                if cached_adjusted is not None:
+                    image = cached_adjusted
+                    self.load_bridge.loaded.emit(generation, key, image, index == self.current_index)
+                    return
+
             if source_zip:
                 image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size)
             else:
@@ -1406,6 +1509,9 @@ class ImageViewer(QMainWindow):
                         image = QImage(filename)
                     except Exception:
                         image = None
+
+            if image is not None and (saturation, brightness, contrast) != (100, 100, 100):
+                self._adjusted_cache_put(adjustment_key, image)
             self.load_bridge.loaded.emit(generation, key, image, index == self.current_index)
         try:
             ImageLoader._executor.submit(worker)
