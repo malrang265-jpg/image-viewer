@@ -393,6 +393,7 @@ class ZipHandler:
 
 class ImageLoadBridge(QObject):
     loaded = pyqtSignal(int, str, object, bool)
+    animated_frame = pyqtSignal(int, int, object)
 
 class ImageListDialog(QDialog):
     def __init__(self, image_list, current_index, parent=None, current_zip=None):
@@ -839,6 +840,7 @@ class ImageViewer(QMainWindow):
         self.cache_manager = CacheManager(self.settings.get('cache_size', 200), self.settings.get('cache_mb', 768))
         self.load_bridge = ImageLoadBridge()
         self.load_bridge.loaded.connect(self._on_background_loaded)
+        self.load_bridge.animated_frame.connect(self._on_animated_frame_ready)
         self.load_generation = 0
         self.loading_keys = set()
         self.load_retry_counts = {}
@@ -851,6 +853,7 @@ class ImageViewer(QMainWindow):
         self.gif_loop_count = 0
         self.gif_max_loops = 2
         self.gif_frame_connected = False
+        self.gif_last_frame = -1
         self.current_index = 0
         self.image_list = []
         self.current_zip = None
@@ -859,6 +862,10 @@ class ImageViewer(QMainWindow):
         self.rotation_angle = 0
         self.current_movie = None
         self.current_movie_original_size = None
+        self.current_movie_generation = 0
+        self.animated_frame_cache = OrderedDict()
+        self.animated_frame_cache_limit = 24
+        self.current_movie_frame = -1
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
@@ -1191,15 +1198,22 @@ class ImageViewer(QMainWindow):
     
     def stop_current_movie(self):
         if self.current_movie:
-            if self.gif_frame_connected:
-                try:
-                    self.current_movie.frameChanged.disconnect(self.on_gif_frame_changed)
-                except:
-                    pass
-                self.gif_frame_connected = False
+            try:
+                self.current_movie.frameChanged.disconnect(self.on_gif_frame_changed)
+            except:
+                pass
+            try:
+                self.current_movie.frameChanged.disconnect(self.on_animated_frame_changed)
+            except:
+                pass
+            self.gif_frame_connected = False
             self.current_movie.stop()
             self.current_movie = None
         self.current_movie_original_size = None
+        self.current_movie_generation += 1
+        self.current_movie_frame = -1
+        self.gif_last_frame = -1
+        self.animated_frame_cache.clear()
     
     def _cache_key(self, filepath, saturation, brightness, contrast, max_size):
         size_key = 'full' if not max_size else f'{max_size[0]}x{max_size[1]}'
@@ -1367,18 +1381,30 @@ class ImageViewer(QMainWindow):
         brightness = self.settings.get('brightness', 100)
         contrast = self.settings.get('contrast', 100)
 
-        # Animated files keep their existing QMovie behavior.
+        # Animated GIF/WebP: keep QMovie for timing/decoding, but render each
+        # frame through an in-memory filter when color adjustments are active.
         if not self.current_zip:
             ext = os.path.splitext(current_file)[1].lower()
             if ext == '.gif' or (ext == '.webp' and is_animated_webp(current_file)):
                 movie = ImageLoader.load_movie(current_file)
                 if movie:
                     self.current_movie = movie
+                    self.current_movie_generation += 1
+                    movie_generation = self.current_movie_generation
                     movie.jumpToFrame(0)
                     self.current_movie_original_size = movie.currentPixmap().size()
-                    self.image_label.setMovie(movie)
+                    if self.fit_to_window and self.current_movie_original_size.width() > 0:
+                        scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                        if scaled_size.width() > 0 and scaled_size.height() > 0:
+                            movie.setScaledSize(scaled_size)
+                    self.current_movie_frame = -1
+                    self.animated_frame_cache.clear()
+                    movie.frameChanged.connect(self.on_animated_frame_changed)
+                    # A new movie must reconnect slideshow loop counting.
+                    if self.slideshow_playing and self.slideshow_mode == 'loop':
+                        self.connect_gif_loop()
                     movie.start()
-                    QTimer.singleShot(0, self.update_image_display)
+                    self._render_animated_frame(movie.currentFrameNumber(), movie_generation)
                     self.is_loading = False
                     return
 
@@ -1398,22 +1424,129 @@ class ImageViewer(QMainWindow):
         self._submit_image_load(self.current_index, generation)
         self._preload_neighbors()
 
+    def _animated_cache_key(self, frame_number):
+        return (frame_number,
+                self.settings.get('saturation', 100),
+                self.settings.get('brightness', 100),
+                self.settings.get('contrast', 100),
+                self.fit_to_window,
+                self.scroll_area.size().width(),
+                self.scroll_area.size().height())
+
+    def on_animated_frame_changed(self, frame_number):
+        if not self.current_movie:
+            return
+        self.current_movie_frame = frame_number
+        self._render_animated_frame(frame_number, self.current_movie_generation)
+
+    def _render_animated_frame(self, frame_number, generation):
+        if not self.current_movie or generation != self.current_movie_generation:
+            return
+        movie = self.current_movie
+        qimage = movie.currentImage()
+        if qimage.isNull():
+            qimage = movie.currentPixmap().toImage()
+        if qimage.isNull():
+            return
+        key = self._animated_cache_key(frame_number)
+        cached = self.animated_frame_cache.get(key)
+        if cached is not None:
+            self.animated_frame_cache.move_to_end(key)
+            self.current_pixmap = cached
+            self.image_label.setPixmap(cached)
+            self.image_label.adjustSize()
+            return
+
+        saturation = self.settings.get('saturation', 100)
+        brightness = self.settings.get('brightness', 100)
+        contrast = self.settings.get('contrast', 100)
+        if saturation == 100 and brightness == 100 and contrast == 100:
+            pixmap = QPixmap.fromImage(qimage)
+            self._store_animated_frame(key, pixmap)
+            self.current_pixmap = pixmap
+            self.image_label.setPixmap(pixmap)
+            self.image_label.adjustSize()
+            return
+
+        # Process the current frame in the worker pool. QMovie itself remains
+        # on the GUI thread because it is a Qt object. The expensive Pillow
+        # color work happens off the UI thread and never creates a temp file.
+        try:
+            rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
+            w, h = rgba.width(), rgba.height()
+            ptr = rgba.bits()
+            ptr.setsize(rgba.byteCount())
+            raw = bytes(ptr)
+            settings = (saturation, brightness, contrast)
+            def worker():
+                try:
+                    from PIL import Image, ImageEnhance
+                    src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
+                    rgb = src.convert('RGB')
+                    if saturation != 100:
+                        rgb = ImageEnhance.Color(rgb).enhance(saturation / 100.0)
+                    if brightness != 100:
+                        rgb = ImageEnhance.Brightness(rgb).enhance(brightness / 100.0)
+                    if contrast != 100:
+                        rgb = ImageEnhance.Contrast(rgb).enhance(contrast / 100.0)
+                    out = rgb.convert('RGBA')
+                    return out.tobytes('raw', 'RGBA'), w, h
+                except Exception:
+                    return None
+            future = ImageLoader._executor.submit(worker)
+            def done(fut, gen=generation, frame=frame_number, key=key):
+                try:
+                    result = fut.result()
+                except Exception:
+                    result = None
+                self.load_bridge.animated_frame.emit(gen, frame, (key, result))
+            future.add_done_callback(done)
+        except Exception:
+            pass
+
+    def _on_animated_frame_ready(self, generation, frame_number, payload):
+        if generation != self.current_movie_generation or not self.current_movie:
+            return
+        key, result = payload
+        if not result:
+            return
+        raw, w, h = result
+        qimg = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        pixmap = QPixmap.fromImage(qimg)
+        if pixmap.isNull():
+            return
+        self._store_animated_frame(key, pixmap)
+        if self.current_movie_frame == frame_number:
+            self.current_pixmap = pixmap
+            self.image_label.setPixmap(pixmap)
+            self.image_label.adjustSize()
+
+    def _store_animated_frame(self, key, pixmap):
+        self.animated_frame_cache[key] = pixmap
+        self.animated_frame_cache.move_to_end(key)
+        while len(self.animated_frame_cache) > self.animated_frame_cache_limit:
+            self.animated_frame_cache.popitem(last=False)
+
     def connect_gif_loop(self):
         if self.current_movie and not self.gif_frame_connected:
             self.current_movie.frameChanged.connect(self.on_gif_frame_changed)
             self.gif_frame_connected = True
-            self.gif_loop_count = 0
     
     def on_gif_frame_changed(self, frame_number):
-        if not self.slideshow_playing:
+        if not self.slideshow_playing or self.slideshow_mode != 'loop':
+            self.gif_last_frame = frame_number
             return
-        if self.slideshow_mode != 'loop':
-            return
-        if frame_number == 0:
+        # Count a completed cycle only when the movie actually wraps from a
+        # later frame back to frame 0. This avoids counting the initial frame
+        # as a completed playback.
+        if frame_number == 0 and self.gif_last_frame > 0:
             self.gif_loop_count += 1
             if self.gif_loop_count >= self.gif_max_loops:
-                self.next_image()
                 self.gif_loop_count = 0
+                self.gif_last_frame = -1
+                self.next_image()
+                return
+        self.gif_last_frame = frame_number
     
     def update_image_display(self):
         if self.current_movie:
@@ -1424,15 +1557,16 @@ class ImageViewer(QMainWindow):
                     original_size = self.current_movie.currentPixmap().size()
                     if original_size.width() > 0:
                         self.current_movie_original_size = original_size
-                
                 if original_size.width() > 0 and original_size.height() > 0:
                     if self.fit_to_window:
                         scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
                     else:
                         scaled_size = QSize(int(original_size.width() * self.zoom_factor),
                                            int(original_size.height() * self.zoom_factor))
-                    self.current_movie.setScaledSize(scaled_size)
-                    self.image_label.adjustSize()
+                    if scaled_size.width() > 0 and scaled_size.height() > 0:
+                        self.current_movie.setScaledSize(scaled_size)
+                    self.current_movie_frame = self.current_movie.currentFrameNumber()
+                    self._render_animated_frame(self.current_movie_frame, self.current_movie_generation)
             except:
                 pass
             return
@@ -1544,6 +1678,7 @@ class ImageViewer(QMainWindow):
         self.slideshow_mode = self.settings.get('slideshow_mode', 'time')
         self.gif_max_loops = self.settings.get('slideshow_gif_loops', 2)
         self.gif_loop_count = 0
+        self.gif_last_frame = -1
         if self.slideshow_mode == 'loop' and self.current_movie:
             self.connect_gif_loop()
         else:
