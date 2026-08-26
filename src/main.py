@@ -166,7 +166,7 @@ class Settings:
                 'prev_image': ['', ''],
                 'zoom_in': ['', ''],
                 'zoom_out': ['', ''],
-                'toggle_actual_size': ['Middle Click', ''],
+                'toggle_actual_size': ['Tilt Left', ''],
                 'toggle_fullscreen': ['Left Double Click', ''],
                 'close_program': ['XButton1', ''],
                 'show_image_list': ['Return', ''],
@@ -547,8 +547,7 @@ class ShortcutSettingsDialog(QDialog):
             ('show_image_list', '이미지 목록 표시'), ('zoom_in', '확대'),
             ('zoom_out', '축소'), ('toggle_actual_size', '실제 크기/창 크기 토글'),
             ('delete_image', '삭제'), ('open_file', '열기'),
-            ('slideshow', '슬라이드쇼'), ('rotate_right', '오른쪽 회전'),
-            ('rotate_left', '왼쪽 회전'),
+            ('slideshow', '슬라이드쇼'),
         ]
         for action_key, action_name in actions:
             group = QGroupBox(action_name)
@@ -580,7 +579,7 @@ class ShortcutSettingsDialog(QDialog):
     def load_shortcuts(self):
         actions = ['next_image', 'prev_image', 'toggle_fullscreen', 'close_program',
                   'show_image_list', 'zoom_in', 'zoom_out', 'toggle_actual_size',
-                  'delete_image', 'open_file', 'slideshow', 'rotate_right', 'rotate_left']
+                  'delete_image', 'open_file', 'slideshow']
         for action in actions:
             shortcuts = self.settings.get_shortcuts(action)
             if action in self.shortcut_buttons:
@@ -1888,14 +1887,6 @@ class ImageViewer(QMainWindow):
                 pass
             self.gif_frame_connected = False
     
-    def rotate_right(self):
-        self.rotation_angle = (self.rotation_angle + 90) % 360
-        self.show_current_image()
-    
-    def rotate_left(self):
-        self.rotation_angle = (self.rotation_angle - 90) % 360
-        self.show_current_image()
-    
     def show_context_menu(self, pos):
         menu = QMenu(self)
         menu.setStyleSheet("""
@@ -1982,22 +1973,29 @@ class ImageViewer(QMainWindow):
         except Exception:
             return False
 
+    def _handle_tilt_wheel(self, event):
+        dx = event.angleDelta().x()
+        if dx == 0:
+            return False
+        # "Tilt Left/Right" is the physical input name. The assigned action
+        # is stored separately, so check_mouse_shortcut() must do the lookup.
+        button_text = 'Tilt Right' if dx > 0 else 'Tilt Left'
+        self.check_mouse_shortcut(button_text)
+        event.accept()
+        return True
+
     def eventFilter(self, obj, event):
-        # Image panning is handled directly by PanLabel. Keep this filter only
-        # for compatibility with the scroll area/other child widgets.
+        # The image label / scroll-area viewport can receive wheel events
+        # before QMainWindow, so intercept horizontal tilt here.
+        if event.type() == QEvent.Wheel:
+            if self._handle_tilt_wheel(event):
+                return True
         return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent):
         self.show_cursor()
         self.reset_cursor_timer()
-        dx = event.angleDelta().x()
-        if dx != 0:
-            # Tilt is inactive until explicitly assigned in shortcut settings.
-            button_text = 'Tilt Right' if dx > 0 else 'Tilt Left'
-            shortcuts = self.settings.get_shortcuts(button_text)
-            if shortcuts and button_text in shortcuts:
-                self.check_mouse_shortcut(button_text)
-            event.accept()
+        if self._handle_tilt_wheel(event):
             return
         if event.angleDelta().y() > 0:
             self.prev_image()
