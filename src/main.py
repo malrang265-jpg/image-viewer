@@ -1017,6 +1017,10 @@ class ImageViewer(QMainWindow):
         self.scroll_area.viewport().setMouseTracking(True)
         self.image_label.installEventFilter(self)
         self.scroll_area.viewport().installEventFilter(self)
+        # Capture mouse events before child widgets / frameless-window dragging.
+        # This is what makes image panning reliable even when the QLabel/QScrollArea
+        # consumes the mouse event first.
+        QApplication.instance().installEventFilter(self)
         # Capture mouse events at the application level so frameless-window
         # dragging cannot steal the left-button drag when panning an image.
         QApplication.instance().installEventFilter(self)
@@ -1856,8 +1860,7 @@ class ImageViewer(QMainWindow):
         if event_type in (QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.MouseButtonRelease):
             if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 target = QApplication.widgetAt(event.globalPos())
-                if (not self.isFullScreen()
-                        and self._is_pan_target(target)
+                if (self._is_pan_target(target)
                         and self._can_pan_image()
                         and self._start_image_pan(event.globalPos())):
                     event.accept()
