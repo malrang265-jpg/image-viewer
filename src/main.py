@@ -1645,6 +1645,13 @@ class ImageViewer(QMainWindow):
         # scrollbars to the new image bounds after the label is resized.
         if self.panning:
             self._end_image_pan()
+        # QScrollArea only lets image_label take on its own (pixmap) size when
+        # widgetResizable is False. With it True, Qt force-fits the label to
+        # the viewport on every layout pass regardless of adjustSize() below,
+        # so a zoomed image can never register as "larger than the viewport"
+        # and panning/scrollbars never actually engage. Keep it True only for
+        # the fit-to-window case, where auto-fitting is what we want anyway.
+        self.scroll_area.setWidgetResizable(self.fit_to_window)
         if self.current_movie:
             try:
                 if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
