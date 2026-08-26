@@ -201,6 +201,7 @@ class Settings:
         self.save()
 
 class ImageLoader:
+    _shutdown = False
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(2, min(4, (os.cpu_count() or 4))))
 
@@ -248,6 +249,23 @@ class ImageLoader:
         if image and not image.isNull():
             return QPixmap.fromImage(image)
         return None
+
+    @staticmethod
+    @classmethod
+    def shutdown_executor(cls):
+        cls._shutdown = True
+        try:
+            cls._executor.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            cls._executor.shutdown(wait=True)
+        except Exception:
+            pass
+
+    @classmethod
+    def restart_executor(cls):
+        if cls._shutdown:
+            cls._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(2, min(4, (os.cpu_count() or 4))))
+            cls._shutdown = False
 
     @staticmethod
     def load_movie(filepath):
@@ -1196,6 +1214,8 @@ class ImageViewer(QMainWindow):
         return (max(64, size.width() + 64), max(64, size.height() + 64))
 
     def _submit_image_load(self, index, generation=None, force=False):
+        if ImageLoader._shutdown:
+            ImageLoader.restart_executor()
         if generation is None:
             generation = self.load_generation
         if index < 0 or index >= len(self.image_list):
@@ -1696,6 +1716,21 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         self.slideshow.stop()
         self.cursor_hide_timer.stop()
+        # Stop creating new background work and release all worker threads.
+        # This is important on Windows: ThreadPoolExecutor worker threads can
+        # keep the process alive and retain large decoded images/ZIP handles.
+        try:
+            self.load_generation += 1
+            self.loading_keys.clear()
+            self.cache_manager.clear()
+            self.current_pixmap = None
+            self.original_pixmap = None
+        except Exception:
+            pass
+        try:
+            ImageLoader.shutdown_executor()
+        except Exception:
+            pass
         try:
             ZipHandler._thread_local.__dict__.clear()
         except Exception:
