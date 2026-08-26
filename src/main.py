@@ -1017,6 +1017,9 @@ class ImageViewer(QMainWindow):
         self.scroll_area.viewport().setMouseTracking(True)
         self.image_label.installEventFilter(self)
         self.scroll_area.viewport().installEventFilter(self)
+        # Capture mouse events at the application level so frameless-window
+        # dragging cannot steal the left-button drag when panning an image.
+        QApplication.instance().installEventFilter(self)
     
     def apply_background_color(self):
         bg_color = self.settings.get('background_color', '#2b2b2b')
@@ -1831,9 +1834,43 @@ class ImageViewer(QMainWindow):
         self.setCursor(Qt.ArrowCursor)
         return True
 
+    def _is_pan_target(self, widget):
+        if widget is None:
+            return False
+        if widget is self.image_label or widget is self.scroll_area.viewport():
+            return True
+        try:
+            return widget.isAncestorOf(self.image_label) or self.image_label.isAncestorOf(widget)
+        except Exception:
+            return False
+
     def eventFilter(self, obj, event):
+        event_type = event.type()
+
+        # Handle the image pan before the frameless QMainWindow drag logic.
+        # QApplication-level interception is intentional: mouse events sent to
+        # child widgets do not reliably reach QMainWindow.mousePressEvent().
+        if event_type in (QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.MouseButtonRelease):
+            if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                target = QApplication.widgetAt(event.globalPos())
+                if self._is_pan_target(target) and self._start_image_pan(event.globalPos()):
+                    event.accept()
+                    return True
+
+            elif event_type == QEvent.MouseMove and self.panning:
+                if self._move_image_pan(event.globalPos()):
+                    event.accept()
+                    return True
+
+            elif event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                if self.panning:
+                    self._end_image_pan()
+                    event.accept()
+                    return True
+
         if obj in (self.image_label, self.scroll_area.viewport()):
-            event_type = event.type()
+            # Keep the local filter as a fallback for platforms where widgetAt()
+            # is temporarily unavailable during a mouse transition.
             if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 if self._start_image_pan(event.globalPos()):
                     event.accept()
@@ -1846,6 +1883,7 @@ class ImageViewer(QMainWindow):
                 if self._end_image_pan():
                     event.accept()
                     return True
+
         return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent):
