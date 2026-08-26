@@ -93,12 +93,20 @@ def get_icon_path():
     return None
 
 def is_animated_webp(filepath):
+    """Return the animated webp's real frame count via Pillow, or 0 if it
+    isn't an animated webp. QMovie.frameCount() is unreliable for many
+    animated webp files (often reports 0), so callers that need an accurate
+    frame count for a webp use this instead of movie.frameCount()."""
     try:
         Image = get_pil_image()
         with Image.open(filepath) as img:
-            return getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
+            if getattr(img, 'is_animated', False):
+                n = getattr(img, 'n_frames', 1)
+                if n > 1:
+                    return n
     except:
-        return False
+        pass
+    return 0
 
 class SingleApplication:
     def __init__(self, app_name="PekoviewerApp"):
@@ -1673,7 +1681,8 @@ class ImageViewer(QMainWindow):
         # frame through an in-memory filter when color adjustments are active.
         if not self.current_zip:
             ext = os.path.splitext(current_file)[1].lower()
-            if ext == '.gif' or (ext == '.webp' and is_animated_webp(current_file)):
+            webp_frame_count = is_animated_webp(current_file) if ext == '.webp' else 0
+            if ext == '.gif' or webp_frame_count:
                 movie = ImageLoader.load_movie(current_file)
                 if movie:
                     self.current_movie = movie
@@ -1708,7 +1717,8 @@ class ImageViewer(QMainWindow):
                         # caused stutter/dropped frames when navigating
                         # between animated images with saturation/brightness/
                         # contrast turned on.
-                        self._prewarm_animated_frames(movie, movie_generation, saturation, brightness, contrast)
+                        self._prewarm_animated_frames(movie, movie_generation, saturation, brightness, contrast,
+                                                       frame_count_hint=webp_frame_count or None)
                     self.is_loading = False
                     return
 
@@ -1738,13 +1748,23 @@ class ImageViewer(QMainWindow):
                 self.scroll_area.size().width(),
                 self.scroll_area.size().height())
 
-    def _prewarm_animated_frames(self, movie, generation, saturation, brightness, contrast):
+    def _prewarm_animated_frames(self, movie, generation, saturation, brightness, contrast, frame_count_hint=None):
         # Walk every frame once on the GUI thread (cheap: just a decode +
         # byte copy, no Pillow work) so we know exactly what needs
         # color-correcting, then fan the Pillow work for all frames out to
         # the worker pool in parallel. Playback only starts once every
         # frame is cached, so the QMovie timer never has to wait on Pillow.
-        frame_count = movie.frameCount()
+        #
+        # frame_count_hint is Pillow's n_frames for an animated webp, passed
+        # in by the caller. movie.frameCount() is unreliable for many
+        # animated webp files (often reports 0), and without a real count
+        # the walk below used to fall back to "advance until
+        # jumpToNextFrame() fails" -- which never fails for a looping
+        # animation, so it silently walked (and Pillow-processed) up to
+        # 2000 duplicate frames on every single adjustment. That GUI-thread
+        # walk plus the resulting flood of queued Pillow jobs is what caused
+        # the severe stutter on looping animated webp.
+        frame_count = frame_count_hint or movie.frameCount()
         frames = []
 
         def grab_current_frame(idx):
@@ -1768,8 +1788,12 @@ class ImageViewer(QMainWindow):
                     break
                 frames.append(data)
         else:
-            # Some animated WebP files don't report a usable frame count
-            # from QMovie; walk frames until it stops advancing.
+            # Last-resort path when even Pillow couldn't report a frame
+            # count: walk frames until it stops advancing OR wraps back to
+            # frame 0, whichever comes first. A looping animation's
+            # jumpToNextFrame() keeps succeeding forever, so the wraparound
+            # check is what actually terminates the walk in that case --
+            # without it this loop always hit the 2000-iteration cap.
             idx = 0
             while idx < 2000:
                 data = grab_current_frame(idx)
@@ -1778,6 +1802,8 @@ class ImageViewer(QMainWindow):
                 frames.append(data)
                 idx += 1
                 if not movie.jumpToNextFrame():
+                    break
+                if movie.currentFrameNumber() == 0:
                     break
 
         movie.jumpToFrame(0)
