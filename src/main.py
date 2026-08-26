@@ -1056,11 +1056,15 @@ class ImageViewer(QMainWindow):
             self.setWindowIcon(icon)
             if self.windowHandle():
                 self.windowHandle().setIcon(icon)
+        self.reset_cursor_timer()
     
     def hide_cursor(self):
-        if self.isFullScreen() and not self.cursor_hidden:
-            self.setCursor(Qt.BlankCursor)
-            self.cursor_hidden = True
+        # Never hide mid-interaction: losing the cursor while actively
+        # resizing/dragging/panning would be disorienting.
+        if self.cursor_hidden or self.dragging or self.resizing or self.panning:
+            return
+        self.setCursor(Qt.BlankCursor)
+        self.cursor_hidden = True
     
     def show_cursor(self):
         if self.cursor_hidden:
@@ -1069,8 +1073,8 @@ class ImageViewer(QMainWindow):
             self.cursor_hidden = False
     
     def reset_cursor_timer(self):
-        if self.isFullScreen():
-            self.cursor_hide_timer.start(2000)
+        # Auto-hide-after-idle now applies in windowed mode too, not just fullscreen.
+        self.cursor_hide_timer.start(2000)
     
     def bring_to_front(self):
         self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
@@ -1194,6 +1198,11 @@ class ImageViewer(QMainWindow):
             return None
     
     def update_cursor(self, pos):
+        if self.isFullScreen():
+            # Resizing isn't possible in fullscreen, so never show a resize cursor there.
+            self.unsetCursor()
+            self.setCursor(Qt.ArrowCursor)
+            return
         region = self.get_resize_region(pos)
         if region in ['left', 'right']:
             self.setCursor(Qt.SizeHorCursor)
@@ -1212,7 +1221,7 @@ class ImageViewer(QMainWindow):
             if self.isFullScreen():
                 self.show_cursor()
                 self.showNormal()
-                self.cursor_hide_timer.stop()
+                self.reset_cursor_timer()
                 event.accept()
                 return
         
@@ -1926,13 +1935,12 @@ class ImageViewer(QMainWindow):
         self._zoom_at(1.0 / 1.20)
     
     def toggle_fullscreen(self):
+        self.show_cursor()
         if self.isFullScreen():
-            self.show_cursor()
             self.showNormal()
-            self.cursor_hide_timer.stop()
         else:
             self.showFullScreen()
-            self.reset_cursor_timer()
+        self.reset_cursor_timer()
     
     def close_program(self):
         QTimer.singleShot(150, self.close)
@@ -2062,6 +2070,7 @@ class ImageViewer(QMainWindow):
         self.pan_start_pos = QPoint(global_pos)
         self.pan_start_h = self.scroll_area.horizontalScrollBar().value()
         self.pan_start_v = self.scroll_area.verticalScrollBar().value()
+        self.show_cursor()
         self.setCursor(Qt.ClosedHandCursor)
         return True
 
@@ -2080,7 +2089,9 @@ class ImageViewer(QMainWindow):
             return False
         self.panning = False
         self.pan_start_pos = None
+        self.show_cursor()
         self.setCursor(Qt.ArrowCursor)
+        self.reset_cursor_timer()
         return True
 
     def _is_pan_target(self, widget):
@@ -2108,11 +2119,19 @@ class ImageViewer(QMainWindow):
         return True
 
     def eventFilter(self, obj, event):
-        # The image label / scroll-area viewport can receive wheel events
-        # before QMainWindow, so intercept horizontal tilt here.
+        # The image label / scroll-area viewport sit directly under the
+        # cursor and cover the whole window, so they receive wheel and
+        # mouse-move events before QMainWindow ever would. Handle wheel
+        # tilt, the resize cursor, and the auto-hide timer here directly
+        # instead of relying on those reaching wheelEvent/mouseMoveEvent.
         if event.type() == QEvent.Wheel:
             if self._handle_tilt_wheel(event):
                 return True
+        elif event.type() == QEvent.MouseMove:
+            if not (self.dragging or self.resizing or self.panning):
+                self.update_cursor(obj.mapTo(self, event.pos()))
+            self.show_cursor()
+            self.reset_cursor_timer()
         return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent):
