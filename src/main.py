@@ -806,6 +806,7 @@ class ImageViewer(QMainWindow):
         self.load_bridge.loaded.connect(self._on_background_loaded)
         self.load_generation = 0
         self.loading_keys = set()
+        self.load_retry_counts = {}
         self.preload_enabled = self.settings.get('preload_next', True)
         self.slideshow = QTimer()
         self.slideshow.timeout.connect(self.next_image)
@@ -1211,27 +1212,77 @@ class ImageViewer(QMainWindow):
             print(f"백그라운드 로딩 시작 오류: {e}")
 
     def _on_background_loaded(self, generation, key, image, was_current):
+        # A preload may have been started for an older navigation generation.
+        # Its result is still valuable: keep it in cache. Only the paint decision
+        # must be based on the image that is current *now*.
         self.loading_keys.discard(key)
-        if generation != self.load_generation:
-            return
+
+        current_key = None
+        if self.image_list and 0 <= self.current_index < len(self.image_list):
+            current_key = self._cache_key(
+                self.image_list[self.current_index],
+                self.settings.get('saturation', 100),
+                self.settings.get('brightness', 100),
+                self.settings.get('contrast', 100),
+                self._target_decode_size()
+            )
+
         if image is None or image.isNull():
-            if was_current:
-                self.is_loading = False
+            # Never blank the viewer because a background decode failed.
+            # Retry the currently requested image once, after a short delay.
+            if key == current_key:
+                count = self.load_retry_counts.get(key, 0)
+                if count < 1:
+                    self.load_retry_counts[key] = count + 1
+                    QTimer.singleShot(
+                        40,
+                        lambda k=key, g=self.load_generation:
+                            self._retry_current_load(k, g)
+                    )
+                else:
+                    self.load_retry_counts.pop(key, None)
+                    self.is_loading = False
             return
+
         pixmap = QPixmap.fromImage(image)
         if pixmap.isNull():
-            return
-        self.cache_manager.put(key, pixmap)
-        # Only paint if this result still belongs to the currently visible image.
-        if was_current and self.image_list and 0 <= self.current_index < len(self.image_list):
-            current_key = self._cache_key(self.image_list[self.current_index],
-                                          self.settings.get('saturation', 100),
-                                          self.settings.get('brightness', 100),
-                                          self.settings.get('contrast', 100),
-                                          self._target_decode_size())
             if key == current_key:
-                self._display_pixmap(pixmap)
-                self.is_loading = False
+                count = self.load_retry_counts.get(key, 0)
+                if count < 1:
+                    self.load_retry_counts[key] = count + 1
+                    QTimer.singleShot(
+                        40,
+                        lambda k=key, g=self.load_generation:
+                            self._retry_current_load(k, g)
+                    )
+                else:
+                    self.load_retry_counts.pop(key, None)
+                    self.is_loading = False
+            return
+
+        self.load_retry_counts.pop(key, None)
+        self.cache_manager.put(key, pixmap)
+
+        # Display only if this result matches what is visible right now.
+        # This fixes rapid navigation races where an older worker finishes late.
+        if key == current_key:
+            self._display_pixmap(pixmap)
+            self.is_loading = False
+
+    def _retry_current_load(self, key, generation):
+        if generation != self.load_generation:
+            return
+        if not self.image_list or not (0 <= self.current_index < len(self.image_list)):
+            return
+        current_key = self._cache_key(
+            self.image_list[self.current_index],
+            self.settings.get('saturation', 100),
+            self.settings.get('brightness', 100),
+            self.settings.get('contrast', 100),
+            self._target_decode_size()
+        )
+        if key == current_key and self.cache_manager.get(key) is None:
+            self._submit_image_load(self.current_index, generation, force=True)
         
     def _display_pixmap(self, pixmap):
         if not pixmap or pixmap.isNull():
@@ -1254,8 +1305,10 @@ class ImageViewer(QMainWindow):
     def _preload_neighbors(self):
         if not self.preload_enabled or not self.image_list:
             return
+        # Do not flood the executor while the user is holding the navigation key.
+        # One image on each side gives most of the benefit with much less contention.
         generation = self.load_generation
-        for distance in (1, -1, 2, -2):
+        for distance in (1, -1):
             idx = self.current_index + distance
             if 0 <= idx < len(self.image_list):
                 self._submit_image_load(idx, generation)
@@ -1296,8 +1349,9 @@ class ImageViewer(QMainWindow):
             return
 
         self.is_loading = True
-        self.image_label.setText('로딩 중...')
-        self.image_label.setPixmap(QPixmap())
+        # Keep the previous frame visible while the new image is decoding.
+        # Clearing the label here caused the frequent black-screen effect during
+        # rapid navigation. A successful decode will replace it atomically.
         self._submit_image_load(self.current_index, generation)
         self._preload_neighbors()
 
