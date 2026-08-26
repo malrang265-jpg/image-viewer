@@ -1069,6 +1069,8 @@ class ImageViewer(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.scroll_area)
         self.image_label = PanLabel(self)
