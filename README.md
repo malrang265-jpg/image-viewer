@@ -1,4 +1,4 @@
-# Simple Image Viewer
+# Pekoviewer_Portable
 
 가볍고 빠른 이미지 뷰어
 
