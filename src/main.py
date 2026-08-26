@@ -158,6 +158,7 @@ class Settings:
             'cache_size': 200,
             'cache_mb': 768,
             'preload_next': True,
+            'preload_count': 3,
             'shortcuts': {
                 'next_image': ['Right', ''],
                 'prev_image': ['Left', ''],
@@ -651,6 +652,14 @@ class SettingsDialog(QDialog):
         display_layout.addRow('', self.show_filename)
         self.fit_to_window = QCheckBox('창에 맞추기')
         display_layout.addRow('', self.fit_to_window)
+
+        self.preload_enabled = QCheckBox('주변 이미지 미리 로딩')
+        display_layout.addRow('', self.preload_enabled)
+        self.preload_count = QComboBox()
+        for count, label in [(0, '사용 안 함'), (1, '앞/뒤 1장'), (2, '앞/뒤 2장'),
+                             (3, '앞/뒤 3장'), (5, '앞/뒤 5장'), (10, '앞/뒤 10장')]:
+            self.preload_count.addItem(label, count)
+        display_layout.addRow('미리 로딩 범위:', self.preload_count)
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
@@ -758,6 +767,12 @@ class SettingsDialog(QDialog):
             self.zoom_quality.setCurrentIndex(index)
         self.show_filename.setChecked(self.settings.get('show_filename', False))
         self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
+        self.preload_enabled.setChecked(self.settings.get('preload_next', True))
+        preload_count = int(self.settings.get('preload_count', 3))
+        preload_index = self.preload_count.findData(preload_count)
+        if preload_index < 0:
+            preload_index = self.preload_count.findData(3)
+        self.preload_count.setCurrentIndex(preload_index)
         self.saturation_slider.setValue(self.settings.get('saturation', 100))
         self.brightness_slider.setValue(self.settings.get('brightness', 100))
         self.contrast_slider.setValue(self.settings.get('contrast', 100))
@@ -786,6 +801,8 @@ class SettingsDialog(QDialog):
         self.settings.set('zoom_quality', self.zoom_quality.currentData())
         self.settings.set('show_filename', self.show_filename.isChecked())
         self.settings.set('fit_to_window', self.fit_to_window.isChecked())
+        self.settings.set('preload_next', self.preload_enabled.isChecked())
+        self.settings.set('preload_count', self.preload_count.currentData())
         self.settings.set('saturation', self.saturation_slider.value())
         self.settings.set('brightness', self.brightness_slider.value())
         self.settings.set('contrast', self.contrast_slider.value())
@@ -808,6 +825,7 @@ class ImageViewer(QMainWindow):
         self.loading_keys = set()
         self.load_retry_counts = {}
         self.preload_enabled = self.settings.get('preload_next', True)
+        self.preload_count = max(0, min(10, int(self.settings.get('preload_count', 3))))
         self.slideshow = QTimer()
         self.slideshow.timeout.connect(self.next_image)
         self.slideshow_playing = False
@@ -1305,13 +1323,18 @@ class ImageViewer(QMainWindow):
     def _preload_neighbors(self):
         if not self.preload_enabled or not self.image_list:
             return
-        # Do not flood the executor while the user is holding the navigation key.
-        # One image on each side gives most of the benefit with much less contention.
+        count = max(0, min(10, int(self.preload_count)))
+        if count <= 0:
+            return
+
+        # Preload symmetrically around the current image. Nearer images are
+        # submitted first so the immediately-next image gets priority.
         generation = self.load_generation
-        for distance in (1, -1):
-            idx = self.current_index + distance
-            if 0 <= idx < len(self.image_list):
-                self._submit_image_load(idx, generation)
+        for distance in range(1, count + 1):
+            for direction in (1, -1):
+                idx = self.current_index + (distance * direction)
+                if 0 <= idx < len(self.image_list):
+                    self._submit_image_load(idx, generation)
 
     def show_current_image(self):
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
@@ -1550,6 +1573,8 @@ class ImageViewer(QMainWindow):
     def show_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec_():
+            self.preload_enabled = self.settings.get('preload_next', True)
+            self.preload_count = max(0, min(10, int(self.settings.get('preload_count', 3))))
             self.apply_background_color()
             self.cache_manager.clear()
             if self.image_list:
