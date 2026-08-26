@@ -10,6 +10,8 @@ import concurrent.futures
 from io import BytesIO
 from collections import OrderedDict
 
+os.environ['QT_OPENGL'] = 'software'
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
