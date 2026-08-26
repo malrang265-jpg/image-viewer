@@ -725,7 +725,7 @@ class SettingsDialog(QDialog):
         adjustment_buttons = QHBoxLayout()
         apply_button = QPushButton('현재 이미지에 즉시 적용')
         apply_button.clicked.connect(self.apply_immediately)
-             reset_button = QPushButton('초기화')
+        reset_button = QPushButton('초기화')
         reset_button.clicked.connect(self.reset_image_adjustments)
         adjustment_buttons.addWidget(apply_button)
         adjustment_buttons.addWidget(reset_button)
