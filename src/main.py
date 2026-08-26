@@ -142,7 +142,9 @@ class Settings:
     
     def default_settings(self):
         return {
-            'window_geometry': None,
+            'window_geometry': {
+                'x': 777, 'y': 258, 'width': 595, 'height': 608
+            },
             'zoom_quality': 'balanced',
             'show_filename': False,
             'background_color': '#2b2b2b',
@@ -160,19 +162,19 @@ class Settings:
             'preload_next': True,
             'preload_count': 3,
             'shortcuts': {
-                'next_image': ['Right', ''],
-                'prev_image': ['Left', ''],
-                'zoom_in': ['Up', ''],
-                'zoom_out': ['Down', ''],
-                'toggle_actual_size': ['0', ''],
-                'toggle_fullscreen': ['F11', ''],
-                'close_program': ['Ctrl+Q', ''],
-                'show_image_list': ['Tab', ''],
-                'delete_image': ['Delete', ''],
-                'open_file': ['Ctrl+O', ''],
-                'slideshow': ['S', ''],
-                'rotate_right': ['R', ''],
-                'rotate_left': ['L', '']
+                'next_image': ['', ''],
+                'prev_image': ['', ''],
+                'zoom_in': ['', ''],
+                'zoom_out': ['', ''],
+                'toggle_actual_size': ['Middle Click', ''],
+                'toggle_fullscreen': ['Left Double Click', ''],
+                'close_program': ['XButton1', ''],
+                'show_image_list': ['Return', ''],
+                'delete_image': ['', ''],
+                'open_file': ['', ''],
+                'slideshow': ['', ''],
+                'rotate_right': ['', ''],
+                'rotate_left': ['', '']
             }
         }
     
@@ -844,6 +846,76 @@ class SettingsDialog(QDialog):
         self.settings.set('background_color', self.current_color)
         self.accept()
 
+class PanLabel(QLabel):
+    """Image label with reliable left-drag panning.
+
+    The pan starts only after a small movement threshold so a normal
+    left double-click can still trigger the fullscreen shortcut.
+    """
+    def __init__(self, viewer):
+        super().__init__()
+        self.viewer = viewer
+        self._pressed = False
+        self._panning = False
+        self._press_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.viewer._can_pan_image():
+            self._pressed = True
+            self._panning = False
+            self._press_pos = QPoint(event.globalPos())
+            self.grabMouse()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pressed and self._press_pos is not None:
+            delta = QPoint(event.globalPos()) - self._press_pos
+            if not self._panning and (abs(delta.x()) >= 4 or abs(delta.y()) >= 4):
+                if self.viewer._start_image_pan(self._press_pos):
+                    self._panning = True
+            if self._panning:
+                self.viewer._move_image_pan(event.globalPos())
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._pressed:
+            was_panning = self._panning
+            self._pressed = False
+            self._panning = False
+            self._press_pos = None
+            try:
+                self.releaseMouse()
+            except Exception:
+                pass
+            if was_panning:
+                self.viewer._end_image_pan()
+                event.accept()
+                return
+            # No movement: let the viewer handle the click/double-click.
+            # Releasing here prevents the frameless-window drag from starting.
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._pressed = False
+            self._panning = False
+            self._press_pos = None
+            try:
+                self.releaseMouse()
+            except Exception:
+                pass
+            self.viewer.check_mouse_shortcut('Left Double Click')
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class ImageViewer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -882,10 +954,12 @@ class ImageViewer(QMainWindow):
         self.is_loading = False
         self.dragging = False
         self.drag_start_pos = None
-        
+        # Image panning: when zoomed beyond the viewport, drag the image itself.
+        # Only scrollbar offsets change during a pan; the pixmap is never re-scaled.
         self.panning = False
         self.pan_start_pos = None
-        
+        self.pan_start_h = 0
+        self.pan_start_v = 0
         self.window_start_pos = None
         self.resizing = False
         self.resize_start_pos = None
@@ -997,7 +1071,7 @@ class ImageViewer(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.scroll_area)
-        self.image_label = QLabel()
+        self.image_label = PanLabel(self)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(100, 100)
         self.image_label.setScaledContents(False)
@@ -1242,6 +1316,7 @@ class ImageViewer(QMainWindow):
         if not self.fit_to_window:
             return None
         size = self.scroll_area.size()
+        # Small safety margin prevents repeated reloads caused by tiny widget changes.
         return (max(64, size.width() + 64), max(64, size.height() + 64))
 
     def _submit_image_load(self, index, generation=None, force=False):
@@ -1281,7 +1356,11 @@ class ImageViewer(QMainWindow):
             print(f"백그라운드 로딩 시작 오류: {e}")
 
     def _on_background_loaded(self, generation, key, image, was_current):
+        # A preload may have been started for an older navigation generation.
+        # Its result is still valuable: keep it in cache. Only the paint decision
+        # must be based on the image that is current *now*.
         self.loading_keys.discard(key)
+
         current_key = None
         if self.image_list and 0 <= self.current_index < len(self.image_list):
             current_key = self._cache_key(
@@ -1293,6 +1372,8 @@ class ImageViewer(QMainWindow):
             )
 
         if image is None or image.isNull():
+            # Never blank the viewer because a background decode failed.
+            # Retry the currently requested image once, after a short delay.
             if key == current_key:
                 count = self.load_retry_counts.get(key, 0)
                 if count < 1:
@@ -1326,6 +1407,8 @@ class ImageViewer(QMainWindow):
         self.load_retry_counts.pop(key, None)
         self.cache_manager.put(key, pixmap)
 
+        # Display only if this result matches what is visible right now.
+        # This fixes rapid navigation races where an older worker finishes late.
         if key == current_key:
             self._display_pixmap(pixmap)
             self.is_loading = False
@@ -1370,6 +1453,8 @@ class ImageViewer(QMainWindow):
         if count <= 0:
             return
 
+        # Preload symmetrically around the current image. Nearer images are
+        # submitted first so the immediately-next image gets priority.
         generation = self.load_generation
         for distance in range(1, count + 1):
             for direction in (1, -1):
@@ -1388,6 +1473,8 @@ class ImageViewer(QMainWindow):
         brightness = self.settings.get('brightness', 100)
         contrast = self.settings.get('contrast', 100)
 
+        # Animated GIF/WebP: keep QMovie for timing/decoding, but render each
+        # frame through an in-memory filter when color adjustments are active.
         if not self.current_zip:
             ext = os.path.splitext(current_file)[1].lower()
             if ext == '.gif' or (ext == '.webp' and is_animated_webp(current_file)):
@@ -1405,6 +1492,7 @@ class ImageViewer(QMainWindow):
                     self.current_movie_frame = -1
                     self.animated_frame_cache.clear()
                     movie.frameChanged.connect(self.on_animated_frame_changed)
+                    # A new movie must reconnect slideshow loop counting.
                     if self.slideshow_playing and self.slideshow_mode == 'loop':
                         self.connect_gif_loop()
                     movie.start()
@@ -1422,6 +1510,9 @@ class ImageViewer(QMainWindow):
             return
 
         self.is_loading = True
+        # Keep the previous frame visible while the new image is decoding.
+        # Clearing the label here caused the frequent black-screen effect during
+        # rapid navigation. A successful decode will replace it atomically.
         self._submit_image_load(self.current_index, generation)
         self._preload_neighbors()
 
@@ -1469,12 +1560,16 @@ class ImageViewer(QMainWindow):
             self.image_label.adjustSize()
             return
 
+        # Process the current frame in the worker pool. QMovie itself remains
+        # on the GUI thread because it is a Qt object. The expensive Pillow
+        # color work happens off the UI thread and never creates a temp file.
         try:
             rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
             w, h = rgba.width(), rgba.height()
             ptr = rgba.bits()
             ptr.setsize(rgba.byteCount())
             raw = bytes(ptr)
+            settings = (saturation, brightness, contrast)
             def worker():
                 try:
                     from PIL import Image, ImageEnhance
@@ -1533,6 +1628,9 @@ class ImageViewer(QMainWindow):
         if not self.slideshow_playing or self.slideshow_mode != 'loop':
             self.gif_last_frame = frame_number
             return
+        # Count a completed cycle only when the movie actually wraps from a
+        # later frame back to frame 0. This avoids counting the initial frame
+        # as a completed playback.
         if frame_number == 0 and self.gif_last_frame > 0:
             self.gif_loop_count += 1
             if self.gif_loop_count >= self.gif_max_loops:
@@ -1543,6 +1641,8 @@ class ImageViewer(QMainWindow):
         self.gif_last_frame = frame_number
     
     def update_image_display(self):
+        # A new scaled pixmap invalidates the old pan position. Qt will clamp
+        # scrollbars to the new image bounds after the label is resized.
         if self.panning:
             self._end_image_pan()
         if self.current_movie:
@@ -1589,6 +1689,7 @@ class ImageViewer(QMainWindow):
         self.fit_to_window = not self.fit_to_window
         if self.fit_to_window:
             self.zoom_factor = 1.0
+        # The fit-to-window cache may be a reduced decode; actual-size needs the full source.
         self.show_current_image()
     
     def next_image(self):
@@ -1614,6 +1715,10 @@ class ImageViewer(QMainWindow):
         viewport = self.scroll_area.viewport()
         viewport_pos = viewport.mapFromGlobal(global_pos)
 
+        # Capture the image-space point under the cursor before scaling.
+        # For a large image this is simply viewport position + scroll offset.
+        old_h = self.scroll_area.horizontalScrollBar().value()
+        old_v = self.scroll_area.verticalScrollBar().value()
         label_pos = self.image_label.mapFrom(viewport, viewport_pos)
         anchor_x = label_pos.x()
         anchor_y = label_pos.y()
@@ -1626,6 +1731,7 @@ class ImageViewer(QMainWindow):
         self.zoom_factor = new_zoom
         self.update_image_display()
 
+        # Keep the same image pixel underneath the cursor.
         ratio = new_zoom / old_zoom
         new_anchor_x = anchor_x * ratio
         new_anchor_y = anchor_y * ratio
@@ -1761,33 +1867,59 @@ class ImageViewer(QMainWindow):
         dialog = ShortcutSettingsDialog(self.settings, self)
         if dialog.exec_():
             pass
-            
+    
     def _can_pan_image(self):
-        if self.fit_to_window:
+        if self.current_movie or not self.current_pixmap or self.fit_to_window:
             return False
         viewport = self.scroll_area.viewport().size()
         label_size = self.image_label.size()
-        return label_size.width() > viewport.width() or label_size.height() > viewport.height()
+        return (label_size.width() > viewport.width() + 1 or
+                label_size.height() > viewport.height() + 1)
 
     def _start_image_pan(self, global_pos):
+        if not self._can_pan_image():
+            return False
         self.panning = True
-        self.pan_start_pos = global_pos
+        self.pan_start_pos = QPoint(global_pos)
+        self.pan_start_h = self.scroll_area.horizontalScrollBar().value()
+        self.pan_start_v = self.scroll_area.verticalScrollBar().value()
         self.setCursor(Qt.ClosedHandCursor)
+        return True
 
     def _move_image_pan(self, global_pos):
-        delta = global_pos - self.pan_start_pos
-        h_bar = self.scroll_area.horizontalScrollBar()
-        v_bar = self.scroll_area.verticalScrollBar()
-        h_bar.setValue(h_bar.value() - delta.x())
-        v_bar.setValue(v_bar.value() - delta.y())
-        self.pan_start_pos = global_pos
+        if not self.panning or self.pan_start_pos is None:
+            return False
+        delta = QPoint(global_pos) - self.pan_start_pos
+        # Move in the same direction as the hand drag. Scrollbar values are
+        # therefore decreased by the mouse delta. Qt clamps them to valid bounds.
+        self.scroll_area.horizontalScrollBar().setValue(self.pan_start_h - delta.x())
+        self.scroll_area.verticalScrollBar().setValue(self.pan_start_v - delta.y())
+        return True
 
     def _end_image_pan(self):
+        if not self.panning:
+            return False
         self.panning = False
         self.pan_start_pos = None
         self.setCursor(Qt.ArrowCursor)
+        return True
+
+    def _is_pan_target(self, widget):
+        if widget is None:
+            return False
+        viewport = self.scroll_area.viewport()
+        if widget is self.image_label or widget is viewport:
+            return True
+        try:
+            # widgetAt() can return a child widget inside the viewport.
+            # What matters is whether the pointer is inside our image area.
+            return viewport.isAncestorOf(widget) or self.image_label.isAncestorOf(widget)
+        except Exception:
+            return False
 
     def eventFilter(self, obj, event):
+        # Image panning is handled directly by PanLabel. Keep this filter only
+        # for compatibility with the scroll area/other child widgets.
         return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent):
@@ -1802,30 +1934,24 @@ class ImageViewer(QMainWindow):
     def mousePressEvent(self, event: QMouseEvent):
         self.show_cursor()
         self.reset_cursor_timer()
-        
         region = self.get_resize_region(event.pos())
-        
-        if event.button() == Qt.LeftButton:
-            if region:
-                self.resizing = True
-                self.resize_start_pos = event.globalPos()
-                self.resize_start_size = self.size()
-                self.resize_region = region
+        if event.button() == Qt.LeftButton and region and not self.isFullScreen():
+            self.resizing = True
+            self.resize_start_pos = event.globalPos()
+            self.resize_start_size = self.size()
+            self.resize_region = region
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and not region:
+            # Fullscreen has no window-position dragging.
+            if self.isFullScreen():
                 event.accept()
                 return
-            
-            if self._can_pan_image():
-                self._start_image_pan(event.globalPos())
-                event.accept()
-                return
-                
-            if not self.isFullScreen():
-                self.dragging = True
-                self.drag_start_pos = event.globalPos()
-                self.window_start_pos = self.pos()
-                event.accept()
-                return
-
+            self.dragging = True
+            self.drag_start_pos = event.globalPos()
+            self.window_start_pos = self.pos()
+            event.accept()
+            return
         button_text = ''
         if event.button() == Qt.MiddleButton:
             button_text = 'Middle Click'
@@ -1833,10 +1959,8 @@ class ImageViewer(QMainWindow):
             button_text = 'XButton1'
         elif event.button() == Qt.XButton2:
             button_text = 'XButton2'
-        
         if button_text:
             self.check_mouse_shortcut(button_text)
-            
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -1847,26 +1971,17 @@ class ImageViewer(QMainWindow):
             delta = event.globalPos() - self.resize_start_pos
             new_w = self.resize_start_size.width()
             new_h = self.resize_start_size.height()
-            
             if self.resize_region in ['left', 'topleft', 'bottomleft']:
                 new_w = max(200, self.resize_start_size.width() - delta.x())
             elif self.resize_region in ['right', 'topright', 'bottomright']:
                 new_w = max(200, self.resize_start_size.width() + delta.x())
-                
             if self.resize_region in ['top', 'topleft', 'topright']:
                 new_h = max(150, self.resize_start_size.height() - delta.y())
             elif self.resize_region in ['bottom', 'bottomleft', 'bottomright']:
                 new_h = max(150, self.resize_start_size.height() + delta.y())
-                
             self.resize(new_w, new_h)
             event.accept()
             return
-            
-        if self.panning and self.pan_start_pos:
-            self._move_image_pan(event.globalPos())
-            event.accept()
-            return
-            
         if self.dragging and self.drag_start_pos and not self.isFullScreen():
             delta = event.globalPos() - self.drag_start_pos
             new_pos = self.window_start_pos + delta
@@ -1874,37 +1989,27 @@ class ImageViewer(QMainWindow):
             self.move(new_pos)
             event.accept()
             return
-            
         self.update_cursor(event.pos())
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event: QMouseEvent):
         self.show_cursor()
         self.reset_cursor_timer()
-        
-        if event.button() == Qt.LeftButton:
-            if self.resizing:
-                self.resizing = False
-                self.resize_start_pos = None
-                self.resize_start_size = None
-                self.resize_region = None
-                self.unsetCursor()
-                self.setCursor(Qt.ArrowCursor)
-                event.accept()
-                return
-                
-            if self.panning:
-                self._end_image_pan()
-                event.accept()
-                return
-                
-            if self.dragging:
-                self.dragging = False
-                self.drag_start_pos = None
-                self.window_start_pos = None
-                event.accept()
-                return
-                
+        if event.button() == Qt.LeftButton and self.resizing:
+            self.resizing = False
+            self.resize_start_pos = None
+            self.resize_start_size = None
+            self.resize_region = None
+            self.unsetCursor()
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and self.dragging:
+            self.dragging = False
+            self.drag_start_pos = None
+            self.window_start_pos = None
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -1932,6 +2037,9 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         self.slideshow.stop()
         self.cursor_hide_timer.stop()
+        # Stop creating new background work and release all worker threads.
+        # This is important on Windows: ThreadPoolExecutor worker threads can
+        # keep the process alive and retain large decoded images/ZIP handles.
         try:
             self.load_generation += 1
             self.loading_keys.clear()
