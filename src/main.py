@@ -1977,9 +1977,9 @@ class ImageViewer(QMainWindow):
         dx = event.angleDelta().x()
         if dx == 0:
             return False
-        # "Tilt Left/Right" is the physical input name. The assigned action
-        # is stored separately, so check_mouse_shortcut() must do the lookup.
-        button_text = 'Tilt Right' if dx > 0 else 'Tilt Left'
+        # The mouse reports horizontal tilt with the opposite sign on this
+        # device/event path. Map the physical direction to the UI name.
+        button_text = 'Tilt Left' if dx > 0 else 'Tilt Right'
         self.check_mouse_shortcut(button_text)
         event.accept()
         return True
