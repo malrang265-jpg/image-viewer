@@ -10,8 +10,6 @@ import concurrent.futures
 from io import BytesIO
 from collections import OrderedDict
 
-os.environ['QT_OPENGL'] = 'software'
-
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
@@ -471,6 +469,7 @@ class ZipHandler:
 class ImageLoadBridge(QObject):
     loaded = pyqtSignal(int, str, object, bool)
     animated_frame = pyqtSignal(int, int, object)
+    animated_prewarm_frame = pyqtSignal(int, int, object)
 
 class ImageListDialog(QDialog):
     def __init__(self, image_list, current_index, parent=None, current_zip=None):
@@ -1014,6 +1013,7 @@ class ImageViewer(QMainWindow):
         self.load_bridge = ImageLoadBridge()
         self.load_bridge.loaded.connect(self._on_background_loaded)
         self.load_bridge.animated_frame.connect(self._on_animated_frame_ready)
+        self.load_bridge.animated_prewarm_frame.connect(self._on_animated_prewarm_frame_ready)
         self.load_generation = 0
         self.loading_keys = set()
         # Cache the expensive color-adjusted source separately from the
@@ -1045,6 +1045,9 @@ class ImageViewer(QMainWindow):
         self.current_movie_generation = 0
         self.animated_frame_cache = OrderedDict()
         self.animated_frame_cache_limit = 24
+        # generation -> remaining frame count while a color-adjusted
+        # animation is being pre-rendered in the background before playback.
+        self.animated_prewarm_pending = {}
         self.current_movie_frame = -1
         self.current_pixmap = None
         self.original_pixmap = None
@@ -1689,12 +1692,23 @@ class ImageViewer(QMainWindow):
                             movie.setScaledSize(scaled_size)
                     self.current_movie_frame = -1
                     self.animated_frame_cache.clear()
-                    movie.frameChanged.connect(self.on_animated_frame_changed)
+                    self.animated_prewarm_pending.pop(movie_generation, None)
                     # A new movie must reconnect slideshow loop counting.
                     if self.slideshow_playing and self.slideshow_mode == 'loop':
                         self.connect_gif_loop()
-                    movie.start()
-                    self._render_animated_frame(movie.currentFrameNumber(), movie_generation)
+                    if saturation == 100 and brightness == 100 and contrast == 100:
+                        movie.frameChanged.connect(self.on_animated_frame_changed)
+                        movie.start()
+                        self._render_animated_frame(movie.currentFrameNumber(), movie_generation)
+                    else:
+                        # Color adjustment is active: render every frame once
+                        # in the background pool and fill the cache before
+                        # starting playback, instead of racing Pillow against
+                        # the frame timer on every loop. That race is what
+                        # caused stutter/dropped frames when navigating
+                        # between animated images with saturation/brightness/
+                        # contrast turned on.
+                        self._prewarm_animated_frames(movie, movie_generation, saturation, brightness, contrast)
                     self.is_loading = False
                     return
 
@@ -1723,6 +1737,119 @@ class ImageViewer(QMainWindow):
                 self.zoom_factor,
                 self.scroll_area.size().width(),
                 self.scroll_area.size().height())
+
+    def _prewarm_animated_frames(self, movie, generation, saturation, brightness, contrast):
+        # Walk every frame once on the GUI thread (cheap: just a decode +
+        # byte copy, no Pillow work) so we know exactly what needs
+        # color-correcting, then fan the Pillow work for all frames out to
+        # the worker pool in parallel. Playback only starts once every
+        # frame is cached, so the QMovie timer never has to wait on Pillow.
+        frame_count = movie.frameCount()
+        frames = []
+
+        def grab_current_frame(idx):
+            qimage = movie.currentImage()
+            if qimage.isNull():
+                qimage = movie.currentPixmap().toImage()
+            if qimage.isNull():
+                return None
+            rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
+            w, h = rgba.width(), rgba.height()
+            ptr = rgba.bits()
+            ptr.setsize(rgba.byteCount())
+            return (idx, bytes(ptr), w, h)
+
+        if frame_count and frame_count > 0:
+            for idx in range(frame_count):
+                if not movie.jumpToFrame(idx):
+                    break
+                data = grab_current_frame(idx)
+                if data is None:
+                    break
+                frames.append(data)
+        else:
+            # Some animated WebP files don't report a usable frame count
+            # from QMovie; walk frames until it stops advancing.
+            idx = 0
+            while idx < 2000:
+                data = grab_current_frame(idx)
+                if data is None:
+                    break
+                frames.append(data)
+                idx += 1
+                if not movie.jumpToNextFrame():
+                    break
+
+        movie.jumpToFrame(0)
+
+        if not frames:
+            # Couldn't walk frames (unsupported format quirk) -- fall back
+            # to the old real-time-per-frame path rather than never playing.
+            movie.frameChanged.connect(self.on_animated_frame_changed)
+            movie.start()
+            self._render_animated_frame(movie.currentFrameNumber(), generation)
+            return
+
+        # Grow the frame cache to fit the whole animation (capped) so
+        # nothing gets evicted mid-prewarm -- the default 24-frame limit
+        # was sized for a rolling playback window, not a full upfront render.
+        self.animated_frame_cache_limit = max(24, min(len(frames), 300))
+
+        self.animated_prewarm_pending[generation] = len(frames)
+        settings = (saturation, brightness, contrast)
+
+        for frame_number, raw, w, h in frames:
+            key = self._animated_cache_key(frame_number)
+
+            def worker(raw=raw, w=w, h=h, settings=settings):
+                try:
+                    from PIL import Image
+                    src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
+                    rgb = src.convert('RGB')
+                    rgb = apply_color_adjustments(rgb, *settings)
+                    out = rgb.convert('RGBA')
+                    return out.tobytes('raw', 'RGBA'), w, h
+                except Exception:
+                    return None
+
+            future = ImageLoader._executor.submit(worker)
+
+            def done(fut, gen=generation, frame=frame_number, key=key):
+                try:
+                    result = fut.result()
+                except Exception:
+                    result = None
+                self.load_bridge.animated_prewarm_frame.emit(gen, frame, (key, result))
+
+            future.add_done_callback(done)
+
+    def _on_animated_prewarm_frame_ready(self, generation, frame_number, payload):
+        key, result = payload
+        if result and generation == self.current_movie_generation:
+            raw, w, h = result
+            qimg = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888).copy()
+            pixmap = QPixmap.fromImage(qimg)
+            if not pixmap.isNull():
+                self._store_animated_frame(key, pixmap)
+
+        remaining = self.animated_prewarm_pending.get(generation)
+        if remaining is None:
+            return
+        remaining -= 1
+        if remaining > 0:
+            self.animated_prewarm_pending[generation] = remaining
+            return
+        del self.animated_prewarm_pending[generation]
+
+        # A newer image/settings change superseded this one while it was
+        # prewarming -- its cache entries are just wasted work, not shown.
+        if generation != self.current_movie_generation or not self.current_movie:
+            return
+        movie = self.current_movie
+        movie.jumpToFrame(0)
+        movie.frameChanged.connect(self.on_animated_frame_changed)
+        movie.start()
+        self._render_animated_frame(movie.currentFrameNumber(), generation)
 
     def on_animated_frame_changed(self, frame_number):
         if not self.current_movie:
