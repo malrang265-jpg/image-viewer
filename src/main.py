@@ -1878,7 +1878,15 @@ class ImageViewer(QMainWindow):
             pass
     
     def _can_pan_image(self):
-        if self.current_movie or not self.current_pixmap or self.fit_to_window:
+        if self.fit_to_window:
+            return False
+        if self.current_movie:
+            # Animated GIF/WebP frames are rendered into the same PanLabel.
+            # The label size follows the current frame, so the existing
+            # scrollbar-offset pan mechanism works for animation too.
+            if not self.current_pixmap and not self.current_movie.currentPixmap().isNull():
+                return True
+        elif not self.current_pixmap:
             return False
         viewport = self.scroll_area.viewport().size()
         label_size = self.image_label.size()
