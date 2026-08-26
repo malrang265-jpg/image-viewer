@@ -794,31 +794,104 @@ class SettingsDialog(QDialog):
                 self.contrast_slider.value()
             )
     
+    @staticmethod
+    def _safe_int(value, default, minimum=None, maximum=None):
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            value = int(float(value))
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    @staticmethod
+    def _safe_bool(value, default):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ('true', '1', 'yes', 'on', '예', '사용'):
+                return True
+            if text in ('false', '0', 'no', 'off', '아니오', '사용 안 함'):
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
     def load_settings(self):
+        # 설정 파일의 값이 문자열/null/범위 밖이어도 설정창이 죽지 않도록
+        # 모든 값을 Qt 위젯에 넣기 전에 안전하게 정규화한다.
         quality = self.settings.get('zoom_quality', 'balanced')
+        if quality not in ('speed', 'balanced', 'quality'):
+            quality = 'balanced'
         index = self.zoom_quality.findData(quality)
-        if index >= 0:
-            self.zoom_quality.setCurrentIndex(index)
-        self.show_filename.setChecked(self.settings.get('show_filename', False))
-        self.fit_to_window.setChecked(self.settings.get('fit_to_window', True))
-        self.preload_enabled.setChecked(self.settings.get('preload_next', True))
-        preload_count = int(self.settings.get('preload_count', 3))
+        if index < 0:
+            index = 1
+        self.zoom_quality.setCurrentIndex(index)
+
+        self.show_filename.setChecked(
+            self._safe_bool(self.settings.get('show_filename', False), False)
+        )
+        self.fit_to_window.setChecked(
+            self._safe_bool(self.settings.get('fit_to_window', True), True)
+        )
+        self.preload_enabled.setChecked(
+            self._safe_bool(self.settings.get('preload_next', True), True)
+        )
+
+        preload_count = self._safe_int(self.settings.get('preload_count', 3), 3, 0, 10)
         preload_index = self.preload_count.findData(preload_count)
         if preload_index < 0:
             preload_index = self.preload_count.findData(3)
+        if preload_index < 0:
+            preload_index = 0
         self.preload_count.setCurrentIndex(preload_index)
-        self.saturation_slider.setValue(self.settings.get('saturation', 100))
-        self.brightness_slider.setValue(self.settings.get('brightness', 100))
-        self.contrast_slider.setValue(self.settings.get('contrast', 100))
-        self.snap_enabled.setChecked(self.settings.get('snap_enabled', True))
-        self.snap_threshold.setValue(self.settings.get('snap_threshold', 20))
+
+        self.saturation_slider.setValue(
+            self._safe_int(self.settings.get('saturation', 100), 100, 0, 200)
+        )
+        self.brightness_slider.setValue(
+            self._safe_int(self.settings.get('brightness', 100), 100, 0, 200)
+        )
+        self.contrast_slider.setValue(
+            self._safe_int(self.settings.get('contrast', 100), 100, 0, 200)
+        )
+
+        self.snap_enabled.setChecked(
+            self._safe_bool(self.settings.get('snap_enabled', True), True)
+        )
+        self.snap_threshold.setValue(
+            self._safe_int(self.settings.get('snap_threshold', 20), 20, 5, 50)
+        )
+
         mode = self.settings.get('slideshow_mode', 'time')
+        if mode not in ('time', 'loop'):
+            mode = 'time'
         index = self.slideshow_mode.findData(mode)
-        if index >= 0:
-            self.slideshow_mode.setCurrentIndex(index)
-        self.slideshow_interval.setValue(self.settings.get('slideshow_interval', 3))
-        self.slideshow_gif_loops.setValue(self.settings.get('slideshow_gif_loops', 2))
-        self.current_color = self.settings.get('background_color', '#2b2b2b')
+        if index < 0:
+            index = 0
+        self.slideshow_mode.setCurrentIndex(index)
+
+        self.slideshow_interval.setValue(
+            self._safe_int(self.settings.get('slideshow_interval', 3), 3, 1, 60)
+        )
+        self.slideshow_gif_loops.setValue(
+            self._safe_int(self.settings.get('slideshow_gif_loops', 2), 2, 1, 10)
+        )
+
+        color = self.settings.get('background_color', '#2b2b2b')
+        if not isinstance(color, str) or not color.strip():
+            color = '#2b2b2b'
+        # QColor가 인식할 수 있는 색상인지 확인하고, 잘못된 값이면 기본값으로 복구
+        from PyQt5.QtGui import QColor
+        qcolor = QColor(color)
+        if not qcolor.isValid():
+            color = '#2b2b2b'
+        self.current_color = color
         self.update_color_button()
     
     def choose_color(self):
