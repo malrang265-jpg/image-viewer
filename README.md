@@ -12,6 +12,3 @@
 - 한국어 UI
 - 유니코드 파일명 지원
 
-## 설치
-```bash
-pip install -r requirements.txt
