@@ -1069,8 +1069,6 @@ class ImageViewer(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.scroll_area)
         self.image_label = PanLabel(self)
@@ -1487,8 +1485,13 @@ class ImageViewer(QMainWindow):
                     movie_generation = self.current_movie_generation
                     movie.jumpToFrame(0)
                     self.current_movie_original_size = movie.currentPixmap().size()
-                    if self.fit_to_window and self.current_movie_original_size.width() > 0:
-                        scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                    self.scroll_area.setWidgetResizable(self.fit_to_window)
+                    if self.current_movie_original_size.width() > 0:
+                        if self.fit_to_window:
+                            scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                        else:
+                            scaled_size = QSize(int(self.current_movie_original_size.width() * self.zoom_factor),
+                                                 int(self.current_movie_original_size.height() * self.zoom_factor))
                         if scaled_size.width() > 0 and scaled_size.height() > 0:
                             movie.setScaledSize(scaled_size)
                     self.current_movie_frame = -1
@@ -1524,6 +1527,7 @@ class ImageViewer(QMainWindow):
                 self.settings.get('brightness', 100),
                 self.settings.get('contrast', 100),
                 self.fit_to_window,
+                self.zoom_factor,
                 self.scroll_area.size().width(),
                 self.scroll_area.size().height())
 
@@ -1878,15 +1882,7 @@ class ImageViewer(QMainWindow):
             pass
     
     def _can_pan_image(self):
-        if self.fit_to_window:
-            return False
-        if self.current_movie:
-            # Animated GIF/WebP frames are rendered into the same PanLabel.
-            # The label size follows the current frame, so the existing
-            # scrollbar-offset pan mechanism works for animation too.
-            if not self.current_pixmap and not self.current_movie.currentPixmap().isNull():
-                return True
-        elif not self.current_pixmap:
+        if not self.current_pixmap or self.fit_to_window:
             return False
         viewport = self.scroll_area.viewport().size()
         label_size = self.image_label.size()
