@@ -18,8 +18,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
                             QListWidget, QListWidgetItem, QMessageBox,
                             QListView, QSlider)
-from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint, QEvent
-from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
+from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint, QEvent, QBuffer, QIODevice
+from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform, QImageReader,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
@@ -173,8 +173,6 @@ class Settings:
                 'delete_image': ['', ''],
                 'open_file': ['', ''],
                 'slideshow': ['', ''],
-                'rotate_right': ['', ''],
-                'rotate_left': ['', '']
             }
         }
     
@@ -184,7 +182,17 @@ class Settings:
     def set(self, key, value):
         self.data[key] = value
         self.save()
-    
+
+    def update_many(self, values):
+        if values:
+            self.data.update(values)
+            self.save()
+
+    def update_shortcuts_many(self, values):
+        if values:
+            self.data.setdefault('shortcuts', {}).update(values)
+            self.save()
+
     def get_shortcuts(self, action):
         shortcuts = self.data.get('shortcuts', {})
         value = shortcuts.get(action, ['', ''])
@@ -213,7 +221,21 @@ class ImageLoader:
 
     @staticmethod
     def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None):
+        # Fast path: native Qt decoding avoids Pillow RGB conversion and byte copies.
         try:
+            if saturation == 100 and brightness == 100 and contrast == 100:
+                reader = QImageReader(filepath)
+                reader.setAutoTransform(True)
+                if max_size and max_size[0] > 0 and max_size[1] > 0:
+                    src_size = reader.size()
+                    if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
+                        reader.setScaledSize(src_size.scaled(
+                            QSize(int(max_size[0]), int(max_size[1])), Qt.KeepAspectRatio))
+                image = reader.read()
+                if not image.isNull():
+                    return image
+
+            # Keep Pillow for the color-adjustment path so output behavior stays the same.
             Image = get_pil_image()
             with Image.open(filepath) as src:
                 if getattr(src, 'is_animated', False):
@@ -365,6 +387,23 @@ class ZipHandler:
             zf = ZipHandler._get_zip(zip_path)
             with zf.open(filename, 'r') as fp:
                 data = fp.read()
+
+            if saturation == 100 and brightness == 100 and contrast == 100:
+                buffer = QBuffer()
+                buffer.setData(QByteArray(data))
+                buffer.open(QIODevice.ReadOnly)
+                reader = QImageReader(buffer)
+                reader.setAutoTransform(True)
+                if max_size and max_size[0] > 0 and max_size[1] > 0:
+                    src_size = reader.size()
+                    if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
+                        reader.setScaledSize(src_size.scaled(
+                            QSize(int(max_size[0]), int(max_size[1])), Qt.KeepAspectRatio))
+                image = reader.read()
+                buffer.close()
+                if not image.isNull():
+                    return image
+
             Image = get_pil_image()
             with Image.open(BytesIO(data)) as src:
                 if getattr(src, 'is_animated', False):
@@ -641,10 +680,11 @@ class ShortcutSettingsDialog(QDialog):
                     button.setText(text)
     
     def save_shortcuts(self):
+        values = {}
         for action, buttons in self.shortcut_buttons.items():
             shortcuts = [buttons[0].text(), buttons[1].text()]
-            shortcuts = [s if s != '없음' else '' for s in shortcuts]
-            self.settings.set_shortcuts(action, shortcuts)
+            values[action] = [s if s != '없음' else '' for s in shortcuts]
+        self.settings.update_shortcuts_many(values)
         self.accept()
 
 class SettingsDialog(QDialog):
@@ -841,20 +881,22 @@ class SettingsDialog(QDialog):
         self.color_button.setText(self.current_color)
     
     def save_settings(self):
-        self.settings.set('zoom_quality', self.zoom_quality.currentData())
-        self.settings.set('show_filename', self.show_filename.isChecked())
-        self.settings.set('fit_to_window', self.fit_to_window.isChecked())
-        self.settings.set('preload_next', self.preload_enabled.isChecked())
-        self.settings.set('preload_count', self.preload_count.currentData())
-        self.settings.set('saturation', self.saturation_slider.value())
-        self.settings.set('brightness', self.brightness_slider.value())
-        self.settings.set('contrast', self.contrast_slider.value())
-        self.settings.set('snap_enabled', self.snap_enabled.isChecked())
-        self.settings.set('snap_threshold', self.snap_threshold.value())
-        self.settings.set('slideshow_mode', self.slideshow_mode.currentData())
-        self.settings.set('slideshow_interval', self.slideshow_interval.value())
-        self.settings.set('slideshow_gif_loops', self.slideshow_gif_loops.value())
-        self.settings.set('background_color', self.current_color)
+        self.settings.update_many({
+            'zoom_quality': self.zoom_quality.currentData(),
+            'show_filename': self.show_filename.isChecked(),
+            'fit_to_window': self.fit_to_window.isChecked(),
+            'preload_next': self.preload_enabled.isChecked(),
+            'preload_count': self.preload_count.currentData(),
+            'saturation': self.saturation_slider.value(),
+            'brightness': self.brightness_slider.value(),
+            'contrast': self.contrast_slider.value(),
+            'snap_enabled': self.snap_enabled.isChecked(),
+            'snap_threshold': self.snap_threshold.value(),
+            'slideshow_mode': self.slideshow_mode.currentData(),
+            'slideshow_interval': self.slideshow_interval.value(),
+            'slideshow_gif_loops': self.slideshow_gif_loops.value(),
+            'background_color': self.current_color,
+        })
         self.accept()
 
 class PanLabel(QLabel):
@@ -953,7 +995,6 @@ class ImageViewer(QMainWindow):
         self.current_zip = None
         self.zoom_factor = 1.0
         self.fit_to_window = True
-        self.rotation_angle = 0
         self.current_movie = None
         self.current_movie_original_size = None
         self.current_movie_generation = 0
@@ -981,6 +1022,9 @@ class ImageViewer(QMainWindow):
         self.cursor_hide_timer = QTimer()
         self.cursor_hide_timer.setSingleShot(True)
         self.cursor_hide_timer.timeout.connect(self.hide_cursor)
+        self._display_update_timer = QTimer(self)
+        self._display_update_timer.setSingleShot(True)
+        self._display_update_timer.timeout.connect(self.update_image_display)
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -1062,9 +1106,11 @@ class ImageViewer(QMainWindow):
         return QPoint(x, y)
     
     def apply_image_adjustments(self, saturation, brightness, contrast):
-        self.settings.set('saturation', saturation)
-        self.settings.set('brightness', brightness)
-        self.settings.set('contrast', contrast)
+        self.settings.update_many({
+            'saturation': saturation,
+            'brightness': brightness,
+            'contrast': contrast,
+        })
         self.cache_manager.clear()
         if self.image_list:
             self.show_current_image()
@@ -1175,7 +1221,6 @@ class ImageViewer(QMainWindow):
             'show_image_list': self.show_image_list_dialog,
             'delete_image': self.delete_image, 'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
-            'rotate_right': self.rotate_right, 'rotate_left': self.rotate_left,
         }
         for action_name, callback in shortcut_actions.items():
             shortcuts = self.settings.get_shortcuts(action_name)
@@ -1195,7 +1240,6 @@ class ImageViewer(QMainWindow):
             'toggle_actual_size': self.toggle_actual_size,
             'delete_image': self.delete_image, 'open_file': self.open_file,
             'slideshow': self.toggle_slideshow,
-            'rotate_right': self.rotate_right, 'rotate_left': self.rotate_left,
         }
         for action_name, callback in actions.items():
             shortcuts = self.settings.get_shortcuts(action_name)
@@ -1444,8 +1488,6 @@ class ImageViewer(QMainWindow):
     def _display_pixmap(self, pixmap):
         if not pixmap or pixmap.isNull():
             return
-        if self.rotation_angle != 0:
-            pixmap = pixmap.transformed(QTransform().rotate(self.rotation_angle), Qt.SmoothTransformation)
         self.current_pixmap = pixmap
         self.original_pixmap = pixmap
         self.update_image_display()
@@ -1721,13 +1763,11 @@ class ImageViewer(QMainWindow):
     def next_image(self):
         if self.image_list and self.current_index < len(self.image_list) - 1:
             self.current_index += 1
-            self.rotation_angle = 0
             self.show_current_image()
     
     def prev_image(self):
         if self.image_list and self.current_index > 0:
             self.current_index -= 1
-            self.rotation_angle = 0
             self.show_current_image()
     
     def _zoom_at(self, factor, global_pos=None):
@@ -1792,7 +1832,6 @@ class ImageViewer(QMainWindow):
             selected = dialog.get_selected_index()
             if selected != self.current_index:
                 self.current_index = selected
-                self.rotation_angle = 0
                 self.show_current_image()
     
     def delete_image(self):
@@ -1953,10 +1992,13 @@ class ImageViewer(QMainWindow):
         self.reset_cursor_timer()
         dx = event.angleDelta().x()
         if dx != 0:
+            # Tilt is inactive until explicitly assigned in shortcut settings.
             button_text = 'Tilt Right' if dx > 0 else 'Tilt Left'
-            if self.check_mouse_shortcut(button_text):
-                event.accept()
-                return
+            shortcuts = self.settings.get_shortcuts(button_text)
+            if shortcuts and button_text in shortcuts:
+                self.check_mouse_shortcut(button_text)
+            event.accept()
+            return
         if event.angleDelta().y() > 0:
             self.prev_image()
         else:
@@ -2057,8 +2099,8 @@ class ImageViewer(QMainWindow):
     
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.fit_to_window:
-            self.update_image_display()
+        if self.fit_to_window and not self._display_update_timer.isActive():
+            self._display_update_timer.start(8)
     
     def closeEvent(self, event: QCloseEvent):
         self.show_cursor()
