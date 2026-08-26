@@ -1837,10 +1837,13 @@ class ImageViewer(QMainWindow):
     def _is_pan_target(self, widget):
         if widget is None:
             return False
-        if widget is self.image_label or widget is self.scroll_area.viewport():
+        viewport = self.scroll_area.viewport()
+        if widget is self.image_label or widget is viewport:
             return True
         try:
-            return widget.isAncestorOf(self.image_label) or self.image_label.isAncestorOf(widget)
+            # widgetAt() can return a child widget inside the viewport.
+            # What matters is whether the pointer is inside our image area.
+            return viewport.isAncestorOf(widget) or self.image_label.isAncestorOf(widget)
         except Exception:
             return False
 
@@ -1853,7 +1856,10 @@ class ImageViewer(QMainWindow):
         if event_type in (QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.MouseButtonRelease):
             if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 target = QApplication.widgetAt(event.globalPos())
-                if self._is_pan_target(target) and self._start_image_pan(event.globalPos()):
+                if (not self.isFullScreen()
+                        and self._is_pan_target(target)
+                        and self._can_pan_image()
+                        and self._start_image_pan(event.globalPos())):
                     event.accept()
                     return True
 
@@ -1907,6 +1913,10 @@ class ImageViewer(QMainWindow):
             event.accept()
             return
         if event.button() == Qt.LeftButton and not region:
+            # Fullscreen has no window-position dragging.
+            if self.isFullScreen():
+                event.accept()
+                return
             self.dragging = True
             self.drag_start_pos = event.globalPos()
             self.window_start_pos = self.pos()
@@ -1942,7 +1952,7 @@ class ImageViewer(QMainWindow):
             self.resize(new_w, new_h)
             event.accept()
             return
-        if self.dragging and self.drag_start_pos:
+        if self.dragging and self.drag_start_pos and not self.isFullScreen():
             delta = event.globalPos() - self.drag_start_pos
             new_pos = self.window_start_pos + delta
             new_pos = self.snap_to_edge(new_pos)
