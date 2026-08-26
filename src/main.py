@@ -499,7 +499,7 @@ class ShortcutSettingsDialog(QDialog):
             QGroupBox { color: white; border: 1px solid #555; margin-top: 10px; }
         """)
         layout = QVBoxLayout(self)
-        info_label = QLabel('버튼 클릭 후 1초 동안 입력한 모든 키/마우스 버튼이 단축키로 설정됩니다.\n더블클릭: Left Double Click / Right Double Click\nESC: 삭제')
+        info_label = QLabel('버튼 클릭 후 1초 동안 입력한 모든 키/마우스 버튼이 단축키로 설정됩니다.\n더블클릭: Left Double Click / Right Double Click\n마우스 틸트: Tilt Left / Tilt Right\nESC: 삭제')
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         actions = [
@@ -611,6 +611,23 @@ class ShortcutSettingsDialog(QDialog):
                     self.captured_keys.append(button_text)
         super().mousePressEvent(event)
     
+    def wheelEvent(self, event):
+        # Horizontal mouse-wheel tilt (e.g. MX Ergo tilt) is exposed by Qt as
+        # QWheelEvent.angleDelta().x(). Capture it as a shortcut.
+        if self.capturing and self.current_action:
+            dx = event.angleDelta().x()
+            if dx > 0:
+                if 'Tilt Right' not in self.captured_keys:
+                    self.captured_keys.append('Tilt Right')
+                event.accept()
+                return
+            elif dx < 0:
+                if 'Tilt Left' not in self.captured_keys:
+                    self.captured_keys.append('Tilt Left')
+                event.accept()
+                return
+        super().wheelEvent(event)
+
     def mouseDoubleClickEvent(self, event):
         if self.capturing and self.current_action:
             if event.button() == Qt.LeftButton:
@@ -1069,8 +1086,6 @@ class ImageViewer(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.scroll_area)
         self.image_label = PanLabel(self)
@@ -1487,13 +1502,8 @@ class ImageViewer(QMainWindow):
                     movie_generation = self.current_movie_generation
                     movie.jumpToFrame(0)
                     self.current_movie_original_size = movie.currentPixmap().size()
-                    self.scroll_area.setWidgetResizable(self.fit_to_window)
-                    if self.current_movie_original_size.width() > 0:
-                        if self.fit_to_window:
-                            scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
-                        else:
-                            scaled_size = QSize(int(self.current_movie_original_size.width() * self.zoom_factor),
-                                                 int(self.current_movie_original_size.height() * self.zoom_factor))
+                    if self.fit_to_window and self.current_movie_original_size.width() > 0:
+                        scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
                         if scaled_size.width() > 0 and scaled_size.height() > 0:
                             movie.setScaledSize(scaled_size)
                     self.current_movie_frame = -1
@@ -1529,7 +1539,6 @@ class ImageViewer(QMainWindow):
                 self.settings.get('brightness', 100),
                 self.settings.get('contrast', 100),
                 self.fit_to_window,
-                self.zoom_factor,
                 self.scroll_area.size().width(),
                 self.scroll_area.size().height())
 
@@ -1884,7 +1893,7 @@ class ImageViewer(QMainWindow):
             pass
     
     def _can_pan_image(self):
-        if not self.current_pixmap or self.fit_to_window:
+        if self.current_movie or not self.current_pixmap or self.fit_to_window:
             return False
         viewport = self.scroll_area.viewport().size()
         label_size = self.image_label.size()
@@ -1940,9 +1949,18 @@ class ImageViewer(QMainWindow):
     def wheelEvent(self, event: QWheelEvent):
         self.show_cursor()
         self.reset_cursor_timer()
+        dx = event.angleDelta().x()
+        if dx > 0:
+            if self.check_mouse_shortcut('Tilt Right'):
+                event.accept()
+                return
+        elif dx < 0:
+            if self.check_mouse_shortcut('Tilt Left'):
+                event.accept()
+                return
         if event.angleDelta().y() > 0:
             self.prev_image()
-        else:
+        elif event.angleDelta().y() < 0:
             self.next_image()
         event.accept()
     
