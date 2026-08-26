@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
                             QListWidget, QListWidgetItem, QMessageBox,
                             QListView, QSlider)
-from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint
+from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint, QEvent
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
@@ -653,16 +653,9 @@ class SettingsDialog(QDialog):
             QComboBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
             QComboBox QAbstractItemView { background-color: #3c3c3c; color: #ffffff; selection-background-color: #4a90d9; }
             QSpinBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 3px; }
-            QSlider::groove:horizontal { height: 10px; background: #555; border-radius: 5px; }
-            QSlider::sub-page:horizontal { background: #4a90d9; border-radius: 5px; }
-            QSlider::add-page:horizontal { background: #444; border-radius: 5px; }
-            QSlider::handle:horizontal {
-                width: 24px; height: 24px; margin: -7px 0;
-                background: #6bb6ff; border: 2px solid #ffffff; border-radius: 12px;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #8bc8ff; border: 2px solid #ffffff;
-            }
+            QSlider::groove:horizontal { height: 8px; background: #555; border-radius: 4px; }
+            QSlider::handle:horizontal { width: 24px; height: 24px; margin: -8px 0; background: #4a90d9; border-radius: 12px; }
+            QSlider::handle:horizontal:hover { background: #6aa8e8; }
             QPushButton { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; padding: 5px 10px; }
             QPushButton:hover { background-color: #4c4c4c; }
         """)
@@ -719,17 +712,14 @@ class SettingsDialog(QDialog):
         contrast_row.addWidget(self.contrast_slider)
         contrast_row.addWidget(self.contrast_label)
         adjust_layout.addRow('명도/대비:', contrast_row)
+
+        reset_adjust_button = QPushButton('채도·밝기·명도 초기화')
+        reset_adjust_button.clicked.connect(self.reset_adjustments)
+        adjust_layout.addRow('', reset_adjust_button)
         
-        adjustment_buttons = QHBoxLayout()
-        reset_adjustments_button = QPushButton('채도·밝기·명도 초기화')
-        reset_adjustments_button.setMinimumHeight(32)
-        reset_adjustments_button.clicked.connect(self.reset_adjustments)
-        adjustment_buttons.addWidget(reset_adjustments_button)
         apply_button = QPushButton('현재 이미지에 즉시 적용')
-        apply_button.setMinimumHeight(32)
         apply_button.clicked.connect(self.apply_immediately)
-        adjustment_buttons.addWidget(apply_button)
-        adjust_layout.addRow('', adjustment_buttons)
+        adjust_layout.addRow('', apply_button)
         
         adjust_group.setLayout(adjust_layout)
         layout.addWidget(adjust_group)
@@ -892,6 +882,12 @@ class ImageViewer(QMainWindow):
         self.is_loading = False
         self.dragging = False
         self.drag_start_pos = None
+        # Image panning: when zoomed beyond the viewport, drag the image itself.
+        # Only scrollbar offsets change during a pan; the pixmap is never re-scaled.
+        self.panning = False
+        self.pan_start_pos = None
+        self.pan_start_h = 0
+        self.pan_start_v = 0
         self.window_start_pos = None
         self.resizing = False
         self.resize_start_pos = None
@@ -1018,6 +1014,9 @@ class ImageViewer(QMainWindow):
         self.setMouseTracking(True)
         self.scroll_area.setMouseTracking(True)
         self.image_label.setMouseTracking(True)
+        self.scroll_area.viewport().setMouseTracking(True)
+        self.image_label.installEventFilter(self)
+        self.scroll_area.viewport().installEventFilter(self)
     
     def apply_background_color(self):
         bg_color = self.settings.get('background_color', '#2b2b2b')
@@ -1570,6 +1569,10 @@ class ImageViewer(QMainWindow):
         self.gif_last_frame = frame_number
     
     def update_image_display(self):
+        # A new scaled pixmap invalidates the old pan position. Qt will clamp
+        # scrollbars to the new image bounds after the label is resized.
+        if self.panning:
+            self._end_image_pan()
         if self.current_movie:
             try:
                 if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
@@ -1629,15 +1632,47 @@ class ImageViewer(QMainWindow):
             self.rotation_angle = 0
             self.show_current_image()
     
-    def zoom_in(self):
+    def _zoom_at(self, factor, global_pos=None):
+        if not self.current_pixmap or self.current_pixmap.isNull():
+            return
+
+        if global_pos is None:
+            from PyQt5.QtGui import QCursor
+            global_pos = QCursor.pos()
+
+        viewport = self.scroll_area.viewport()
+        viewport_pos = viewport.mapFromGlobal(global_pos)
+
+        # Capture the image-space point under the cursor before scaling.
+        # For a large image this is simply viewport position + scroll offset.
+        old_h = self.scroll_area.horizontalScrollBar().value()
+        old_v = self.scroll_area.verticalScrollBar().value()
+        label_pos = self.image_label.mapFrom(viewport, viewport_pos)
+        anchor_x = label_pos.x()
+        anchor_y = label_pos.y()
+
         self.fit_to_window = False
-        self.zoom_factor *= 1.2
+        old_zoom = self.zoom_factor
+        new_zoom = max(0.05, min(16.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+        self.zoom_factor = new_zoom
         self.update_image_display()
+
+        # Keep the same image pixel underneath the cursor.
+        ratio = new_zoom / old_zoom
+        new_anchor_x = anchor_x * ratio
+        new_anchor_y = anchor_y * ratio
+        target_h = int(new_anchor_x - viewport_pos.x())
+        target_v = int(new_anchor_y - viewport_pos.y())
+        self.scroll_area.horizontalScrollBar().setValue(target_h)
+        self.scroll_area.verticalScrollBar().setValue(target_v)
+
+    def zoom_in(self):
+        self._zoom_at(1.20)
     
     def zoom_out(self):
-        self.fit_to_window = False
-        self.zoom_factor /= 1.2
-        self.update_image_display()
+        self._zoom_at(1.0 / 1.20)
     
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1761,6 +1796,58 @@ class ImageViewer(QMainWindow):
         if dialog.exec_():
             pass
     
+    def _can_pan_image(self):
+        if self.current_movie or not self.current_pixmap or self.fit_to_window:
+            return False
+        viewport = self.scroll_area.viewport().size()
+        label_size = self.image_label.size()
+        return label_size.width() > viewport.width() or label_size.height() > viewport.height()
+
+    def _start_image_pan(self, global_pos):
+        if not self._can_pan_image():
+            return False
+        self.panning = True
+        self.pan_start_pos = QPoint(global_pos)
+        self.pan_start_h = self.scroll_area.horizontalScrollBar().value()
+        self.pan_start_v = self.scroll_area.verticalScrollBar().value()
+        self.setCursor(Qt.ClosedHandCursor)
+        return True
+
+    def _move_image_pan(self, global_pos):
+        if not self.panning or self.pan_start_pos is None:
+            return False
+        delta = QPoint(global_pos) - self.pan_start_pos
+        # Move in the same direction as the hand drag. Scrollbar values are
+        # therefore decreased by the mouse delta. Qt clamps them to valid bounds.
+        self.scroll_area.horizontalScrollBar().setValue(self.pan_start_h - delta.x())
+        self.scroll_area.verticalScrollBar().setValue(self.pan_start_v - delta.y())
+        return True
+
+    def _end_image_pan(self):
+        if not self.panning:
+            return False
+        self.panning = False
+        self.pan_start_pos = None
+        self.setCursor(Qt.ArrowCursor)
+        return True
+
+    def eventFilter(self, obj, event):
+        if obj in (self.image_label, self.scroll_area.viewport()):
+            event_type = event.type()
+            if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                if self._start_image_pan(event.globalPos()):
+                    event.accept()
+                    return True
+            elif event_type == QEvent.MouseMove and self.panning:
+                if self._move_image_pan(event.globalPos()):
+                    event.accept()
+                    return True
+            elif event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                if self._end_image_pan():
+                    event.accept()
+                    return True
+        return super().eventFilter(obj, event)
+
     def wheelEvent(self, event: QWheelEvent):
         self.show_cursor()
         self.reset_cursor_timer()
