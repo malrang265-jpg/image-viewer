@@ -1959,7 +1959,7 @@ class ImageViewer(QMainWindow):
                 h = scaled_size.height() if scaled_size else self.current_movie_original_size.height()
                 if w > 0 and h > 0:
                     bytes_per_frame = w * h * 4
-                    budget = 200 * 1024 * 1024  # ~200MB ceiling for this cache
+                    budget = 800 * 1024 * 1024  # ~800MB ceiling for this cache
                     by_memory = max(1, budget // max(1, bytes_per_frame))
                     self.animated_frame_cache_limit = max(24, min(frame_count, by_memory, 600))
                 else:
