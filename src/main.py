@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QListView, QSlider)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint, QEvent, QBuffer, QIODevice
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform, QImageReader,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon)
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor, QPainter)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
 user32 = ctypes.windll.user32
@@ -196,6 +196,7 @@ class Settings:
             'anim_saturation': 100,
             'anim_brightness': 100,
             'anim_contrast': 100,
+            'broken_image_path': '',
             'slideshow_interval': 3,
             'slideshow_mode': 'time',
             'slideshow_gif_loops': 2,
@@ -888,6 +889,26 @@ class SettingsDialog(QDialog):
         slideshow_layout.addRow('GIF 재생 횟수:', self.slideshow_gif_loops)
         slideshow_group.setLayout(slideshow_layout)
         layout.addWidget(slideshow_group)
+
+        error_group = QGroupBox('오류 처리')
+        error_layout = QFormLayout()
+        self.broken_image_path = ''
+        self.broken_image_path_label = QLabel('설정 안 함 (기본 이미지 사용)')
+        self.broken_image_path_label.setWordWrap(True)
+        error_layout.addRow('손상된 파일 대체 이미지:', self.broken_image_path_label)
+        broken_image_buttons = QHBoxLayout()
+        choose_broken_button = QPushButton('찾아보기...')
+        choose_broken_button.clicked.connect(self.choose_broken_image)
+        clear_broken_button = QPushButton('지우기')
+        clear_broken_button.clicked.connect(self.clear_broken_image)
+        broken_image_buttons.addWidget(choose_broken_button)
+        broken_image_buttons.addWidget(clear_broken_button)
+        error_layout.addRow('', broken_image_buttons)
+        error_note = QLabel('직접 이동 중 파일을 읽을 수 없으면 이 이미지가 대신 표시됩니다.\n슬라이드쇼 중에는 대신 자동으로 다음 이미지로 건너뜁니다.')
+        error_note.setWordWrap(True)
+        error_layout.addRow('', error_note)
+        error_group.setLayout(error_layout)
+        layout.addWidget(error_group)
         
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
@@ -969,9 +990,29 @@ class SettingsDialog(QDialog):
             self.slideshow_mode.setCurrentIndex(index)
         self.slideshow_interval.setValue(self.settings.get('slideshow_interval', 3))
         self.slideshow_gif_loops.setValue(self.settings.get('slideshow_gif_loops', 2))
+        self.broken_image_path = self.settings.get('broken_image_path', '')
+        self.update_broken_image_label()
         self.current_color = self.settings.get('background_color', '#2b2b2b')
         self.update_color_button()
     
+    def choose_broken_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '손상된 파일 대체 이미지 선택', '',
+            '이미지 파일 (*.png *.jpg *.jpeg *.gif *.webp)')
+        if path:
+            self.broken_image_path = path
+            self.update_broken_image_label()
+
+    def clear_broken_image(self):
+        self.broken_image_path = ''
+        self.update_broken_image_label()
+
+    def update_broken_image_label(self):
+        if self.broken_image_path:
+            self.broken_image_path_label.setText(self.broken_image_path)
+        else:
+            self.broken_image_path_label.setText('설정 안 함 (기본 이미지 사용)')
+
     def choose_color(self):
         color = QColorDialog.getColor()
         if color.isValid():
@@ -1000,6 +1041,7 @@ class SettingsDialog(QDialog):
             'slideshow_mode': self.slideshow_mode.currentData(),
             'slideshow_interval': self.slideshow_interval.value(),
             'slideshow_gif_loops': self.slideshow_gif_loops.value(),
+            'broken_image_path': self.broken_image_path,
             'background_color': self.current_color,
         })
         self.accept()
@@ -1100,6 +1142,7 @@ class ImageViewer(QMainWindow):
         self.slideshow.timeout.connect(self.next_image)
         self.slideshow_playing = False
         self.slideshow_mode = 'time'
+        self.slideshow_fail_streak = 0
         self.gif_loop_count = 0
         self.gif_max_loops = 2
         self.gif_frame_connected = False
@@ -1110,6 +1153,10 @@ class ImageViewer(QMainWindow):
         self.zoom_factor = 1.0
         self.fit_to_window = True
         self.current_movie = None
+        # Backing QBuffer for a movie built from in-memory bytes (a zip
+        # entry, since QMovie can't read a zip path directly). Must be kept
+        # alive for as long as the movie is; stop_current_movie() closes it.
+        self.current_movie_buffer = None
         self.current_movie_original_size = None
         self.current_movie_generation = 0
         self.animated_frame_cache = OrderedDict()
@@ -1121,6 +1168,7 @@ class ImageViewer(QMainWindow):
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
+        self._default_broken_pixmap_cache = None
         self.dragging = False
         self.drag_start_pos = None
         # Image panning: when zoomed beyond the viewport, drag the image itself.
@@ -1494,6 +1542,12 @@ class ImageViewer(QMainWindow):
             self.gif_frame_connected = False
             self.current_movie.stop()
             self.current_movie = None
+        if self.current_movie_buffer is not None:
+            try:
+                self.current_movie_buffer.close()
+            except:
+                pass
+            self.current_movie_buffer = None
         self.current_movie_original_size = None
         self.current_movie_generation += 1
         self.current_movie_frame = -1
@@ -1638,36 +1692,14 @@ class ImageViewer(QMainWindow):
             )
 
         if image is None or image.isNull():
-            # Never blank the viewer because a background decode failed.
-            # Retry the currently requested image once, after a short delay.
             if key == current_key:
-                count = self.load_retry_counts.get(key, 0)
-                if count < 1:
-                    self.load_retry_counts[key] = count + 1
-                    QTimer.singleShot(
-                        40,
-                        lambda k=key, g=self.load_generation:
-                            self._retry_current_load(k, g)
-                    )
-                else:
-                    self.load_retry_counts.pop(key, None)
-                    self.is_loading = False
+                self._retry_or_fail_current_load(key)
             return
 
         pixmap = QPixmap.fromImage(image)
         if pixmap.isNull():
             if key == current_key:
-                count = self.load_retry_counts.get(key, 0)
-                if count < 1:
-                    self.load_retry_counts[key] = count + 1
-                    QTimer.singleShot(
-                        40,
-                        lambda k=key, g=self.load_generation:
-                            self._retry_current_load(k, g)
-                    )
-                else:
-                    self.load_retry_counts.pop(key, None)
-                    self.is_loading = False
+                self._retry_or_fail_current_load(key)
             return
 
         self.load_retry_counts.pop(key, None)
@@ -1678,6 +1710,71 @@ class ImageViewer(QMainWindow):
         if key == current_key:
             self._display_pixmap(pixmap)
             self.is_loading = False
+            self.slideshow_fail_streak = 0
+
+    def _retry_or_fail_current_load(self, key):
+        # Never blank the viewer on the first failure -- retry the currently
+        # requested image once, after a short delay, in case it was just a
+        # transient read hiccup (e.g. a locked/still-being-written file).
+        count = self.load_retry_counts.get(key, 0)
+        if count < 1:
+            self.load_retry_counts[key] = count + 1
+            QTimer.singleShot(
+                40,
+                lambda k=key, g=self.load_generation:
+                    self._retry_current_load(k, g)
+            )
+        else:
+            self.load_retry_counts.pop(key, None)
+            self._handle_unreadable_current_image()
+
+    def _handle_unreadable_current_image(self):
+        # The retry above was also exhausted: the current file has a
+        # supported extension but its data genuinely can't be decoded
+        # (corrupted/truncated, etc). During a slideshow this must not just
+        # sit there waiting for a signal that will never come (this is what
+        # used to freeze a GIF-loop-mode slideshow, since a movie that never
+        # started never emits the frameChanged it needs to count loops) --
+        # skip past it automatically instead. While browsing manually,
+        # replace the stale previous frame with an explicit "broken image"
+        # placeholder rather than leaving old content on screen that looks
+        # like it belongs to this file.
+        self.is_loading = False
+        if self.slideshow_playing:
+            self.slideshow_fail_streak += 1
+            if self.slideshow_fail_streak > min(len(self.image_list), 200):
+                # Every remaining image is failing to load; stop instead of
+                # spinning through the whole list indefinitely.
+                self.stop_slideshow()
+                self._display_pixmap(self._get_broken_image_pixmap())
+                return
+            self.next_image()
+        else:
+            self._display_pixmap(self._get_broken_image_pixmap())
+
+    def _get_broken_image_pixmap(self):
+        path = self.settings.get('broken_image_path', '')
+        if path:
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                return pixmap
+        return self._default_broken_pixmap()
+
+    def _default_broken_pixmap(self):
+        if self._default_broken_pixmap_cache is None:
+            pixmap = QPixmap(400, 300)
+            pixmap.fill(QColor('#3c3c3c'))
+            painter = QPainter(pixmap)
+            try:
+                painter.setPen(QColor('#cccccc'))
+                font = painter.font()
+                font.setPointSize(13)
+                painter.setFont(font)
+                painter.drawText(pixmap.rect(), Qt.AlignCenter, '이미지를 불러올 수 없습니다')
+            finally:
+                painter.end()
+            self._default_broken_pixmap_cache = pixmap
+        return self._default_broken_pixmap_cache
 
     def _retry_current_load(self, key, generation):
         if generation != self.load_generation:
@@ -1732,6 +1829,77 @@ class ImageViewer(QMainWindow):
         self.image_label.setPixmap(pixmap)
         return True
 
+    def _load_animated_movie(self, current_file, ext):
+        """Try to load current_file as a playable QMovie (an animated gif,
+        or a webp with more than one frame). Works whether the file sits on
+        disk or inside the currently open zip -- QMovie can't read a zip
+        path directly, so a zip entry is read into memory first and handed
+        to QMovie through a QBuffer.
+
+        Returns (movie, buffer, frame_count_hint):
+          - movie is None both when the file isn't an animated gif/webp and
+            when it is one but couldn't actually be decoded (corrupted/
+            truncated data). Either way the caller should fall back to the
+            regular static-image path, which is also what surfaces a
+            genuine decode failure through the normal load-failure handling
+            (retry, then slideshow auto-skip / broken-image placeholder).
+          - buffer is the QBuffer backing a zip-sourced movie. It must be
+            kept alive (self.current_movie_buffer) for as long as the movie
+            is in use -- QMovie keeps reading frames from it as playback
+            advances, it doesn't copy the data up front. It's None for a
+            movie loaded straight from a real file path.
+          - frame_count_hint is Pillow's n_frames for an animated webp (see
+            _prewarm_animated_frames for why movie.frameCount() alone can't
+            be trusted for webp).
+        """
+        if ext not in ('.gif', '.webp'):
+            return None, None, 0
+
+        data = None
+        if self.current_zip:
+            try:
+                zf = ZipHandler._get_zip(self.current_zip)
+                with zf.open(current_file, 'r') as fp:
+                    data = fp.read()
+            except Exception:
+                return None, None, 0
+
+        frame_count_hint = 0
+        if ext == '.webp':
+            frame_count_hint = is_animated_webp(BytesIO(data) if data is not None else current_file)
+            if not frame_count_hint:
+                # A static (single-frame) webp: let the normal image path
+                # handle it instead of QMovie.
+                return None, None, 0
+
+        buffer = None
+        movie = None
+        try:
+            if data is not None:
+                buffer = QBuffer()
+                buffer.setData(QByteArray(data))
+                if not buffer.open(QIODevice.ReadOnly):
+                    return None, None, 0
+                movie = QMovie()
+                movie.setDevice(buffer)
+            else:
+                movie = QMovie(current_file)
+            if not movie.isValid():
+                raise ValueError('invalid movie')
+            movie.jumpToFrame(0)
+            first_frame = movie.currentPixmap()
+            if first_frame.isNull() or first_frame.width() <= 0:
+                raise ValueError('first frame failed to decode')
+        except Exception:
+            if buffer is not None:
+                try:
+                    buffer.close()
+                except Exception:
+                    pass
+            return None, None, 0
+
+        return movie, buffer, frame_count_hint
+
     def show_current_image(self):
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
             return
@@ -1749,49 +1917,50 @@ class ImageViewer(QMainWindow):
         # Animated GIF/WebP: keep QMovie for timing/decoding, but render each
         # frame through an in-memory filter when color adjustments are active.
         # Moving images use their own anim_* saturation/brightness/contrast
-        # settings, independent from the ones used for static images.
-        if not self.current_zip:
-            ext = os.path.splitext(current_file)[1].lower()
-            webp_frame_count = is_animated_webp(current_file) if ext == '.webp' else 0
-            if ext == '.gif' or webp_frame_count:
-                movie = ImageLoader.load_movie(current_file)
-                if movie:
-                    self.current_movie = movie
-                    self.current_movie_generation += 1
-                    movie_generation = self.current_movie_generation
-                    movie.jumpToFrame(0)
-                    self.current_movie_original_size = movie.currentPixmap().size()
-                    self.scroll_area.setWidgetResizable(self.fit_to_window)
-                    if self.current_movie_original_size.width() > 0:
-                        if self.fit_to_window:
-                            scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
-                        else:
-                            scaled_size = QSize(int(self.current_movie_original_size.width() * self.zoom_factor),
-                                                 int(self.current_movie_original_size.height() * self.zoom_factor))
-                        if scaled_size.width() > 0 and scaled_size.height() > 0:
-                            movie.setScaledSize(scaled_size)
-                    self.current_movie_frame = -1
-                    self.animated_frame_cache.clear()
-                    self.animated_prewarm_pending.pop(movie_generation, None)
-                    # A new movie must reconnect slideshow loop counting.
-                    if self.slideshow_playing and self.slideshow_mode == 'loop':
-                        self.connect_gif_loop()
-                    if anim_saturation == 100 and anim_brightness == 100 and anim_contrast == 100:
-                        movie.frameChanged.connect(self.on_animated_frame_changed)
-                        movie.start()
-                        self._render_animated_frame(movie.currentFrameNumber(), movie_generation)
-                    else:
-                        # Color adjustment is active: render every frame once
-                        # in the background pool and fill the cache before
-                        # starting playback, instead of racing Pillow against
-                        # the frame timer on every loop. That race is what
-                        # caused stutter/dropped frames when navigating
-                        # between animated images with saturation/brightness/
-                        # contrast turned on.
-                        self._prewarm_animated_frames(movie, movie_generation, anim_saturation, anim_brightness, anim_contrast,
-                                                       frame_count_hint=webp_frame_count or None)
-                    self.is_loading = False
-                    return
+        # settings, independent from the ones used for static images. This
+        # works the same way for a file inside a zip as for one on disk --
+        # _load_animated_movie reads the zip entry into memory and hands
+        # QMovie a QBuffer instead of a file path.
+        ext = os.path.splitext(current_file)[1].lower()
+        movie, movie_buffer, webp_frame_count = self._load_animated_movie(current_file, ext)
+        if movie:
+            self.current_movie = movie
+            self.current_movie_buffer = movie_buffer
+            self.current_movie_generation += 1
+            movie_generation = self.current_movie_generation
+            self.current_movie_original_size = movie.currentPixmap().size()
+            self.scroll_area.setWidgetResizable(self.fit_to_window)
+            if self.current_movie_original_size.width() > 0:
+                if self.fit_to_window:
+                    scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                else:
+                    scaled_size = QSize(int(self.current_movie_original_size.width() * self.zoom_factor),
+                                         int(self.current_movie_original_size.height() * self.zoom_factor))
+                if scaled_size.width() > 0 and scaled_size.height() > 0:
+                    movie.setScaledSize(scaled_size)
+            self.current_movie_frame = -1
+            self.animated_frame_cache.clear()
+            self.animated_prewarm_pending.pop(movie_generation, None)
+            self.slideshow_fail_streak = 0
+            # A new movie must reconnect slideshow loop counting.
+            if self.slideshow_playing and self.slideshow_mode == 'loop':
+                self.connect_gif_loop()
+            if anim_saturation == 100 and anim_brightness == 100 and anim_contrast == 100:
+                movie.frameChanged.connect(self.on_animated_frame_changed)
+                movie.start()
+                self._render_animated_frame(movie.currentFrameNumber(), movie_generation)
+            else:
+                # Color adjustment is active: render every frame once
+                # in the background pool and fill the cache before
+                # starting playback, instead of racing Pillow against
+                # the frame timer on every loop. That race is what
+                # caused stutter/dropped frames when navigating
+                # between animated images with saturation/brightness/
+                # contrast turned on.
+                self._prewarm_animated_frames(movie, movie_generation, anim_saturation, anim_brightness, anim_contrast,
+                                               frame_count_hint=webp_frame_count or None)
+            self.is_loading = False
+            return
 
         max_size = self._target_decode_size()
         key = self._cache_key(current_file, saturation, brightness, contrast, max_size)
