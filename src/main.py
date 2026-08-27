@@ -921,7 +921,7 @@ class SettingsDialog(QDialog):
         broken_image_buttons.addWidget(choose_broken_button)
         broken_image_buttons.addWidget(clear_broken_button)
         error_layout.addRow('', broken_image_buttons)
-        error_note = QLabel('.')
+        error_note = QLabel()
         error_note.setWordWrap(True)
         error_layout.addRow('', error_note)
         error_group.setLayout(error_layout)
