@@ -2207,12 +2207,23 @@ class ImageViewer(QMainWindow):
         total = self.prefetch_frame_count or self.current_movie.frameCount()
         if not total or total <= 1:
             return
+        # Backpressure: if the worker pool is already as busy as it can
+        # usefully be (e.g. a large/zoomed frame is taking a while), don't
+        # pile speculative work on top of it -- that only pushes the frame
+        # that's actually about to be displayed further back in the queue,
+        # which is what made zoomed-in playback feel *slower* than before
+        # prefetching existed. Just skip this round; the next real frame
+        # change will try again once things free up.
+        if len(self.animated_inflight_keys) >= _ANIM_WORKER_COUNT:
+            return
         generation = self.current_movie_generation
         for step in range(1, self.anim_lookahead + 1):
             target = (frame_number + step) % total
             key = self._animated_cache_key(target)
             if key in self.animated_frame_cache or key in self.animated_inflight_keys:
                 continue
+            if len(self.animated_inflight_keys) >= _ANIM_WORKER_COUNT:
+                break
             try:
                 if not self.prefetch_movie.jumpToFrame(target):
                     continue
@@ -2298,6 +2309,16 @@ class ImageViewer(QMainWindow):
                                            int(original_size.height() * self.zoom_factor))
                     if scaled_size.width() > 0 and scaled_size.height() > 0:
                         self.current_movie.setScaledSize(scaled_size)
+                        # The look-ahead movie must track every size change
+                        # the live movie gets, or it keeps decoding frames
+                        # at the old size while _animated_cache_key already
+                        # reflects the new zoom/window size -- the cache
+                        # then holds wrong-sized pixels filed under a
+                        # "correct size" key, which is what made zoom look
+                        # like it randomly reset in-loop and made window
+                        # resizes during playback appear to do nothing.
+                        if self.prefetch_movie:
+                            self.prefetch_movie.setScaledSize(scaled_size)
                     self.current_movie_frame = self.current_movie.currentFrameNumber()
                     self._render_animated_frame(self.current_movie_frame, self.current_movie_generation)
             except:
