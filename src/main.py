@@ -954,7 +954,7 @@ class SettingsDialog(QDialog):
         broken_image_buttons.addWidget(choose_broken_button)
         broken_image_buttons.addWidget(clear_broken_button)
         error_layout.addRow('', broken_image_buttons)
-        error_note = QLabel('직접 이동 중 파일을 읽을 수 없으면 이 이미지가 대신 표시됩니다.\n슬라이드쇼 중에는 대신 자동으로 다음 이미지로 건너뜁니다.')
+        error_note = QLabel()
         error_note.setWordWrap(True)
         error_layout.addRow('', error_note)
         error_group.setLayout(error_layout)
