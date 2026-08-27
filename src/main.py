@@ -261,10 +261,21 @@ class Settings:
 # low-core machines.
 _DECODE_WORKER_COUNT = max(2, min(8, (os.cpu_count() or 4)))
 
+# Animated-frame color processing gets its own small pool, separate from
+# _executor above (which handles static-image decode/preload). Without this
+# split, playing a color-adjusted gif/webp while neighboring images preload
+# in the background makes both compete for the same workers -- the
+# animation stalls waiting behind preload jobs and preload slows down too.
+# Kept small (1-3) on purpose: only one frame is ever "live" per movie plus
+# a couple of look-ahead frames, so extra workers here wouldn't speed up a
+# single animation, they'd just take workers away from the shared pool.
+_ANIM_WORKER_COUNT = max(1, min(3, (os.cpu_count() or 4) // 2))
+
 class ImageLoader:
     _shutdown = False
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=_DECODE_WORKER_COUNT)
+    _anim_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_WORKER_COUNT)
 
     @staticmethod
     def is_supported(filename):
@@ -335,11 +346,18 @@ class ImageLoader:
             cls._executor.shutdown(wait=True)
         except Exception:
             pass
+        try:
+            cls._anim_executor.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            cls._anim_executor.shutdown(wait=True)
+        except Exception:
+            pass
 
     @classmethod
     def restart_executor(cls):
         if cls._shutdown:
             cls._executor = concurrent.futures.ThreadPoolExecutor(max_workers=_DECODE_WORKER_COUNT)
+            cls._anim_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_WORKER_COUNT)
             cls._shutdown = False
 
     @staticmethod
@@ -1157,16 +1175,24 @@ class ImageViewer(QMainWindow):
         self.current_movie_buffer = None
         self.current_movie_original_size = None
         self.current_movie_generation = 0
-        # Color-adjusted animated frames at their native (undecoded-scale)
-        # resolution, keyed by frame number + anim_* settings only -- NOT by
-        # window size or zoom. See _render_animated_frame /
-        # _display_animated_source: this is what lets a resize or zoom
-        # change skip Pillow entirely for a frame already processed once and
-        # only pay for a cheap Qt-level rescale.
-        self.animated_source_cache = OrderedDict()
+        self.animated_frame_cache = OrderedDict()
         self.animated_frame_cache_limit = 24
-        self.animated_processing_keys = set()
         self.current_movie_frame = -1
+        # A second, unstarted QMovie built from the exact same source as
+        # current_movie, used only to jumpToFrame() a few frames ahead and
+        # hand those frames to the anim worker pool for color processing
+        # *before* playback reaches them. It decodes through the same Qt
+        # plugin with the same setScaledSize(), so prefetched frames are
+        # pixel-identical to what the live movie would have produced --
+        # unlike re-decoding with Pillow, which could scale slightly
+        # differently. Keys already in animated_frame_cache/in-flight are
+        # skipped, so this only ever does extra work that would otherwise
+        # have been done later anyway, just earlier.
+        self.prefetch_movie = None
+        self.prefetch_buffer = None
+        self.prefetch_frame_count = None
+        self.anim_lookahead = 2
+        self.animated_inflight_keys = set()
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
@@ -1287,7 +1313,7 @@ class ImageViewer(QMainWindow):
             'anim_contrast': anim_contrast,
         })
         # No cache_manager.clear() here: every cache key already includes
-        # saturation/brightness/contrast (see _cache_key / _animated_source_cache_key),
+        # saturation/brightness/contrast (see _cache_key / _animated_cache_key),
         # so entries made under the old values simply stop being matched
         # instead of needing eviction -- and leaving them in place means
         # flipping back to a value used earlier (or an image already
@@ -1550,12 +1576,25 @@ class ImageViewer(QMainWindow):
             except:
                 pass
             self.current_movie_buffer = None
+        if self.prefetch_movie is not None:
+            try:
+                self.prefetch_movie.stop()
+            except:
+                pass
+            self.prefetch_movie = None
+        if self.prefetch_buffer is not None:
+            try:
+                self.prefetch_buffer.close()
+            except:
+                pass
+            self.prefetch_buffer = None
+        self.prefetch_frame_count = None
+        self.animated_inflight_keys.clear()
         self.current_movie_original_size = None
         self.current_movie_generation += 1
         self.current_movie_frame = -1
         self.gif_last_frame = -1
-        self.animated_source_cache.clear()
-        self.animated_processing_keys.clear()
+        self.animated_frame_cache.clear()
     
     def _cache_key(self, filepath, saturation, brightness, contrast, max_size):
         size_key = 'full' if not max_size else f'{max_size[0]}x{max_size[1]}'
@@ -1857,9 +1896,15 @@ class ImageViewer(QMainWindow):
             animated webp files). It's None for a gif; movie.frameCount()
             is reliable for Qt's own gif plugin, so callers can just use
             that directly instead.
+          - source is the raw bytes read from the zip entry (or None when
+            the file was read straight from current_file on disk). Callers
+            that want a second, independent QMovie on the same data (e.g.
+            for frame look-ahead) can pass this straight back into
+            _build_qmovie() -- re-reading the zip entry a second time is
+            avoided since the bytes are already in memory here.
         """
         if ext not in ('.gif', '.webp'):
-            return None, None, None
+            return None, None, None, None
 
         data = None
         if self.current_zip:
@@ -1868,7 +1913,7 @@ class ImageViewer(QMainWindow):
                 with zf.open(current_file, 'r') as fp:
                     data = fp.read()
             except Exception:
-                return None, None, None
+                return None, None, None, None
 
         frame_count = None
         if ext == '.webp':
@@ -1877,8 +1922,19 @@ class ImageViewer(QMainWindow):
             # path instead of QMovie.
             frame_count = is_animated_webp(BytesIO(data) if data is not None else current_file)
             if not frame_count:
-                return None, None, None
+                return None, None, None, None
 
+        movie, buffer = self._build_qmovie(current_file, data)
+        if movie is None:
+            return None, None, None, None
+
+        return movie, buffer, frame_count, data
+
+    def _build_qmovie(self, current_file, data):
+        """Build one playable QMovie from either raw bytes (data, for a zip
+        entry) or a path on disk (current_file, when data is None). Used
+        both for the live/display movie and for the independent look-ahead
+        movie in show_current_image, so the two always decode identically."""
         buffer = None
         movie = None
         try:
@@ -1886,7 +1942,7 @@ class ImageViewer(QMainWindow):
                 buffer = QBuffer()
                 buffer.setData(QByteArray(data))
                 if not buffer.open(QIODevice.ReadOnly):
-                    return None, None, None
+                    return None, None
                 movie = QMovie()
                 movie.setDevice(buffer)
             else:
@@ -1903,9 +1959,9 @@ class ImageViewer(QMainWindow):
                     buffer.close()
                 except Exception:
                     pass
-            return None, None, None
+            return None, None
 
-        return movie, buffer, frame_count
+        return movie, buffer
 
     def show_current_image(self):
         if not self.image_list or self.current_index < 0 or self.current_index >= len(self.image_list):
@@ -1918,22 +1974,17 @@ class ImageViewer(QMainWindow):
         brightness = self.settings.get('brightness', 100)
         contrast = self.settings.get('contrast', 100)
 
-        # Animated GIF/WebP: keep QMovie for timing/decoding at the file's
-        # native resolution -- we never call setScaledSize, see
-        # _display_animated_source -- and render each frame through an
-        # in-memory filter on demand as it plays. The color-adjusted result
-        # is cached by frame number + anim_* settings only (see
-        # _animated_source_cache_key), independent of window size/zoom, so
-        # repeat loops AND resizes/zooms are free: only the cheap final
-        # Qt-level rescale-to-display-size runs again, never the Pillow
-        # work. This works the same way for a file inside a zip as for one
-        # on disk -- _load_animated_movie reads the zip entry into memory
-        # and hands QMovie a QBuffer instead of a file path. Moving images
-        # use their own anim_* saturation/brightness/contrast settings,
-        # independent from the ones used for static images (see
-        # _render_animated_frame).
+        # Animated GIF/WebP: keep QMovie for timing/decoding, and render each
+        # frame through an in-memory filter on demand as it plays (only the
+        # frame currently on screen is ever processed, cached by frame
+        # number + anim_* settings so repeat loops are free). This works the
+        # same way for a file inside a zip as for one on disk --
+        # _load_animated_movie reads the zip entry into memory and hands
+        # QMovie a QBuffer instead of a file path. Moving images use their
+        # own anim_* saturation/brightness/contrast settings, independent
+        # from the ones used for static images (see _render_animated_frame).
         ext = os.path.splitext(current_file)[1].lower()
-        movie, movie_buffer, known_frame_count = self._load_animated_movie(current_file, ext)
+        movie, movie_buffer, known_frame_count, movie_source = self._load_animated_movie(current_file, ext)
         if movie:
             self.current_movie = movie
             self.current_movie_buffer = movie_buffer
@@ -1941,9 +1992,19 @@ class ImageViewer(QMainWindow):
             movie_generation = self.current_movie_generation
             self.current_movie_original_size = movie.currentPixmap().size()
             self.scroll_area.setWidgetResizable(self.fit_to_window)
+            scaled_size = None
+            if self.current_movie_original_size.width() > 0:
+                if self.fit_to_window:
+                    scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                else:
+                    scaled_size = QSize(int(self.current_movie_original_size.width() * self.zoom_factor),
+                                         int(self.current_movie_original_size.height() * self.zoom_factor))
+                if scaled_size.width() > 0 and scaled_size.height() > 0:
+                    movie.setScaledSize(scaled_size)
+                else:
+                    scaled_size = None
             self.current_movie_frame = -1
-            self.animated_source_cache.clear()
-            self.animated_processing_keys.clear()
+            self.animated_frame_cache.clear()
             self.slideshow_fail_streak = 0
 
             # Size the frame cache to fit the animation's whole loop
@@ -1956,12 +2017,10 @@ class ImageViewer(QMainWindow):
             # frames get evicted before their next loop could reuse them,
             # so color processing (and the staleness that comes with it)
             # never actually settled down no matter how long you waited.
-            # Sized off the *native* frame dimensions, since that's the
-            # resolution the cached color-adjusted source is stored at.
             frame_count = known_frame_count or movie.frameCount()
-            w = self.current_movie_original_size.width()
-            h = self.current_movie_original_size.height()
             if frame_count and frame_count > 0:
+                w = scaled_size.width() if scaled_size else self.current_movie_original_size.width()
+                h = scaled_size.height() if scaled_size else self.current_movie_original_size.height()
                 if w > 0 and h > 0:
                     bytes_per_frame = w * h * 4
                     budget = 800 * 1024 * 1024  # ~800MB ceiling for this cache
@@ -1972,13 +2031,23 @@ class ImageViewer(QMainWindow):
             else:
                 self.animated_frame_cache_limit = 24
 
+            self.prefetch_frame_count = frame_count if frame_count and frame_count > 0 else None
+            # Independent look-ahead movie: same source, same scaled size,
+            # never started/played. jumpToFrame() on it is used purely to
+            # decode a future frame for background color processing before
+            # the live movie actually reaches it (see _prefetch_ahead).
+            self.prefetch_movie, self.prefetch_buffer = self._build_qmovie(current_file, movie_source)
+            if self.prefetch_movie and scaled_size:
+                self.prefetch_movie.setScaledSize(scaled_size)
+
             # A new movie must reconnect slideshow loop counting.
             if self.slideshow_playing and self.slideshow_mode == 'loop':
                 self.connect_gif_loop()
             movie.frameChanged.connect(self.on_animated_frame_changed)
             movie.start()
-            self.current_movie_frame = movie.currentFrameNumber()
-            self._render_animated_frame(self.current_movie_frame, movie_generation)
+            start_frame = movie.currentFrameNumber()
+            self._render_animated_frame(start_frame, movie_generation)
+            self._prefetch_ahead(start_frame)
             self.is_loading = False
             return
 
@@ -1998,22 +2067,25 @@ class ImageViewer(QMainWindow):
         self._submit_image_load(self.current_index, generation)
         self._preload_neighbors()
 
-    def _animated_source_cache_key(self, frame_number):
-        # Deliberately excludes window size, zoom, and fit_to_window: this
-        # caches the color-adjusted frame at its native resolution, so a
-        # resize or zoom never has to redo the Pillow work for a frame
-        # that's already been processed once. Only the frame number and the
-        # anim_* adjustment settings can invalidate an entry.
+    def _animated_cache_key(self, frame_number):
         return (frame_number,
                 self.settings.get('anim_saturation', 100),
                 self.settings.get('anim_brightness', 100),
-                self.settings.get('anim_contrast', 100))
+                self.settings.get('anim_contrast', 100),
+                self.fit_to_window,
+                self.zoom_factor,
+                self.scroll_area.size().width(),
+                self.scroll_area.size().height())
 
     def on_animated_frame_changed(self, frame_number):
         if not self.current_movie:
             return
         self.current_movie_frame = frame_number
         self._render_animated_frame(frame_number, self.current_movie_generation)
+        # Keep the next couple of frames a step ahead of playback so their
+        # color processing is already sitting in cache by the time the
+        # movie actually reaches them, instead of starting cold each time.
+        self._prefetch_ahead(frame_number)
 
     def _render_animated_frame(self, frame_number, generation):
         if not self.current_movie or generation != self.current_movie_generation:
@@ -2024,43 +2096,47 @@ class ImageViewer(QMainWindow):
             qimage = movie.currentPixmap().toImage()
         if qimage.isNull():
             return
+        key = self._animated_cache_key(frame_number)
+        cached = self.animated_frame_cache.get(key)
+        if cached is not None:
+            self.animated_frame_cache.move_to_end(key)
+            self.current_pixmap = cached
+            self.image_label.setPixmap(cached)
+            self.image_label.adjustSize()
+            return
 
         saturation = self.settings.get('anim_saturation', 100)
         brightness = self.settings.get('anim_brightness', 100)
         contrast = self.settings.get('anim_contrast', 100)
-
         if saturation == 100 and brightness == 100 and contrast == 100:
-            # No adjustment: the decoded frame is already the display source.
-            self._display_animated_source(qimage, frame_number, generation)
+            pixmap = QPixmap.fromImage(qimage)
+            self._store_animated_frame(key, pixmap)
+            self.current_pixmap = pixmap
+            self.image_label.setPixmap(pixmap)
+            self.image_label.adjustSize()
             return
 
-        # The color-adjusted source is cached by frame + anim settings only
-        # (see _animated_source_cache_key). A resize/zoom that lands here for
-        # an already-processed frame just rescales the cached result below --
-        # it never repeats the Pillow work.
-        src_key = self._animated_source_cache_key(frame_number)
-        cached_source = self.animated_source_cache.get(src_key)
-        if cached_source is not None:
-            self.animated_source_cache.move_to_end(src_key)
-            self._display_animated_source(cached_source, frame_number, generation)
+        # A look-ahead prefetch may already be processing this exact frame;
+        # if so just wait for that result instead of computing it twice.
+        if key in self.animated_inflight_keys:
             return
+        self._submit_animated_frame_processing(qimage, frame_number, generation, key)
 
-        if src_key in self.animated_processing_keys:
-            # Already computing this exact frame+settings combo (e.g. a
-            # second resize/zoom tick fired before the first result came
-            # back) -- don't queue duplicate Pillow work for it.
-            return
-        self.animated_processing_keys.add(src_key)
-
-        # Process the current frame in the worker pool. QMovie itself remains
-        # on the GUI thread because it is a Qt object. The expensive Pillow
+    def _submit_animated_frame_processing(self, qimage, frame_number, generation, key):
+        # Process the frame in the anim worker pool (kept separate from the
+        # static-image pool -- see _ANIM_WORKER_COUNT). QMovie itself stays
+        # on the GUI thread because it's a Qt object; the expensive Pillow
         # color work happens off the UI thread and never creates a temp file.
+        saturation = self.settings.get('anim_saturation', 100)
+        brightness = self.settings.get('anim_brightness', 100)
+        contrast = self.settings.get('anim_contrast', 100)
         try:
             rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
             w, h = rgba.width(), rgba.height()
             ptr = rgba.bits()
             ptr.setsize(rgba.byteCount())
             raw = bytes(ptr)
+            self.animated_inflight_keys.add(key)
             def worker():
                 try:
                     from PIL import Image
@@ -2071,8 +2147,8 @@ class ImageViewer(QMainWindow):
                     return out.tobytes('raw', 'RGBA'), w, h
                 except Exception:
                     return None
-            future = ImageLoader._executor.submit(worker)
-            def done(fut, gen=generation, frame=frame_number, key=src_key):
+            future = ImageLoader._anim_executor.submit(worker)
+            def done(fut, gen=generation, frame=frame_number, key=key):
                 try:
                     result = fut.result()
                 except Exception:
@@ -2080,55 +2156,65 @@ class ImageViewer(QMainWindow):
                 self.load_bridge.animated_frame.emit(gen, frame, (key, result))
             future.add_done_callback(done)
         except Exception:
-            self.animated_processing_keys.discard(src_key)
+            self.animated_inflight_keys.discard(key)
 
-    def _display_animated_source(self, image, frame_number, generation):
-        # image is a QImage/QPixmap at the movie's native resolution
-        # (already color-adjusted if needed). Scaling it to the current
-        # display size happens here, every time this is called -- on a
-        # resize or zoom this rescale is the ONLY work that repeats. It's a
-        # plain Qt scale, not Pillow, so it's the same cost class the
-        # static-image path already pays on every resize tick.
-        if generation != self.current_movie_generation or self.current_movie_frame != frame_number:
+    def _prefetch_ahead(self, frame_number):
+        """Decode the next anim_lookahead frames on the paused prefetch
+        movie and hand them to the worker pool now, so they're ready in
+        animated_frame_cache before playback actually reaches them."""
+        if not self.prefetch_movie or not self.current_movie:
             return
-        target = self._current_movie_target_size()
-        if target is None or target.width() <= 0 or target.height() <= 0:
+        # No adjustment active: the live path takes a free instant fast path
+        # (QPixmap.fromImage with no Pillow round-trip), so there's nothing
+        # worth precomputing here.
+        if (self.settings.get('anim_saturation', 100) == 100
+                and self.settings.get('anim_brightness', 100) == 100
+                and self.settings.get('anim_contrast', 100) == 100):
             return
-        pixmap = image if isinstance(image, QPixmap) else QPixmap.fromImage(image)
-        quality = Qt.FastTransformation if self.settings.get('zoom_quality', 'balanced') == 'speed' else Qt.SmoothTransformation
-        scaled = pixmap.scaled(target, Qt.KeepAspectRatio, quality)
-        self.current_pixmap = scaled
-        self.image_label.setPixmap(scaled)
-        self.image_label.adjustSize()
-
-    def _current_movie_target_size(self):
-        original_size = self.current_movie_original_size
-        if not original_size or original_size.width() <= 0 or original_size.height() <= 0:
-            return None
-        if self.fit_to_window:
-            return original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
-        return QSize(int(original_size.width() * self.zoom_factor),
-                     int(original_size.height() * self.zoom_factor))
+        total = self.prefetch_frame_count or self.current_movie.frameCount()
+        if not total or total <= 1:
+            return
+        generation = self.current_movie_generation
+        for step in range(1, self.anim_lookahead + 1):
+            target = (frame_number + step) % total
+            key = self._animated_cache_key(target)
+            if key in self.animated_frame_cache or key in self.animated_inflight_keys:
+                continue
+            try:
+                if not self.prefetch_movie.jumpToFrame(target):
+                    continue
+                qimage = self.prefetch_movie.currentImage()
+                if qimage.isNull():
+                    qimage = self.prefetch_movie.currentPixmap().toImage()
+                if qimage.isNull():
+                    continue
+            except Exception:
+                continue
+            self._submit_animated_frame_processing(qimage, target, generation, key)
 
     def _on_animated_frame_ready(self, generation, frame_number, payload):
         key, result = payload
-        self.animated_processing_keys.discard(key)
+        self.animated_inflight_keys.discard(key)
         if generation != self.current_movie_generation or not self.current_movie:
             return
         if not result:
             return
         raw, w, h = result
         qimg = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888).copy()
-        if qimg.isNull():
+        pixmap = QPixmap.fromImage(qimg)
+        if pixmap.isNull():
             return
-        self._store_animated_source(key, qimg)
-        self._display_animated_source(qimg, frame_number, generation)
+        self._store_animated_frame(key, pixmap)
+        if self.current_movie_frame == frame_number:
+            self.current_pixmap = pixmap
+            self.image_label.setPixmap(pixmap)
+            self.image_label.adjustSize()
 
-    def _store_animated_source(self, key, image):
-        self.animated_source_cache[key] = image
-        self.animated_source_cache.move_to_end(key)
-        while len(self.animated_source_cache) > self.animated_frame_cache_limit:
-            self.animated_source_cache.popitem(last=False)
+    def _store_animated_frame(self, key, pixmap):
+        self.animated_frame_cache[key] = pixmap
+        self.animated_frame_cache.move_to_end(key)
+        while len(self.animated_frame_cache) > self.animated_frame_cache_limit:
+            self.animated_frame_cache.popitem(last=False)
 
     def connect_gif_loop(self):
         if self.current_movie and not self.gif_frame_connected:
@@ -2165,19 +2251,22 @@ class ImageViewer(QMainWindow):
         self.scroll_area.setWidgetResizable(self.fit_to_window)
         if self.current_movie:
             try:
-                if not self.current_movie_original_size or self.current_movie_original_size.width() <= 0:
+                if self.current_movie_original_size and self.current_movie_original_size.width() > 0:
+                    original_size = self.current_movie_original_size
+                else:
                     original_size = self.current_movie.currentPixmap().size()
                     if original_size.width() > 0:
                         self.current_movie_original_size = original_size
-                # No setScaledSize call here: the movie always decodes at its
-                # native resolution, and _render_animated_frame /
-                # _display_animated_source handle scaling to the current
-                # display size. Since the color-adjusted source is cached by
-                # frame + anim settings only (not by size), calling this on
-                # every resize/zoom tick is cheap -- it hits that cache and
-                # only pays for a Qt-level rescale, never Pillow.
-                self.current_movie_frame = self.current_movie.currentFrameNumber()
-                self._render_animated_frame(self.current_movie_frame, self.current_movie_generation)
+                if original_size.width() > 0 and original_size.height() > 0:
+                    if self.fit_to_window:
+                        scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                    else:
+                        scaled_size = QSize(int(original_size.width() * self.zoom_factor),
+                                           int(original_size.height() * self.zoom_factor))
+                    if scaled_size.width() > 0 and scaled_size.height() > 0:
+                        self.current_movie.setScaledSize(scaled_size)
+                    self.current_movie_frame = self.current_movie.currentFrameNumber()
+                    self._render_animated_frame(self.current_movie_frame, self.current_movie_generation)
             except:
                 pass
             return
