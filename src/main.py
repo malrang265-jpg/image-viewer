@@ -193,6 +193,9 @@ class Settings:
             'saturation': 100,
             'brightness': 100,
             'contrast': 100,
+            'anim_saturation': 100,
+            'anim_brightness': 100,
+            'anim_contrast': 100,
             'slideshow_interval': 3,
             'slideshow_mode': 'time',
             'slideshow_gif_loops': 2,
@@ -780,9 +783,9 @@ class SettingsDialog(QDialog):
         display_group.setLayout(display_layout)
         layout.addWidget(display_group)
         
-        adjust_group = QGroupBox('이미지 조절')
-        adjust_layout = QFormLayout()
-        
+        static_adjust_group = QGroupBox('정지 이미지 조절')
+        static_adjust_layout = QFormLayout()
+
         self.saturation_slider = QSlider(Qt.Horizontal)
         self.saturation_slider.setRange(0, 200)
         self.saturation_slider.setValue(100)
@@ -790,8 +793,8 @@ class SettingsDialog(QDialog):
         saturation_row = QHBoxLayout()
         saturation_row.addWidget(self.saturation_slider)
         saturation_row.addWidget(self.saturation_label)
-        adjust_layout.addRow('채도:', saturation_row)
-        
+        static_adjust_layout.addRow('채도:', saturation_row)
+
         self.brightness_slider = QSlider(Qt.Horizontal)
         self.brightness_slider.setRange(0, 200)
         self.brightness_slider.setValue(100)
@@ -799,8 +802,8 @@ class SettingsDialog(QDialog):
         brightness_row = QHBoxLayout()
         brightness_row.addWidget(self.brightness_slider)
         brightness_row.addWidget(self.brightness_label)
-        adjust_layout.addRow('밝기:', brightness_row)
-        
+        static_adjust_layout.addRow('밝기:', brightness_row)
+
         self.contrast_slider = QSlider(Qt.Horizontal)
         self.contrast_slider.setRange(0, 200)
         self.contrast_slider.setValue(100)
@@ -808,18 +811,55 @@ class SettingsDialog(QDialog):
         contrast_row = QHBoxLayout()
         contrast_row.addWidget(self.contrast_slider)
         contrast_row.addWidget(self.contrast_label)
-        adjust_layout.addRow('명도/대비:', contrast_row)
+        static_adjust_layout.addRow('명도/대비:', contrast_row)
 
-        reset_adjust_button = QPushButton('채도·밝기·명도 초기화')
+        reset_adjust_button = QPushButton('정지 이미지 조절 초기화')
         reset_adjust_button.clicked.connect(self.reset_adjustments)
-        adjust_layout.addRow('', reset_adjust_button)
-        
+        static_adjust_layout.addRow('', reset_adjust_button)
+
+        static_adjust_group.setLayout(static_adjust_layout)
+        layout.addWidget(static_adjust_group)
+
+        anim_adjust_group = QGroupBox('움직이는 이미지 조절 (GIF·애니메이션 WebP)')
+        anim_adjust_layout = QFormLayout()
+
+        self.anim_saturation_slider = QSlider(Qt.Horizontal)
+        self.anim_saturation_slider.setRange(0, 200)
+        self.anim_saturation_slider.setValue(100)
+        self.anim_saturation_label = QLabel('100%')
+        anim_saturation_row = QHBoxLayout()
+        anim_saturation_row.addWidget(self.anim_saturation_slider)
+        anim_saturation_row.addWidget(self.anim_saturation_label)
+        anim_adjust_layout.addRow('채도:', anim_saturation_row)
+
+        self.anim_brightness_slider = QSlider(Qt.Horizontal)
+        self.anim_brightness_slider.setRange(0, 200)
+        self.anim_brightness_slider.setValue(100)
+        self.anim_brightness_label = QLabel('100%')
+        anim_brightness_row = QHBoxLayout()
+        anim_brightness_row.addWidget(self.anim_brightness_slider)
+        anim_brightness_row.addWidget(self.anim_brightness_label)
+        anim_adjust_layout.addRow('밝기:', anim_brightness_row)
+
+        self.anim_contrast_slider = QSlider(Qt.Horizontal)
+        self.anim_contrast_slider.setRange(0, 200)
+        self.anim_contrast_slider.setValue(100)
+        self.anim_contrast_label = QLabel('100%')
+        anim_contrast_row = QHBoxLayout()
+        anim_contrast_row.addWidget(self.anim_contrast_slider)
+        anim_contrast_row.addWidget(self.anim_contrast_label)
+        anim_adjust_layout.addRow('명도/대비:', anim_contrast_row)
+
+        reset_anim_adjust_button = QPushButton('움직이는 이미지 조절 초기화')
+        reset_anim_adjust_button.clicked.connect(self.reset_anim_adjustments)
+        anim_adjust_layout.addRow('', reset_anim_adjust_button)
+
+        anim_adjust_group.setLayout(anim_adjust_layout)
+        layout.addWidget(anim_adjust_group)
+
         apply_button = QPushButton('현재 이미지에 즉시 적용')
         apply_button.clicked.connect(self.apply_immediately)
-        adjust_layout.addRow('', apply_button)
-        
-        adjust_group.setLayout(adjust_layout)
-        layout.addWidget(adjust_group)
+        layout.addWidget(apply_button)
         
         snap_group = QGroupBox('창 자석 기능')
         snap_layout = QFormLayout()
@@ -871,11 +911,23 @@ class SettingsDialog(QDialog):
             lambda v: self.brightness_label.setText(f'{v}%'))
         self.contrast_slider.valueChanged.connect(
             lambda v: self.contrast_label.setText(f'{v}%'))
+        self.anim_saturation_slider.valueChanged.connect(
+            lambda v: self.anim_saturation_label.setText(f'{v}%'))
+        self.anim_brightness_slider.valueChanged.connect(
+            lambda v: self.anim_brightness_label.setText(f'{v}%'))
+        self.anim_contrast_slider.valueChanged.connect(
+            lambda v: self.anim_contrast_label.setText(f'{v}%'))
     
     def reset_adjustments(self):
         self.saturation_slider.setValue(100)
         self.brightness_slider.setValue(100)
         self.contrast_slider.setValue(100)
+        self.apply_immediately()
+
+    def reset_anim_adjustments(self):
+        self.anim_saturation_slider.setValue(100)
+        self.anim_brightness_slider.setValue(100)
+        self.anim_contrast_slider.setValue(100)
         self.apply_immediately()
 
     def apply_immediately(self):
@@ -884,7 +936,10 @@ class SettingsDialog(QDialog):
             parent.apply_image_adjustments(
                 self.saturation_slider.value(),
                 self.brightness_slider.value(),
-                self.contrast_slider.value()
+                self.contrast_slider.value(),
+                self.anim_saturation_slider.value(),
+                self.anim_brightness_slider.value(),
+                self.anim_contrast_slider.value()
             )
     
     def load_settings(self):
@@ -903,6 +958,9 @@ class SettingsDialog(QDialog):
         self.saturation_slider.setValue(self.settings.get('saturation', 100))
         self.brightness_slider.setValue(self.settings.get('brightness', 100))
         self.contrast_slider.setValue(self.settings.get('contrast', 100))
+        self.anim_saturation_slider.setValue(self.settings.get('anim_saturation', 100))
+        self.anim_brightness_slider.setValue(self.settings.get('anim_brightness', 100))
+        self.anim_contrast_slider.setValue(self.settings.get('anim_contrast', 100))
         self.snap_enabled.setChecked(self.settings.get('snap_enabled', True))
         self.snap_threshold.setValue(self.settings.get('snap_threshold', 20))
         mode = self.settings.get('slideshow_mode', 'time')
@@ -934,6 +992,9 @@ class SettingsDialog(QDialog):
             'saturation': self.saturation_slider.value(),
             'brightness': self.brightness_slider.value(),
             'contrast': self.contrast_slider.value(),
+            'anim_saturation': self.anim_saturation_slider.value(),
+            'anim_brightness': self.anim_brightness_slider.value(),
+            'anim_contrast': self.anim_contrast_slider.value(),
             'snap_enabled': self.snap_enabled.isChecked(),
             'snap_threshold': self.snap_threshold.value(),
             'slideshow_mode': self.slideshow_mode.currentData(),
@@ -1165,18 +1226,23 @@ class ImageViewer(QMainWindow):
             y = screen.bottom() - h
         return QPoint(x, y)
     
-    def apply_image_adjustments(self, saturation, brightness, contrast):
+    def apply_image_adjustments(self, saturation, brightness, contrast,
+                                 anim_saturation, anim_brightness, anim_contrast):
         self.settings.update_many({
             'saturation': saturation,
             'brightness': brightness,
             'contrast': contrast,
+            'anim_saturation': anim_saturation,
+            'anim_brightness': anim_brightness,
+            'anim_contrast': anim_contrast,
         })
         # No cache_manager.clear() here: every cache key already includes
-        # saturation/brightness/contrast (see _cache_key), so entries made
-        # under the old values simply stop being matched instead of needing
-        # eviction -- and leaving them in place means flipping back to a
-        # value used earlier (or an image already processed at the new one)
-        # can still hit the cache instead of paying full decode+adjust again.
+        # saturation/brightness/contrast (see _cache_key / _animated_cache_key),
+        # so entries made under the old values simply stop being matched
+        # instead of needing eviction -- and leaving them in place means
+        # flipping back to a value used earlier (or an image already
+        # processed at the new one) can still hit the cache instead of
+        # paying full decode+adjust again.
         if self.image_list:
             self.show_current_image()
     
@@ -1676,9 +1742,14 @@ class ImageViewer(QMainWindow):
         saturation = self.settings.get('saturation', 100)
         brightness = self.settings.get('brightness', 100)
         contrast = self.settings.get('contrast', 100)
+        anim_saturation = self.settings.get('anim_saturation', 100)
+        anim_brightness = self.settings.get('anim_brightness', 100)
+        anim_contrast = self.settings.get('anim_contrast', 100)
 
         # Animated GIF/WebP: keep QMovie for timing/decoding, but render each
         # frame through an in-memory filter when color adjustments are active.
+        # Moving images use their own anim_* saturation/brightness/contrast
+        # settings, independent from the ones used for static images.
         if not self.current_zip:
             ext = os.path.splitext(current_file)[1].lower()
             webp_frame_count = is_animated_webp(current_file) if ext == '.webp' else 0
@@ -1705,7 +1776,7 @@ class ImageViewer(QMainWindow):
                     # A new movie must reconnect slideshow loop counting.
                     if self.slideshow_playing and self.slideshow_mode == 'loop':
                         self.connect_gif_loop()
-                    if saturation == 100 and brightness == 100 and contrast == 100:
+                    if anim_saturation == 100 and anim_brightness == 100 and anim_contrast == 100:
                         movie.frameChanged.connect(self.on_animated_frame_changed)
                         movie.start()
                         self._render_animated_frame(movie.currentFrameNumber(), movie_generation)
@@ -1717,7 +1788,7 @@ class ImageViewer(QMainWindow):
                         # caused stutter/dropped frames when navigating
                         # between animated images with saturation/brightness/
                         # contrast turned on.
-                        self._prewarm_animated_frames(movie, movie_generation, saturation, brightness, contrast,
+                        self._prewarm_animated_frames(movie, movie_generation, anim_saturation, anim_brightness, anim_contrast,
                                                        frame_count_hint=webp_frame_count or None)
                     self.is_loading = False
                     return
@@ -1740,9 +1811,9 @@ class ImageViewer(QMainWindow):
 
     def _animated_cache_key(self, frame_number):
         return (frame_number,
-                self.settings.get('saturation', 100),
-                self.settings.get('brightness', 100),
-                self.settings.get('contrast', 100),
+                self.settings.get('anim_saturation', 100),
+                self.settings.get('anim_brightness', 100),
+                self.settings.get('anim_contrast', 100),
                 self.fit_to_window,
                 self.zoom_factor,
                 self.scroll_area.size().width(),
@@ -1901,9 +1972,9 @@ class ImageViewer(QMainWindow):
             self.image_label.adjustSize()
             return
 
-        saturation = self.settings.get('saturation', 100)
-        brightness = self.settings.get('brightness', 100)
-        contrast = self.settings.get('contrast', 100)
+        saturation = self.settings.get('anim_saturation', 100)
+        brightness = self.settings.get('anim_brightness', 100)
+        contrast = self.settings.get('anim_contrast', 100)
         if saturation == 100 and brightness == 100 and contrast == 100:
             pixmap = QPixmap.fromImage(qimage)
             self._store_animated_frame(key, pixmap)
