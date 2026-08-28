@@ -954,7 +954,7 @@ class SettingsDialog(QDialog):
         broken_image_buttons.addWidget(choose_broken_button)
         broken_image_buttons.addWidget(clear_broken_button)
         error_layout.addRow('', broken_image_buttons)
-        error_note = QLabel()
+        error_note = QLabel('직접 이동 중 파일을 읽을 수 없으면 이 이미지가 대신 표시됩니다.\n슬라이드쇼 중에는 대신 자동으로 다음 이미지로 건너뜁니다.')
         error_note.setWordWrap(True)
         error_layout.addRow('', error_note)
         error_group.setLayout(error_layout)
@@ -1226,6 +1226,13 @@ class ImageViewer(QMainWindow):
         self.prefetch_frame_count = None
         self.anim_lookahead = 2
         self.animated_inflight_keys = set()
+        # The size the current animated frame should actually appear at on
+        # screen (post zoom/fit). May be larger than
+        # current_movie_original_size when zoomed in -- see
+        # _anim_decode_size/_apply_anim_scaled_size for why the movies
+        # themselves are capped at the original resolution instead of
+        # being asked to decode at this size directly.
+        self.current_movie_target_size = None
         self.current_pixmap = None
         self.original_pixmap = None
         self.is_loading = False
@@ -1624,6 +1631,7 @@ class ImageViewer(QMainWindow):
         self.prefetch_frame_count = None
         self.animated_inflight_keys.clear()
         self.current_movie_original_size = None
+        self.current_movie_target_size = None
         self.current_movie_generation += 1
         self.current_movie_frame = -1
         self.gif_last_frame = -1
@@ -2025,6 +2033,11 @@ class ImageViewer(QMainWindow):
             movie_generation = self.current_movie_generation
             self.current_movie_original_size = movie.currentPixmap().size()
             self.scroll_area.setWidgetResizable(self.fit_to_window)
+
+            # Built before the scaled-size is applied below so
+            # _apply_anim_scaled_size can sync both movies in one place.
+            self.prefetch_movie, self.prefetch_buffer = self._build_qmovie(current_file, movie_source)
+
             scaled_size = None
             if self.current_movie_original_size.width() > 0:
                 if self.fit_to_window:
@@ -2033,7 +2046,7 @@ class ImageViewer(QMainWindow):
                     scaled_size = QSize(int(self.current_movie_original_size.width() * self.zoom_factor),
                                          int(self.current_movie_original_size.height() * self.zoom_factor))
                 if scaled_size.width() > 0 and scaled_size.height() > 0:
-                    movie.setScaledSize(scaled_size)
+                    self._apply_anim_scaled_size(scaled_size)
                 else:
                     scaled_size = None
             self.current_movie_frame = -1
@@ -2065,13 +2078,6 @@ class ImageViewer(QMainWindow):
                 self.animated_frame_cache_limit = 24
 
             self.prefetch_frame_count = frame_count if frame_count and frame_count > 0 else None
-            # Independent look-ahead movie: same source, same scaled size,
-            # never started/played. jumpToFrame() on it is used purely to
-            # decode a future frame for background color processing before
-            # the live movie actually reaches it (see _prefetch_ahead).
-            self.prefetch_movie, self.prefetch_buffer = self._build_qmovie(current_file, movie_source)
-            if self.prefetch_movie and scaled_size:
-                self.prefetch_movie.setScaledSize(scaled_size)
 
             # A new movie must reconnect slideshow loop counting.
             if self.slideshow_playing and self.slideshow_mode == 'loop':
@@ -2110,6 +2116,39 @@ class ImageViewer(QMainWindow):
                 self.scroll_area.size().width(),
                 self.scroll_area.size().height())
 
+    def _anim_decode_size(self, target_size):
+        """The size QMovie should actually decode/scale a frame to. Capped
+        at the animation's native resolution: when the user is zoomed in
+        past 1:1, letting QMovie upscale every frame before our own color
+        filter runs on it means the filter -- and every raw-bytes copy
+        around it in _submit_animated_frame_processing -- pays for pixels
+        that carry no extra information over the native frame. Instead the
+        movie decodes at native resolution and the upscale to the actual
+        on-screen size happens once, cheaply (a single resize), after the
+        per-pixel color math instead of before it. When target_size is at
+        or below native resolution (fit-to-window, or zoomed out) this is a
+        no-op -- that case was already cheap and correct."""
+        orig = self.current_movie_original_size
+        if not target_size or not orig or orig.width() <= 0 or orig.height() <= 0:
+            return target_size
+        if target_size.width() <= orig.width() and target_size.height() <= orig.height():
+            return target_size
+        return orig
+
+    def _apply_anim_scaled_size(self, target_size):
+        """Set the on-screen target size for the current animation and sync
+        both the live and look-ahead movies to the (possibly smaller,
+        native-capped) decode size. Call this -- not setScaledSize()
+        directly -- on load and on every zoom/window-size change, so the
+        two movies never drift apart; see the note in _prefetch_ahead about
+        what happens when they do."""
+        self.current_movie_target_size = target_size
+        decode_size = self._anim_decode_size(target_size)
+        if self.current_movie:
+            self.current_movie.setScaledSize(decode_size)
+        if self.prefetch_movie:
+            self.prefetch_movie.setScaledSize(decode_size)
+
     def on_animated_frame_changed(self, frame_number):
         if not self.current_movie:
             return
@@ -2143,6 +2182,10 @@ class ImageViewer(QMainWindow):
         contrast = self.settings.get('anim_contrast', 100)
         if saturation == 100 and brightness == 100 and contrast == 100:
             pixmap = QPixmap.fromImage(qimage)
+            target = self.current_movie_target_size
+            if target and (pixmap.width() != target.width() or pixmap.height() != target.height()):
+                mode = Qt.FastTransformation if self.settings.get('zoom_quality', 'balanced') == 'speed' else Qt.SmoothTransformation
+                pixmap = pixmap.scaled(target, Qt.KeepAspectRatio, mode)
             self._store_animated_frame(key, pixmap)
             self.current_pixmap = pixmap
             self.image_label.setPixmap(pixmap)
@@ -2163,6 +2206,9 @@ class ImageViewer(QMainWindow):
         saturation = self.settings.get('anim_saturation', 100)
         brightness = self.settings.get('anim_brightness', 100)
         contrast = self.settings.get('anim_contrast', 100)
+        target = self.current_movie_target_size
+        target_w = target.width() if target else None
+        target_h = target.height() if target else None
         try:
             rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
             w, h = rgba.width(), rgba.height()
@@ -2175,9 +2221,16 @@ class ImageViewer(QMainWindow):
                     from PIL import Image
                     src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
                     rgb = src.convert('RGB')
+                    # Color math runs at native (w, h) resolution -- see
+                    # _anim_decode_size -- so the upscale to the on-screen
+                    # target size, if any, happens once here at the end
+                    # instead of the filter paying for the extra pixels.
                     rgb = apply_color_adjustments(rgb, saturation, brightness, contrast)
+                    if target_w and target_h and (rgb.width != target_w or rgb.height != target_h):
+                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+                        rgb = rgb.resize((target_w, target_h), resample)
                     out = rgb.convert('RGBA')
-                    return out.tobytes('raw', 'RGBA'), w, h
+                    return out.tobytes('raw', 'RGBA'), rgb.width, rgb.height
                 except Exception:
                     return None
             future = ImageLoader._anim_executor.submit(worker)
@@ -2308,17 +2361,11 @@ class ImageViewer(QMainWindow):
                         scaled_size = QSize(int(original_size.width() * self.zoom_factor),
                                            int(original_size.height() * self.zoom_factor))
                     if scaled_size.width() > 0 and scaled_size.height() > 0:
-                        self.current_movie.setScaledSize(scaled_size)
-                        # The look-ahead movie must track every size change
-                        # the live movie gets, or it keeps decoding frames
-                        # at the old size while _animated_cache_key already
-                        # reflects the new zoom/window size -- the cache
-                        # then holds wrong-sized pixels filed under a
-                        # "correct size" key, which is what made zoom look
-                        # like it randomly reset in-loop and made window
-                        # resizes during playback appear to do nothing.
-                        if self.prefetch_movie:
-                            self.prefetch_movie.setScaledSize(scaled_size)
+                        # _apply_anim_scaled_size caps the movies' own
+                        # decode size at the native resolution and keeps
+                        # the live and look-ahead movie in sync -- see its
+                        # docstring for why that matters here.
+                        self._apply_anim_scaled_size(scaled_size)
                     self.current_movie_frame = self.current_movie.currentFrameNumber()
                     self._render_animated_frame(self.current_movie_frame, self.current_movie_generation)
             except:
