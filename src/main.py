@@ -18,7 +18,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QListView, QSlider)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint, QEvent, QBuffer, QIODevice
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform, QImageReader,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor, QPainter)
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor, QPainter,
+                        QOpenGLContext, QOffscreenSurface, QOpenGLFramebufferObject,
+                        QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture, QVector2D)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
 user32 = ctypes.windll.user32
@@ -105,6 +107,203 @@ def apply_color_adjustments(img, saturation=100, brightness=100, contrast=100):
         lut = [max(0, min(255, round(mean + (x - mean) * c))) for x in range(256)]
         img = img.point(lut * len(img.getbands()))
     return img
+
+
+class GpuColorCorrector:
+    """Renders anim_saturation/anim_brightness/anim_contrast on the GPU
+    with a GLSL fragment shader, replacing the per-frame Pillow work
+    (apply_color_adjustments, via _submit_animated_frame_processing) that
+    was the actual playback bottleneck for color-adjusted animated
+    gif/webp: a full 3x4 matrix convert() plus point() LUTs, every frame,
+    even though already backgrounded to a thread pool. A texture upload
+    plus one shader pass over the same pixels is dramatically cheaper, and
+    is fast enough to run synchronously on the GUI thread -- so the
+    thread-pool hop and the Qt signal round trip it needed both disappear
+    for the frames this succeeds on (see _render_animated_frame_gpu and
+    _prefetch_ahead in ImageViewer). Nothing about the existing Pillow
+    path is changed; it's still there, untouched, as the fallback for
+    whenever this returns None (unsupported driver, GL init failure,
+    etc).
+
+    Uses QOffscreenSurface + QOpenGLContext -- Qt's documented way to
+    render with OpenGL without a visible window -- rather than
+    QOpenGLWidget, which expects to be part of a shown widget hierarchy.
+    A fresh QOpenGLTexture/QOpenGLFramebufferObject is created per call
+    instead of trying to resize/reuse GL objects across frames of
+    differing sizes; simpler and safer, and still far cheaper than the
+    Pillow path it replaces.
+
+    One behavior difference from the Pillow path: contrast there pivots
+    around the *current frame's* actual mean brightness (via PIL's
+    ImageStat, computed after saturation/brightness are applied); doing
+    that on the GPU would need a separate reduction pass over the frame,
+    which reintroduces per-frame overhead this change exists to remove.
+    This shader pivots contrast at a fixed mid-gray (0.5) instead -- the
+    standard real-time approximation -- so output only differs from
+    before when contrast != 100 *and* the frame's average brightness sits
+    far from mid-gray.
+    """
+
+    _VERTEX_SRC = """
+        attribute vec2 a_position;
+        attribute vec2 a_texcoord;
+        varying vec2 v_texcoord;
+        void main() {
+            v_texcoord = a_texcoord;
+            gl_Position = vec4(a_position, 0.0, 1.0);
+        }
+    """
+
+    _FRAGMENT_SRC = """
+        uniform sampler2D u_texture;
+        uniform float u_saturation;
+        uniform float u_brightness;
+        uniform float u_contrast;
+        varying vec2 v_texcoord;
+        void main() {
+            vec3 color = texture2D(u_texture, v_texcoord).rgb;
+            // Same luma weights and mix() blend as _saturate_matrix.
+            float gray = dot(color, vec3(0.299, 0.587, 0.114));
+            color = mix(vec3(gray), color, u_saturation);
+            // Same plain multiply as the brightness LUT in
+            // apply_color_adjustments.
+            color = color * u_brightness;
+            // Fixed mid-gray pivot -- see class docstring.
+            color = (color - 0.5) * u_contrast + 0.5;
+            gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+        }
+    """
+
+    _GL_TRIANGLE_STRIP = 0x0005
+
+    def __init__(self):
+        self._context = None
+        self._surface = None
+        self._program = None
+        self._broken = False  # set once init fails, so we stop retrying every frame
+
+    def _ensure_ready(self):
+        if self._program is not None:
+            return True
+        if self._broken:
+            return False
+        try:
+            surface = QOffscreenSurface()
+            surface.create()
+            if not surface.isValid():
+                raise RuntimeError('오프스크린 surface 생성 실패')
+            context = QOpenGLContext()
+            if not context.create():
+                raise RuntimeError('GL 컨텍스트 생성 실패')
+            if not context.makeCurrent(surface):
+                raise RuntimeError('makeCurrent 실패')
+            try:
+                program = QOpenGLShaderProgram()
+                if not program.addShaderFromSourceCode(QOpenGLShader.Vertex, self._VERTEX_SRC):
+                    raise RuntimeError(program.log())
+                if not program.addShaderFromSourceCode(QOpenGLShader.Fragment, self._FRAGMENT_SRC):
+                    raise RuntimeError(program.log())
+                if not program.link():
+                    raise RuntimeError(program.log())
+            finally:
+                context.doneCurrent()
+            self._surface = surface
+            self._context = context
+            self._program = program
+            return True
+        except Exception as e:
+            print(f"GPU 색보정 초기화 실패, 이후 프레임은 CPU 경로를 사용합니다: {e}")
+            self._broken = True
+            self._context = None
+            self._surface = None
+            self._program = None
+            return False
+
+    def adjust(self, qimage, saturation, brightness, contrast, target_w, target_h):
+        """qimage: source frame, any QImage format. saturation/brightness/
+        contrast: 1.0 = no change. Returns a QImage sized target_w x
+        target_h with alpha forced fully opaque -- apply_color_adjustments
+        already loses per-pixel alpha the same way via its RGB round trip,
+        so this matches existing output -- or None if the GPU path isn't
+        available, in which case the caller should fall back to
+        apply_color_adjustments()."""
+        if target_w <= 0 or target_h <= 0 or not self._ensure_ready():
+            return None
+        texture = None
+        fbo = None
+        try:
+            if not self._context.makeCurrent(self._surface):
+                return None
+            texture = QOpenGLTexture(qimage.convertToFormat(QImage.Format_RGBA8888),
+                                      QOpenGLTexture.DontGenerateMipMaps)
+            texture.setMinificationFilter(QOpenGLTexture.Linear)
+            texture.setMagnificationFilter(QOpenGLTexture.Linear)
+            texture.setWrapMode(QOpenGLTexture.ClampToEdge)
+
+            fbo = QOpenGLFramebufferObject(target_w, target_h)
+            if not fbo.bind():
+                return None
+            self._context.functions().glViewport(0, 0, target_w, target_h)
+
+            program = self._program
+            program.bind()
+            texture.bind(0)
+            program.setUniformValue('u_texture', 0)
+            program.setUniformValue('u_saturation', float(saturation))
+            program.setUniformValue('u_brightness', float(brightness))
+            program.setUniformValue('u_contrast', float(contrast))
+
+            pos_loc = program.attributeLocation('a_position')
+            uv_loc = program.attributeLocation('a_texcoord')
+            # NDC corners for a full-viewport quad, paired with UVs chosen so
+            # QImage's top row (row 0 of the buffer we just uploaded) lands
+            # at the top of the quad (NDC y=+1); toImage() below
+            # (flipped=True, its default) then puts that same top content
+            # back at row 0 of the output QImage, so orientation round-trips
+            # correctly.
+            positions = [QVector2D(-1, -1), QVector2D(1, -1), QVector2D(-1, 1), QVector2D(1, 1)]
+            texcoords = [QVector2D(0, 1), QVector2D(1, 1), QVector2D(0, 0), QVector2D(1, 0)]
+            program.enableAttributeArray(pos_loc)
+            program.setAttributeArray(pos_loc, positions)
+            program.enableAttributeArray(uv_loc)
+            program.setAttributeArray(uv_loc, texcoords)
+
+            self._context.functions().glDrawArrays(self._GL_TRIANGLE_STRIP, 0, 4)
+
+            program.disableAttributeArray(pos_loc)
+            program.disableAttributeArray(uv_loc)
+            texture.release()
+            program.release()
+
+            result = fbo.toImage()
+            return result if not result.isNull() else None
+        except Exception as e:
+            print(f"GPU 프레임 색보정 실패, 이 프레임은 CPU 경로로 대체합니다: {e}")
+            return None
+        finally:
+            if fbo is not None:
+                fbo.release()
+            if texture is not None:
+                texture.destroy()
+            if self._context is not None:
+                self._context.doneCurrent()
+
+    def shutdown(self):
+        if self._context is None:
+            return
+        try:
+            if self._surface is not None:
+                self._context.makeCurrent(self._surface)
+            self._program = None
+        except Exception:
+            pass
+        finally:
+            try:
+                self._context.doneCurrent()
+            except Exception:
+                pass
+            self._context = None
+            self._surface = None
 
 
 def get_app_dir():
@@ -351,7 +550,7 @@ class ImageLoader:
         return os.path.splitext(filename)[1].lower() in ImageLoader.SUPPORTED_FORMATS
 
     @staticmethod
-    def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None, high_quality=False):
+    def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None):
         # Fast path: native Qt decoding avoids Pillow RGB conversion and byte copies.
         try:
             if saturation == 100 and brightness == 100 and contrast == 100:
@@ -373,17 +572,12 @@ class ImageLoader:
                     src.seek(0)
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    # BILINEAR trades resample quality for speed and is fine
-                    # when this thumbnail is small relative to the source,
-                    # since it gets scaled again by Qt right after anyway.
-                    # In high_quality mode max_size is already close to the
-                    # actual display size (see _target_decode_size), so that
-                    # second Qt scale is now minor -- use LANCZOS here since
-                    # this resample is effectively the one that counts.
-                    if high_quality:
-                        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-                    else:
-                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+                    # BILINEAR here trades a little resample quality for real
+                    # speed: this thumbnail gets scaled again by Qt to the
+                    # exact viewport size right after (update_image_display),
+                    # so LANCZOS's extra sharpness on this intermediate step
+                    # was mostly being thrown away anyway.
+                    resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
                 img = apply_color_adjustments(img, saturation, brightness, contrast)
                 data = img.tobytes('raw', 'RGB')
@@ -525,7 +719,7 @@ class ZipHandler:
         return zf
 
     @staticmethod
-    def load_image_data(zip_path, filename, saturation=100, brightness=100, contrast=100, max_size=None, high_quality=False):
+    def load_image_data(zip_path, filename, saturation=100, brightness=100, contrast=100, max_size=None):
         try:
             zf = ZipHandler._get_zip(zip_path)
             with zf.open(filename, 'r') as fp:
@@ -553,10 +747,7 @@ class ZipHandler:
                     src.seek(0)
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    if high_quality:
-                        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-                    else:
-                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+                    resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
                 img = apply_color_adjustments(img, saturation, brightness, contrast)
                 raw = img.tobytes('raw', 'RGB')
@@ -1270,6 +1461,12 @@ class ImageViewer(QMainWindow):
         self.prefetch_frame_count = None
         self.anim_lookahead = 2
         self.animated_inflight_keys = set()
+        # Renders anim_saturation/anim_brightness/anim_contrast on the GPU
+        # instead of the Pillow path below -- see GpuColorCorrector and
+        # _render_animated_frame_gpu. One instance persists for the
+        # window's lifetime (GL context is created lazily on first use);
+        # torn down in closeEvent.
+        self.gl_color_corrector = GpuColorCorrector()
         # The size the current animated frame should actually appear at on
         # screen (post zoom/fit). May be larger than
         # current_movie_original_size when zoomed in -- see
@@ -1690,15 +1887,6 @@ class ImageViewer(QMainWindow):
         if not self.fit_to_window:
             return None
         size = self.scroll_area.size()
-        if self.settings.get('zoom_quality', 'balanced') == 'quality':
-            # 'balanced'/'speed' decode close to the viewport size, so the
-            # later display-time scale is a second, further downsample of an
-            # already-shrunk image -- that double downscale is what softens
-            # fine detail. 'quality' decodes at up to 2x viewport instead, so
-            # that final scale has real source pixels to work from. Capped at
-            # 4096/side so a huge source image doesn't get decoded far beyond
-            # anything the screen will actually show.
-            return (min(max(64, size.width() * 2), 4096), min(max(64, size.height() * 2), 4096))
         # Small safety margin prevents repeated reloads caused by tiny widget changes.
         return (max(64, size.width() + 64), max(64, size.height() + 64))
 
@@ -1725,9 +1913,9 @@ class ImageViewer(QMainWindow):
             old = self._source_image_cache_order.pop(0)
             self._source_image_cache.pop(old, None)
 
-    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast, max_size=None):
+    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast):
         source = f'{self.current_zip}|{filepath}' if self.current_zip else filepath
-        return (source, int(saturation), int(brightness), int(contrast), max_size)
+        return (source, int(saturation), int(brightness), int(contrast))
 
     def _adjusted_cache_get(self, key):
         value = self._adjusted_image_cache.get(key)
@@ -1781,7 +1969,7 @@ class ImageViewer(QMainWindow):
                     )
                     return
 
-            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast, max_size)
+            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast)
             # For non-default adjustments, reuse the expensive color-adjusted
             # source when available. The existing display cache still handles
             # the fit-to-window/full-size distinction.
@@ -1792,11 +1980,10 @@ class ImageViewer(QMainWindow):
                     self.load_bridge.loaded.emit(generation, key, image, index == self.current_index)
                     return
 
-            high_quality = self.settings.get('zoom_quality', 'balanced') == 'quality'
             if source_zip:
-                image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size, high_quality)
+                image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size)
             else:
-                image = ImageLoader.load_image_data(filename, saturation, brightness, contrast, max_size, high_quality)
+                image = ImageLoader.load_image_data(filename, saturation, brightness, contrast, max_size)
                 if image is None and max_size is None:
                     try:
                         image = QImage(filename)
@@ -2247,11 +2434,42 @@ class ImageViewer(QMainWindow):
             self.image_label.adjustSize()
             return
 
+        # Try the GPU shader path first -- it runs synchronously right here
+        # (fast enough not to need the anim worker pool) and, on success,
+        # skips the Pillow path below entirely. Only on GPU failure
+        # (unsupported driver, first-time init error, etc.) does this fall
+        # through to the exact same thread-pool/Pillow path as before.
+        pixmap = self._render_animated_frame_gpu(qimage, saturation, brightness, contrast)
+        if pixmap is not None:
+            self._store_animated_frame(key, pixmap)
+            self.current_pixmap = pixmap
+            self.image_label.setPixmap(pixmap)
+            self.image_label.adjustSize()
+            return
+
         # A look-ahead prefetch may already be processing this exact frame;
         # if so just wait for that result instead of computing it twice.
         if key in self.animated_inflight_keys:
             return
         self._submit_animated_frame_processing(qimage, frame_number, generation, key)
+
+    def _render_animated_frame_gpu(self, qimage, saturation, brightness, contrast):
+        """GPU-shader replacement for the Pillow apply_color_adjustments()
+        call in _submit_animated_frame_processing, for the frame that's
+        actually about to be displayed. Renders synchronously (see
+        GpuColorCorrector.adjust) and returns a ready-to-display QPixmap
+        already sized to current_movie_target_size, or None if the GPU
+        path isn't available -- callers fall back to the unchanged
+        Pillow/thread-pool path in that case."""
+        target = self.current_movie_target_size
+        target_w = target.width() if target else qimage.width()
+        target_h = target.height() if target else qimage.height()
+        result = self.gl_color_corrector.adjust(
+            qimage, saturation / 100.0, brightness / 100.0, contrast / 100.0,
+            target_w, target_h)
+        if result is None or result.isNull():
+            return None
+        return QPixmap.fromImage(result)
 
     def _submit_animated_frame_processing(self, qimage, frame_number, generation, key):
         # Process the frame in the anim worker pool (kept separate from the
@@ -2301,23 +2519,29 @@ class ImageViewer(QMainWindow):
 
     def _prefetch_ahead(self, frame_number):
         """Decode the next anim_lookahead frames on the paused prefetch
-        movie and hand them to the worker pool now, so they're ready in
+        movie and run them through the GPU shader now (falling back to the
+        worker pool per-frame on GPU failure), so they're ready in
         animated_frame_cache before playback actually reaches them."""
         if not self.prefetch_movie or not self.current_movie:
             return
         # No adjustment active: the live path takes a free instant fast path
         # (QPixmap.fromImage with no Pillow round-trip), so there's nothing
         # worth precomputing here.
-        if (self.settings.get('anim_saturation', 100) == 100
-                and self.settings.get('anim_brightness', 100) == 100
-                and self.settings.get('anim_contrast', 100) == 100):
+        saturation = self.settings.get('anim_saturation', 100)
+        brightness = self.settings.get('anim_brightness', 100)
+        contrast = self.settings.get('anim_contrast', 100)
+        if saturation == 100 and brightness == 100 and contrast == 100:
             return
         total = self.prefetch_frame_count or self.current_movie.frameCount()
         if not total or total <= 1:
             return
-        # Backpressure: if the worker pool is already as busy as it can
-        # usefully be (e.g. a large/zoomed frame is taking a while), don't
-        # pile speculative work on top of it -- that only pushes the frame
+        # Backpressure: the GPU path below runs synchronously and never
+        # touches animated_inflight_keys, so this only ever gates frames
+        # that fall back to the CPU worker pool -- a no-op while the GPU
+        # path keeps succeeding, and the same protection as before if it
+        # doesn't. If the worker pool is already as busy as it can usefully
+        # be (e.g. a large/zoomed frame is taking a while), don't pile
+        # speculative work on top of it -- that only pushes the frame
         # that's actually about to be displayed further back in the queue,
         # which is what made zoomed-in playback feel *slower* than before
         # prefetching existed. Just skip this round; the next real frame
@@ -2341,6 +2565,10 @@ class ImageViewer(QMainWindow):
                 if qimage.isNull():
                     continue
             except Exception:
+                continue
+            pixmap = self._render_animated_frame_gpu(qimage, saturation, brightness, contrast)
+            if pixmap is not None:
+                self._store_animated_frame(key, pixmap)
                 continue
             self._submit_animated_frame_processing(qimage, target, generation, key)
 
@@ -2835,6 +3063,10 @@ class ImageViewer(QMainWindow):
             pass
         try:
             ZipHandler._thread_local.__dict__.clear()
+        except Exception:
+            pass
+        try:
+            self.gl_color_corrector.shutdown()
         except Exception:
             pass
         super().closeEvent(event)
