@@ -351,7 +351,7 @@ class ImageLoader:
         return os.path.splitext(filename)[1].lower() in ImageLoader.SUPPORTED_FORMATS
 
     @staticmethod
-    def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None):
+    def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None, high_quality=False):
         # Fast path: native Qt decoding avoids Pillow RGB conversion and byte copies.
         try:
             if saturation == 100 and brightness == 100 and contrast == 100:
@@ -373,12 +373,17 @@ class ImageLoader:
                     src.seek(0)
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    # BILINEAR here trades a little resample quality for real
-                    # speed: this thumbnail gets scaled again by Qt to the
-                    # exact viewport size right after (update_image_display),
-                    # so LANCZOS's extra sharpness on this intermediate step
-                    # was mostly being thrown away anyway.
-                    resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+                    # BILINEAR trades resample quality for speed and is fine
+                    # when this thumbnail is small relative to the source,
+                    # since it gets scaled again by Qt right after anyway.
+                    # In high_quality mode max_size is already close to the
+                    # actual display size (see _target_decode_size), so that
+                    # second Qt scale is now minor -- use LANCZOS here since
+                    # this resample is effectively the one that counts.
+                    if high_quality:
+                        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                    else:
+                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
                 img = apply_color_adjustments(img, saturation, brightness, contrast)
                 data = img.tobytes('raw', 'RGB')
@@ -520,7 +525,7 @@ class ZipHandler:
         return zf
 
     @staticmethod
-    def load_image_data(zip_path, filename, saturation=100, brightness=100, contrast=100, max_size=None):
+    def load_image_data(zip_path, filename, saturation=100, brightness=100, contrast=100, max_size=None, high_quality=False):
         try:
             zf = ZipHandler._get_zip(zip_path)
             with zf.open(filename, 'r') as fp:
@@ -548,7 +553,10 @@ class ZipHandler:
                     src.seek(0)
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+                    if high_quality:
+                        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                    else:
+                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
                 img = apply_color_adjustments(img, saturation, brightness, contrast)
                 raw = img.tobytes('raw', 'RGB')
@@ -1682,6 +1690,15 @@ class ImageViewer(QMainWindow):
         if not self.fit_to_window:
             return None
         size = self.scroll_area.size()
+        if self.settings.get('zoom_quality', 'balanced') == 'quality':
+            # 'balanced'/'speed' decode close to the viewport size, so the
+            # later display-time scale is a second, further downsample of an
+            # already-shrunk image -- that double downscale is what softens
+            # fine detail. 'quality' decodes at up to 2x viewport instead, so
+            # that final scale has real source pixels to work from. Capped at
+            # 4096/side so a huge source image doesn't get decoded far beyond
+            # anything the screen will actually show.
+            return (min(max(64, size.width() * 2), 4096), min(max(64, size.height() * 2), 4096))
         # Small safety margin prevents repeated reloads caused by tiny widget changes.
         return (max(64, size.width() + 64), max(64, size.height() + 64))
 
@@ -1708,9 +1725,9 @@ class ImageViewer(QMainWindow):
             old = self._source_image_cache_order.pop(0)
             self._source_image_cache.pop(old, None)
 
-    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast):
+    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast, max_size=None):
         source = f'{self.current_zip}|{filepath}' if self.current_zip else filepath
-        return (source, int(saturation), int(brightness), int(contrast))
+        return (source, int(saturation), int(brightness), int(contrast), max_size)
 
     def _adjusted_cache_get(self, key):
         value = self._adjusted_image_cache.get(key)
@@ -1764,7 +1781,7 @@ class ImageViewer(QMainWindow):
                     )
                     return
 
-            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast)
+            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast, max_size)
             # For non-default adjustments, reuse the expensive color-adjusted
             # source when available. The existing display cache still handles
             # the fit-to-window/full-size distinction.
@@ -1775,10 +1792,11 @@ class ImageViewer(QMainWindow):
                     self.load_bridge.loaded.emit(generation, key, image, index == self.current_index)
                     return
 
+            high_quality = self.settings.get('zoom_quality', 'balanced') == 'quality'
             if source_zip:
-                image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size)
+                image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size, high_quality)
             else:
-                image = ImageLoader.load_image_data(filename, saturation, brightness, contrast, max_size)
+                image = ImageLoader.load_image_data(filename, saturation, brightness, contrast, max_size, high_quality)
                 if image is None and max_size is None:
                     try:
                         image = QImage(filename)
