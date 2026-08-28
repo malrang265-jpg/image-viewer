@@ -41,29 +41,6 @@ def get_pil_enhance():
         PIL_ImageEnhance = ImageEnhance
     return PIL_ImageEnhance
 
-_cv2_module = None
-_np_module = None
-
-def get_cv2():
-    """Lazy-loaded like get_pil_image() above. cv2 (opencv-python-headless)
-    is an optional dependency used only for the fast animated-frame color
-    path (see apply_color_adjustments_cv2) -- if it isn't installed, that
-    path's caller falls back to the plain PIL pipeline, so importing it
-    lazily here means a missing cv2 install never breaks startup or any
-    other feature, only forfeits the speedup."""
-    global _cv2_module
-    if _cv2_module is None:
-        import cv2
-        _cv2_module = cv2
-    return _cv2_module
-
-def get_numpy():
-    global _np_module
-    if _np_module is None:
-        import numpy
-        _np_module = numpy
-    return _np_module
-
 # Which algorithm handles saturation. Both are kept side by side so the two
 # can be A/B compared directly -- flip this to 'enhance' to go back to the
 # original behavior.
@@ -128,115 +105,6 @@ def apply_color_adjustments(img, saturation=100, brightness=100, contrast=100):
         lut = [max(0, min(255, round(mean + (x - mean) * c))) for x in range(256)]
         img = img.point(lut * len(img.getbands()))
     return img
-
-# ITU-R 601-2 luma weights -- same numbers _saturate_matrix and
-# apply_color_adjustments above already use (also what Pillow's own
-# convert('L') uses), kept as one named constant so the cv2 path below
-# can't drift from them.
-_LUMA_R, _LUMA_G, _LUMA_B = 0.299, 0.587, 0.114
-
-def apply_color_adjustments_cv2(rgb, saturation=100, brightness=100, contrast=100):
-    """OpenCV/numpy equivalent of apply_color_adjustments() above, for the
-    animated gif/webp playback hot path (see _process_animated_frame_fast
-    and _submit_animated_frame_processing). Takes and returns an HxWx3
-    uint8 numpy array (R,G,B order -- deliberately never converted to
-    OpenCV's usual BGR, so this can reuse the exact same weights and
-    matrix layout as _saturate_matrix and the contrast math above
-    unchanged, instead of re-deriving them for BGR order and risking a
-    mismatch between how a static image and an animated one render the
-    same slider values).
-
-    Measured end to end (real color math + the RGBA<->RGB buffer
-    conversions around it, matching what _submit_animated_frame_processing
-    actually does) at roughly 1.3-1.6x apply_color_adjustments()'s speed on
-    a single CPU core -- most of the per-frame cost turned out to be
-    memory movement (format conversions, buffer copies) rather than the
-    saturation/brightness/contrast math itself, and cv2 isn't meaningfully
-    faster than PIL at plain memory movement, only at the math. That's a
-    real, safe win, not the order-of-magnitude one a raw cv2.LUT()-vs-
-    numpy micro-benchmark suggests in isolation -- see the chat discussion
-    for the multi-core-machine caveat and the GPU-shader alternative for
-    an actually large win. Callers should treat any exception here as
-    "fall back to apply_color_adjustments()".
-    """
-    cv2 = get_cv2()
-    np = get_numpy()
-
-    if saturation != 100:
-        s = saturation / 100.0
-        lr, lg, lb = _LUMA_R, _LUMA_G, _LUMA_B
-        # Same 3x3 as _saturate_matrix's 3x4 (dropping its trailing zero
-        # constant column -- cv2.transform has no offset term, and none
-        # is needed here). Fed straight to cv2.transform as uint8: it
-        # saturate-casts the result back to uint8 internally (verified
-        # against the manual astype(float32)->clip->astype(uint8) route:
-        # identical apart from the last-bit rounding direction, max 1/255
-        # off), which skips two extra full-frame passes converting to and
-        # from float32.
-        matrix = np.array([
-            [lr * (1 - s) + s, lg * (1 - s),     lb * (1 - s)],
-            [lr * (1 - s),     lg * (1 - s) + s, lb * (1 - s)],
-            [lr * (1 - s),     lg * (1 - s),     lb * (1 - s) + s],
-        ], dtype=np.float32)
-        rgb = cv2.transform(rgb, matrix)
-
-    if brightness != 100:
-        b = brightness / 100.0
-        lut = np.clip(np.arange(256) * b, 0, 255).astype(np.uint8)
-        rgb = cv2.LUT(rgb, lut)
-
-    if contrast != 100:
-        # Same pivot as apply_color_adjustments(): the mean of the
-        # *luminance-weighted* grayscale version of the (already
-        # saturation/brightness-adjusted) image, not a flat per-channel
-        # average of R/G/B -- matches PIL's convert('L') mean so a static
-        # image and an animated one with the same contrast value look the
-        # same. Computed via the same cv2.transform() as a 1x3 matrix
-        # (one luminance number out per pixel) rather than three separate
-        # numpy multiplies, for the same reason as the saturation matrix
-        # above. (This averages the unrounded per-pixel luminance and
-        # rounds once at the end, rather than PIL's round-every-pixel-
-        # then-average; the two differ by a small fraction of a unit at
-        # most, not enough to change the rounded mean in practice.)
-        gray = cv2.transform(rgb, np.array([[_LUMA_R, _LUMA_G, _LUMA_B]], dtype=np.float32))
-        mean = round(float(gray.mean()))
-        c = contrast / 100.0
-        lut = np.clip(mean + (np.arange(256) - mean) * c, 0, 255).astype(np.uint8)
-        rgb = cv2.LUT(rgb, lut)
-
-    return rgb
-
-def _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, target_w, target_h):
-    """cv2-based replacement for the PIL block in
-    _submit_animated_frame_processing's worker(): color-adjust (and
-    resize, if needed) one animated frame's raw RGBA buffer straight from
-    Qt, without a PIL round trip. Returns (rgba_bytes, width, height), or
-    None if cv2 isn't installed or anything else goes wrong -- the caller
-    falls back to the original PIL path in that case, so a missing cv2
-    install degrades to the old speed instead of breaking playback."""
-    try:
-        cv2 = get_cv2()
-        np = get_numpy()
-        # .copy() so this is a normal writable, contiguous array -- raw is
-        # an immutable bytes object, and frombuffer()'s view onto it isn't
-        # writable, which some cv2 ops need.
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4)).copy()
-        rgb = apply_color_adjustments_cv2(arr[:, :, :3], saturation, brightness, contrast)
-        out = np.empty((h, w, 4), dtype=np.uint8)
-        out[:, :, :3] = rgb
-        # Always fully opaque, matching the PIL path above exactly: its
-        # src.convert('RGB') drops the source alpha, and convert('RGBA')
-        # coming back always fills alpha with 255 -- it never round-trips
-        # the original values either. Carrying the real source alpha
-        # through here instead would be a behavior change, not just a
-        # speedup, so this keeps it byte-for-byte consistent instead.
-        out[:, :, 3] = 255
-        if target_w and target_h and (w != target_w or h != target_h):
-            out = cv2.resize(out, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        out = np.ascontiguousarray(out)
-        return out.tobytes(), out.shape[1], out.shape[0]
-    except Exception:
-        return None
 
 
 def get_app_dir():
@@ -483,7 +351,7 @@ class ImageLoader:
         return os.path.splitext(filename)[1].lower() in ImageLoader.SUPPORTED_FORMATS
 
     @staticmethod
-    def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None):
+    def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None, high_quality=False):
         # Fast path: native Qt decoding avoids Pillow RGB conversion and byte copies.
         try:
             if saturation == 100 and brightness == 100 and contrast == 100:
@@ -505,12 +373,17 @@ class ImageLoader:
                     src.seek(0)
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    # BILINEAR here trades a little resample quality for real
-                    # speed: this thumbnail gets scaled again by Qt to the
-                    # exact viewport size right after (update_image_display),
-                    # so LANCZOS's extra sharpness on this intermediate step
-                    # was mostly being thrown away anyway.
-                    resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+                    # BILINEAR trades resample quality for speed and is fine
+                    # when this thumbnail is small relative to the source,
+                    # since it gets scaled again by Qt right after anyway.
+                    # In high_quality mode max_size is already close to the
+                    # actual display size (see _target_decode_size), so that
+                    # second Qt scale is now minor -- use LANCZOS here since
+                    # this resample is effectively the one that counts.
+                    if high_quality:
+                        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                    else:
+                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
                 img = apply_color_adjustments(img, saturation, brightness, contrast)
                 data = img.tobytes('raw', 'RGB')
@@ -652,7 +525,7 @@ class ZipHandler:
         return zf
 
     @staticmethod
-    def load_image_data(zip_path, filename, saturation=100, brightness=100, contrast=100, max_size=None):
+    def load_image_data(zip_path, filename, saturation=100, brightness=100, contrast=100, max_size=None, high_quality=False):
         try:
             zf = ZipHandler._get_zip(zip_path)
             with zf.open(filename, 'r') as fp:
@@ -680,7 +553,10 @@ class ZipHandler:
                     src.seek(0)
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+                    if high_quality:
+                        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                    else:
+                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
                 img = apply_color_adjustments(img, saturation, brightness, contrast)
                 raw = img.tobytes('raw', 'RGB')
@@ -700,6 +576,7 @@ class ZipHandler:
 class ImageLoadBridge(QObject):
     loaded = pyqtSignal(int, str, object, bool)
     animated_frame = pyqtSignal(int, int, object)
+    hq_refined = pyqtSignal(int, int, object)
 
 class ImageListDialog(QDialog):
     def __init__(self, image_list, current_index, parent=None, current_zip=None):
@@ -1342,6 +1219,7 @@ class ImageViewer(QMainWindow):
         self.load_bridge = ImageLoadBridge()
         self.load_bridge.loaded.connect(self._on_background_loaded)
         self.load_bridge.animated_frame.connect(self._on_animated_frame_ready)
+        self.load_bridge.hq_refined.connect(self._on_hq_refine_ready)
         self.load_generation = 0
         self.loading_keys = set()
         # Cache the expensive color-adjusted source separately from the
@@ -1426,6 +1304,18 @@ class ImageViewer(QMainWindow):
         self._display_update_timer = QTimer(self)
         self._display_update_timer.setSingleShot(True)
         self._display_update_timer.timeout.connect(self.update_image_display)
+        # 'quality' mode's high-cost LANCZOS re-render only runs once the
+        # user stops resizing/zooming: every update_image_display() call
+        # restarts this single-shot timer (see _schedule_hq_refine), so it
+        # only actually fires ~150ms after the *last* one -- during active
+        # dragging/zooming the fast Qt.SmoothTransformation pixmap keeps
+        # being shown and interaction stays responsive; only the settled
+        # frame gets refined in the background and swapped in after.
+        self._hq_refine_timer = QTimer(self)
+        self._hq_refine_timer.setSingleShot(True)
+        self._hq_refine_timer.timeout.connect(self._trigger_hq_refine)
+        self._hq_refine_token = 0
+        self._hq_refine_pending = None
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -1814,6 +1704,15 @@ class ImageViewer(QMainWindow):
         if not self.fit_to_window:
             return None
         size = self.scroll_area.size()
+        if self.settings.get('zoom_quality', 'balanced') == 'quality':
+            # 'balanced'/'speed' decode close to the viewport size, so the
+            # later display-time scale is a second, further downsample of an
+            # already-shrunk image -- that double downscale is what softens
+            # fine detail. 'quality' decodes at up to 2x viewport instead, so
+            # that final scale has real source pixels to work from. Capped at
+            # 4096/side so a huge source image doesn't get decoded far beyond
+            # anything the screen will actually show.
+            return (min(max(64, size.width() * 2), 4096), min(max(64, size.height() * 2), 4096))
         # Small safety margin prevents repeated reloads caused by tiny widget changes.
         return (max(64, size.width() + 64), max(64, size.height() + 64))
 
@@ -1840,9 +1739,9 @@ class ImageViewer(QMainWindow):
             old = self._source_image_cache_order.pop(0)
             self._source_image_cache.pop(old, None)
 
-    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast):
+    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast, max_size=None):
         source = f'{self.current_zip}|{filepath}' if self.current_zip else filepath
-        return (source, int(saturation), int(brightness), int(contrast))
+        return (source, int(saturation), int(brightness), int(contrast), max_size)
 
     def _adjusted_cache_get(self, key):
         value = self._adjusted_image_cache.get(key)
@@ -1896,7 +1795,7 @@ class ImageViewer(QMainWindow):
                     )
                     return
 
-            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast)
+            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast, max_size)
             # For non-default adjustments, reuse the expensive color-adjusted
             # source when available. The existing display cache still handles
             # the fit-to-window/full-size distinction.
@@ -1907,10 +1806,11 @@ class ImageViewer(QMainWindow):
                     self.load_bridge.loaded.emit(generation, key, image, index == self.current_index)
                     return
 
+            high_quality = self.settings.get('zoom_quality', 'balanced') == 'quality'
             if source_zip:
-                image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size)
+                image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size, high_quality)
             else:
-                image = ImageLoader.load_image_data(filename, saturation, brightness, contrast, max_size)
+                image = ImageLoader.load_image_data(filename, saturation, brightness, contrast, max_size, high_quality)
                 if image is None and max_size is None:
                     try:
                         image = QImage(filename)
@@ -2045,6 +1945,8 @@ class ImageViewer(QMainWindow):
     def _display_pixmap(self, pixmap):
         if not pixmap or pixmap.isNull():
             return
+        self._hq_refine_token += 1
+        self._hq_refine_timer.stop()
         self.current_pixmap = pixmap
         self.original_pixmap = pixmap
         self.update_image_display()
@@ -2370,8 +2272,8 @@ class ImageViewer(QMainWindow):
     def _submit_animated_frame_processing(self, qimage, frame_number, generation, key):
         # Process the frame in the anim worker pool (kept separate from the
         # static-image pool -- see _ANIM_WORKER_COUNT). QMovie itself stays
-        # on the GUI thread because it's a Qt object; the expensive color
-        # work happens off the UI thread and never creates a temp file.
+        # on the GUI thread because it's a Qt object; the expensive Pillow
+        # color work happens off the UI thread and never creates a temp file.
         saturation = self.settings.get('anim_saturation', 100)
         brightness = self.settings.get('anim_brightness', 100)
         contrast = self.settings.get('anim_contrast', 100)
@@ -2386,14 +2288,6 @@ class ImageViewer(QMainWindow):
             raw = bytes(ptr)
             self.animated_inflight_keys.add(key)
             def worker():
-                # cv2 path first (see _process_animated_frame_fast) --
-                # roughly an order of magnitude faster than the PIL path
-                # below for this. Falls through to PIL on any failure,
-                # most commonly because opencv-python-headless just isn't
-                # installed, so playback still works either way.
-                result = _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, target_w, target_h)
-                if result is not None:
-                    return result
                 try:
                     from PIL import Image
                     src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
@@ -2566,6 +2460,95 @@ class ImageViewer(QMainWindow):
                 )
                 self.image_label.setPixmap(scaled)
             self.image_label.adjustSize()
+            self._schedule_hq_refine(scaled.size())
+
+    def _schedule_hq_refine(self, target_size):
+        # Only 'quality' mode pays for the LANCZOS pass. 'speed'/'balanced'
+        # never schedule this, so their behavior/perf is untouched.
+        if self.settings.get('zoom_quality', 'balanced') != 'quality':
+            return
+        if not self.current_pixmap or target_size.width() <= 0 or target_size.height() <= 0:
+            return
+        # Restarting a running single-shot QTimer resets its countdown, so
+        # rapid successive calls (dragging a window edge, scrolling the
+        # zoom wheel) keep pushing this out -- it only actually fires once
+        # nothing has called update_image_display for 150ms.
+        self._hq_refine_token += 1
+        self._hq_refine_pending = (self.current_pixmap, target_size, self.load_generation, self.current_index)
+        self._hq_refine_timer.start(150)
+
+    def _trigger_hq_refine(self):
+        pending = self._hq_refine_pending
+        if not pending:
+            return
+        source_pixmap, target_size, generation, index = pending
+        # Bail out if anything relevant moved on while we were waiting.
+        if (generation != self.load_generation or index != self.current_index
+                or self.current_movie or self.current_pixmap is not source_pixmap):
+            return
+        token = self._hq_refine_token
+        try:
+            image = source_pixmap.toImage().convertToFormat(QImage.Format_RGB888)
+            w, h = image.width(), image.height()
+            if w <= 0 or h <= 0:
+                return
+            ptr = image.bits()
+            ptr.setsize(image.byteCount())
+            raw = bytes(ptr)
+        except Exception:
+            return
+        target_w, target_h = target_size.width(), target_size.height()
+
+        def worker():
+            try:
+                from PIL import Image as PILImage
+                src = PILImage.frombuffer('RGB', (w, h), raw, 'raw', 'RGB', 0, 1)
+                if (w, h) == (target_w, target_h):
+                    out = src
+                else:
+                    resample = PILImage.Resampling.LANCZOS if hasattr(PILImage, 'Resampling') else PILImage.LANCZOS
+                    out = src.resize((target_w, target_h), resample)
+                return out.tobytes('raw', 'RGB'), out.width, out.height
+            except Exception:
+                return None
+
+        try:
+            future = ImageLoader._executor.submit(worker)
+        except Exception:
+            return
+
+        def done(fut, gen=generation, tok=token, idx=index):
+            try:
+                result = fut.result()
+            except Exception:
+                result = None
+            self.load_bridge.hq_refined.emit(gen, tok, (idx, result))
+        future.add_done_callback(done)
+
+    def _on_hq_refine_ready(self, generation, token, payload):
+        # A newer refine (or a new resize/zoom/image) superseded this one.
+        if token != self._hq_refine_token or generation != self.load_generation:
+            return
+        index, result = payload
+        if result is None or index != self.current_index or self.current_movie:
+            return
+        raw, w, h = result
+        if w <= 0 or h <= 0:
+            return
+        qimg = QImage(raw, w, h, w * 3, QImage.Format_RGB888).copy()
+        if qimg.isNull():
+            return
+        pixmap = QPixmap.fromImage(qimg)
+        if pixmap.isNull():
+            return
+        current = self.image_label.pixmap()
+        # Only swap in if the label is still showing a same-size pixmap --
+        # if the window/zoom moved on again this refine no longer matches
+        # what should be on screen, and a newer _schedule_hq_refine call
+        # (with a bumped token) will already be on its way to replace it.
+        if current is None or current.size() != pixmap.size():
+            return
+        self.image_label.setPixmap(pixmap)
     
     def toggle_actual_size(self):
         self.fit_to_window = not self.fit_to_window
@@ -2940,6 +2923,7 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         self.slideshow.stop()
         self.cursor_hide_timer.stop()
+        self._hq_refine_timer.stop()
         # Stop creating new background work and release all worker threads.
         # This is important on Windows: ThreadPoolExecutor worker threads can
         # keep the process alive and retain large decoded images/ZIP handles.
