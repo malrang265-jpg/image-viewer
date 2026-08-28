@@ -153,22 +153,16 @@ class SingleApplication:
         self.socket = QLocalSocket()
         self.server = None
         self.file_received_callback = None
-        # A socket accepted in on_new_connection must be kept alive here
-        # (in Python, not just in Qt) until its message has fully arrived --
-        # otherwise nothing but the C++ side would own it, and it could be
-        # torn down before a slow sender finished writing.
-        self._pending_sockets = []
 
     def is_running(self):
         self.socket.connectToServer(self.app_name)
         # The already-running instance can only accept this connection once
-        # its GUI thread is free to process events -- e.g. it may be mid-
-        # decode of a large animated webp frame right now. 30ms was too
-        # tight for that and made this check false-negative under exactly
-        # that load, so double-clicking a file would silently launch a
-        # second, redundant window instead of forwarding the file to the
-        # one already open. A real "nothing is listening" case still fails
-        # almost immediately, so this doesn't slow down a normal cold start.
+        # its GUI thread is free -- e.g. it may be mid-decode of a large
+        # animated webp frame right now. 30ms was too tight for that and
+        # made this check false-negative under exactly that load. A real
+        # "nothing is listening" case still fails almost immediately (a
+        # refused connection isn't a timeout), so this doesn't slow down a
+        # normal cold start.
         return self.socket.waitForConnected(1000)
 
     def start_server(self):
@@ -182,53 +176,30 @@ class SingleApplication:
             # flush() alone doesn't guarantee the bytes actually left the
             # pipe -- Qt's own docs note the amount written depends on the
             # OS and say to use waitForBytesWritten() when not about to
-            # return to an event loop, which is exactly this case (the
-            # process calls sys.exit(0) right after this). Without waiting
-            # here, disconnectFromServer() could tear the pipe down before
-            # the message actually went out, silently dropping the file to
-            # open -- this combined with the receive-side timeout below was
-            # the main cause of double-click sometimes doing nothing.
+            # return to an event loop, which is exactly this case (this
+            # process calls sys.exit(0) right after send_message returns,
+            # so it never does). Without this wait, disconnectFromServer()
+            # right below could tear the pipe down before the message
+            # actually left, silently dropping the file to open.
             self.socket.waitForBytesWritten(2000)
             self.socket.disconnectFromServer()
-            if self.socket.state() != QLocalSocket.UnconnectedState:
-                self.socket.waitForDisconnected(1000)
 
     def on_new_connection(self):
         socket = self.server.nextPendingConnection()
         if socket is None:
             return
-        self._pending_sockets.append(socket)
-        buffer = QByteArray()
-
-        def cleanup():
-            try:
-                self._pending_sockets.remove(socket)
-            except ValueError:
-                pass
-            socket.deleteLater()
-
-        def handle_ready_read():
-            buffer.append(socket.readAll())
-
-        def handle_disconnected():
-            data = buffer.data().decode('utf-8', errors='ignore')
+        # The old fixed 30ms wait here regularly timed out before the
+        # sender's bytes had arrived whenever this GUI thread happened to
+        # be busy at that instant -- a large animated webp mid-frame-decode
+        # is the common case -- which silently dropped the file-switch
+        # request with no error and no retry. 3 seconds gives large
+        # headroom over any realistic decode stall while keeping this as
+        # the same plain, direct read the rest of this class already used.
+        if socket.waitForReadyRead(3000):
+            data = socket.readAll().data().decode('utf-8', errors='ignore')
             if self.file_received_callback and data:
                 self.file_received_callback(data)
-            cleanup()
-
-        # Read the incoming path asynchronously via signals instead of a
-        # short blocking waitForReadyRead(). The old fixed 30ms timeout
-        # raced against the GUI thread being busy (again, a large animated
-        # webp mid-frame-decode is the common case) and regularly elapsed
-        # before the sender's bytes had arrived, which silently dropped the
-        # file-switch request with no error and no retry. This way the data
-        # is picked up whenever the event loop is actually free to process
-        # it, however long that takes, instead of giving up on a clock.
-        socket.readyRead.connect(handle_ready_read)
-        socket.disconnected.connect(handle_disconnected)
-        # Safety net: if a sender connects but never finishes (e.g. it
-        # crashed mid-write), don't hold the socket open forever.
-        QTimer.singleShot(5000, lambda: cleanup() if socket in self._pending_sockets else None)
+        socket.disconnectFromServer()
 
     def set_file_received_callback(self, callback):
         self.file_received_callback = callback
