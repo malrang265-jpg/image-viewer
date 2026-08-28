@@ -125,11 +125,17 @@ def get_icon_path():
             return path
     return None
 
-def is_animated_webp(filepath):
-    """Return the animated webp's real frame count via Pillow, or 0 if it
-    isn't an animated webp. QMovie.frameCount() is unreliable for many
-    animated webp files (often reports 0), so callers that need an accurate
-    frame count for a webp use this instead of movie.frameCount()."""
+def get_frame_count(filepath):
+    """Return a file's real animated-frame count via Pillow, or 0 if it
+    isn't a multi-frame animation. Used for both gif and webp:
+    QMovie.frameCount() is unreliable for many animated webp files (often
+    reports 0), and for gif this is what tells a genuinely animated gif
+    apart from a single-frame one -- a single-frame gif has nothing to
+    animate, so it belongs on the normal static-image path instead of
+    QMovie. (A QMovie whose one frame never advances again also never gets
+    asked to redecode at a new size, so a later window resize can leave it
+    stuck showing that frame at the old size -- routing it away from
+    QMovie entirely sidesteps that instead of trying to patch around it.)"""
     try:
         Image = get_pil_image()
         with Image.open(filepath) as img:
@@ -147,32 +153,83 @@ class SingleApplication:
         self.socket = QLocalSocket()
         self.server = None
         self.file_received_callback = None
-    
+        # A socket accepted in on_new_connection must be kept alive here
+        # (in Python, not just in Qt) until its message has fully arrived --
+        # otherwise nothing but the C++ side would own it, and it could be
+        # torn down before a slow sender finished writing.
+        self._pending_sockets = []
+
     def is_running(self):
         self.socket.connectToServer(self.app_name)
-        if self.socket.waitForConnected(30):
-            return True
-        return False
-    
+        # The already-running instance can only accept this connection once
+        # its GUI thread is free to process events -- e.g. it may be mid-
+        # decode of a large animated webp frame right now. 30ms was too
+        # tight for that and made this check false-negative under exactly
+        # that load, so double-clicking a file would silently launch a
+        # second, redundant window instead of forwarding the file to the
+        # one already open. A real "nothing is listening" case still fails
+        # almost immediately, so this doesn't slow down a normal cold start.
+        return self.socket.waitForConnected(1000)
+
     def start_server(self):
         self.server = QLocalServer()
         self.server.listen(self.app_name)
         self.server.newConnection.connect(self.on_new_connection)
-    
+
     def send_message(self, message):
         if self.socket.state() == QLocalSocket.ConnectedState:
-            self.socket.write(message.encode())
-            self.socket.flush()
+            self.socket.write(message.encode('utf-8'))
+            # flush() alone doesn't guarantee the bytes actually left the
+            # pipe -- Qt's own docs note the amount written depends on the
+            # OS and say to use waitForBytesWritten() when not about to
+            # return to an event loop, which is exactly this case (the
+            # process calls sys.exit(0) right after this). Without waiting
+            # here, disconnectFromServer() could tear the pipe down before
+            # the message actually went out, silently dropping the file to
+            # open -- this combined with the receive-side timeout below was
+            # the main cause of double-click sometimes doing nothing.
+            self.socket.waitForBytesWritten(2000)
             self.socket.disconnectFromServer()
-    
+            if self.socket.state() != QLocalSocket.UnconnectedState:
+                self.socket.waitForDisconnected(1000)
+
     def on_new_connection(self):
         socket = self.server.nextPendingConnection()
-        if socket.waitForReadyRead(30):
-            data = socket.readAll().data().decode('utf-8', errors='ignore')
+        if socket is None:
+            return
+        self._pending_sockets.append(socket)
+        buffer = QByteArray()
+
+        def cleanup():
+            try:
+                self._pending_sockets.remove(socket)
+            except ValueError:
+                pass
+            socket.deleteLater()
+
+        def handle_ready_read():
+            buffer.append(socket.readAll())
+
+        def handle_disconnected():
+            data = buffer.data().decode('utf-8', errors='ignore')
             if self.file_received_callback and data:
                 self.file_received_callback(data)
-        socket.disconnectFromServer()
-    
+            cleanup()
+
+        # Read the incoming path asynchronously via signals instead of a
+        # short blocking waitForReadyRead(). The old fixed 30ms timeout
+        # raced against the GUI thread being busy (again, a large animated
+        # webp mid-frame-decode is the common case) and regularly elapsed
+        # before the sender's bytes had arrived, which silently dropped the
+        # file-switch request with no error and no retry. This way the data
+        # is picked up whenever the event loop is actually free to process
+        # it, however long that takes, instead of giving up on a clock.
+        socket.readyRead.connect(handle_ready_read)
+        socket.disconnected.connect(handle_disconnected)
+        # Safety net: if a sender connects but never finishes (e.g. it
+        # crashed mid-write), don't hold the socket open forever.
+        QTimer.singleShot(5000, lambda: cleanup() if socket in self._pending_sockets else None)
+
     def set_file_received_callback(self, callback):
         self.file_received_callback = callback
 
@@ -306,7 +363,15 @@ _ANIM_WORKER_COUNT = max(1, min(3, (os.cpu_count() or 4) // 2))
 
 class ImageLoader:
     _shutdown = False
-    SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+    # bmp/tif(f)/ico added on top of the original set -- Pillow already
+    # handles all of them (no new dependency), and none of them are ever
+    # animated here (see _load_animated_movie's ext check), so they go
+    # straight through the same static-image decode path as png/jpg: the
+    # QImageReader fast path with a PIL fallback, background-thread
+    # decoding, and the existing cache. No change to per-frame/playback
+    # cost for gif or webp.
+    SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp',
+                          '.bmp', '.tif', '.tiff', '.ico'}
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=_DECODE_WORKER_COUNT)
     _anim_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_WORKER_COUNT)
 
@@ -449,7 +514,7 @@ class CacheManager:
 
 class ZipHandler:
     _thread_local = threading.local()
-    _supported = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+    _supported = ImageLoader.SUPPORTED_FORMATS
 
     @staticmethod
     def is_zip(filename):
@@ -1048,7 +1113,7 @@ class SettingsDialog(QDialog):
     def choose_broken_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, '손상된 파일 대체 이미지 선택', '',
-            '이미지 파일 (*.png *.jpg *.jpeg *.gif *.webp)')
+            '이미지 파일 (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff *.ico)')
         if path:
             self.broken_image_path = path
             self.update_broken_image_label()
@@ -1931,12 +1996,11 @@ class ImageViewer(QMainWindow):
             is in use -- QMovie keeps reading frames from it as playback
             advances, it doesn't copy the data up front. It's None for a
             movie loaded straight from a real file path.
-          - frame_count is the animation's real frame count for a webp
-            (Pillow already had to report it for is_animated_webp below, so
-            it's free here -- movie.frameCount() is unreliable for many
-            animated webp files). It's None for a gif; movie.frameCount()
-            is reliable for Qt's own gif plugin, so callers can just use
-            that directly instead.
+          - frame_count is the animation's real frame count, for both gif
+            and webp (Pillow already had to report it via get_frame_count
+            below to confirm the file is actually animated, so it's free
+            here -- movie.frameCount() is unreliable for many animated
+            webp files).
           - source is the raw bytes read from the zip entry (or None when
             the file was read straight from current_file on disk). Callers
             that want a second, independent QMovie on the same data (e.g.
@@ -1956,14 +2020,15 @@ class ImageViewer(QMainWindow):
             except Exception:
                 return None, None, None, None
 
-        frame_count = None
-        if ext == '.webp':
-            # is_animated_webp also tells a static (single-frame) webp apart
-            # from an animated one; a static one belongs to the normal image
-            # path instead of QMovie.
-            frame_count = is_animated_webp(BytesIO(data) if data is not None else current_file)
-            if not frame_count:
-                return None, None, None, None
+        # get_frame_count tells a static (single-frame) gif/webp apart from
+        # a genuinely animated one; a static one belongs on the normal
+        # image path instead of QMovie. This used to only be checked for
+        # webp -- every .gif went straight to QMovie regardless of frame
+        # count -- which is what let a single-frame gif get stuck not
+        # resizing with the window (see get_frame_count's docstring).
+        frame_count = get_frame_count(BytesIO(data) if data is not None else current_file)
+        if not frame_count:
+            return None, None, None, None
 
         movie, buffer = self._build_qmovie(current_file, data)
         if movie is None:
@@ -2056,9 +2121,10 @@ class ImageViewer(QMainWindow):
             # Size the frame cache to fit the animation's whole loop
             # (bounded by a memory budget, since frames can be large),
             # instead of a flat 24-frame limit. The frame count is already
-            # known for free here -- Pillow already reported it for a webp
-            # (known_frame_count), and Qt's gif plugin reports it
-            # immediately for a gif -- so this costs no extra decoding.
+            # known for free here -- get_frame_count (via Pillow) already
+            # had to determine it for both gif and webp just to confirm
+            # the file is genuinely animated before reaching this point,
+            # so using it here costs no extra decoding.
             # A too-small fixed cache is what let a long/heavy animation's
             # frames get evicted before their next loop could reuse them,
             # so color processing (and the staleness that comes with it)
@@ -2491,7 +2557,7 @@ class ImageViewer(QMainWindow):
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, '이미지 열기', '',
-            '이미지 파일 (*.png *.jpg *.jpeg *.gif *.webp);;ZIP 파일 (*.zip);;모든 파일 (*)'
+            '이미지 파일 (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff *.ico);;ZIP 파일 (*.zip);;모든 파일 (*)'
         )
         if file_path:
             self.load_path(file_path)
