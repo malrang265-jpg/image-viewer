@@ -2450,7 +2450,19 @@ class ImageViewer(QMainWindow):
             scaled_size = None
             if self.current_movie_original_size.width() > 0:
                 if self.fit_to_window:
-                    scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                    # Same physical-pixel-target fix as
+                    # update_image_display's fit_to_window branch -- this
+                    # is a separate computation (for the very first frame,
+                    # before any resize/zoom event has happened) that was
+                    # missed when that one was fixed, which is why the
+                    # correct size only ever showed up *after* a window
+                    # resize forced update_image_display to run: switching
+                    # to a new animated image, or pressing "actual size" to
+                    # re-enter fit-to-window, kept landing here instead and
+                    # rendering at half the intended resolution on a
+                    # scaled display.
+                    dpr = self.devicePixelRatioF()
+                    scaled_size = self.current_movie_original_size.scaled(self.scroll_area.size() * dpr, Qt.KeepAspectRatio)
                 else:
                     scaled_size = QSize(int(self.current_movie_original_size.width() * self.zoom_factor),
                                          int(self.current_movie_original_size.height() * self.zoom_factor))
