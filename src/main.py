@@ -914,6 +914,7 @@ class ZipHandler:
 class ImageLoadBridge(QObject):
     loaded = pyqtSignal(int, str, object, bool)
     animated_frame = pyqtSignal(int, int, object)
+    hq_resample = pyqtSignal(int, object)
 
 class ImageListDialog(QDialog):
     def __init__(self, image_list, current_index, parent=None, current_zip=None):
@@ -1556,6 +1557,7 @@ class ImageViewer(QMainWindow):
         self.load_bridge = ImageLoadBridge()
         self.load_bridge.loaded.connect(self._on_background_loaded)
         self.load_bridge.animated_frame.connect(self._on_animated_frame_ready)
+        self.load_bridge.hq_resample.connect(self._on_hq_resample_ready)
         self.load_generation = 0
         self.loading_keys = set()
         # Cache the expensive color-adjusted source separately from the
@@ -1646,6 +1648,15 @@ class ImageViewer(QMainWindow):
         self._display_update_timer = QTimer(self)
         self._display_update_timer.setSingleShot(True)
         self._display_update_timer.timeout.connect(self.update_image_display)
+        # Fires once window-resize activity has been quiet for a bit -- see
+        # resizeEvent and _apply_high_quality_resample. Kept separate from
+        # _display_update_timer above (which redraws immediately, cheaply,
+        # on every resize event for responsiveness) so the expensive
+        # Lanczos re-render only happens once, after resizing settles.
+        self._hq_resample_timer = QTimer(self)
+        self._hq_resample_timer.setSingleShot(True)
+        self._hq_resample_timer.timeout.connect(self._apply_high_quality_resample)
+        self._hq_resample_inflight = False
         self.init_ui()
         self.load_settings()
         self.setup_icon()
@@ -2877,13 +2888,100 @@ class ImageViewer(QMainWindow):
                 scaled.setDevicePixelRatio(self.devicePixelRatioF())
                 self.image_label.setPixmap(scaled)
             self.image_label.adjustSize()
-    
+
+    def _apply_high_quality_resample(self):
+        """Re-renders the currently displayed fit-to-window image with a
+        sharper Lanczos resample, replacing the quick
+        Qt.SmoothTransformation result update_image_display used moments
+        ago. Only fires once window-resize activity has been quiet for a
+        bit (see resizeEvent/toggle_actual_size) -- Lanczos (via Pillow)
+        is noticeably sharper than Qt's built-in smooth scaling for a
+        significant downscale like fit-to-window often needs, but
+        measured at up to ~1 second for a large (24MP-ish) photo, which
+        is far too slow to run on the GUI thread synchronously (that
+        would freeze the window for up to a second right as resizing
+        stops) or to redo on every single resize event during an active
+        drag. So this dispatches to the shared decode pool and applies
+        the result asynchronously instead -- see _on_hq_resample_ready.
+        Static images only (an animated frame changes every fraction of a
+        second regardless, so there's no "settled" moment for this to
+        wait for)."""
+        if not self.fit_to_window or self.current_movie or not self.current_pixmap:
+            return
+        if self._hq_resample_inflight:
+            # A previous pass is still working through a large image; let
+            # it finish rather than piling more Lanczos work onto the
+            # shared decode pool. Later resize events keep re-arming this
+            # timer, so a fresh pass still happens once things quiet down
+            # again and the pool is free.
+            return
+        dpr = self.devicePixelRatioF()
+        target = self.scroll_area.size() * dpr
+        target_w, target_h = target.width(), target.height()
+        if target_w <= 0 or target_h <= 0:
+            return
+        try:
+            rgba = self.current_pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
+            w, h = rgba.width(), rgba.height()
+            if w <= 0 or h <= 0:
+                return
+            ptr = rgba.bits()
+            ptr.setsize(rgba.byteCount())
+            raw = bytes(ptr)
+        except Exception:
+            return
+        generation = self.load_generation
+        self._hq_resample_inflight = True
+        def worker():
+            try:
+                Image = get_pil_image()
+                src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1).convert('RGB')
+                resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                src.thumbnail((target_w, target_h), resample)
+                return src.tobytes('raw', 'RGB'), src.width, src.height
+            except Exception:
+                return None
+        future = ImageLoader._executor.submit(worker)
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception:
+                result = None
+            self.load_bridge.hq_resample.emit(generation, (result, target_w, target_h))
+        future.add_done_callback(done)
+
+    def _on_hq_resample_ready(self, generation, payload):
+        self._hq_resample_inflight = False
+        result, expected_w, expected_h = payload
+        if generation != self.load_generation or not self.fit_to_window or self.current_movie:
+            return
+        # If the window was resized again while this was computing, a
+        # newer pass is already scheduled (resizeEvent restarts the timer
+        # on every resize event) -- skip this now-stale result rather than
+        # briefly showing an image sized for the window's previous size.
+        current_target = self.scroll_area.size() * self.devicePixelRatioF()
+        if (abs(current_target.width() - expected_w) > 2
+                or abs(current_target.height() - expected_h) > 2):
+            return
+        if not result:
+            return
+        raw, w, h = result
+        qimg = QImage(raw, w, h, w * 3, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(qimg)
+        if pixmap.isNull():
+            return
+        pixmap.setDevicePixelRatio(self.devicePixelRatioF())
+        self.image_label.setPixmap(pixmap)
+        self.image_label.adjustSize()
+
     def toggle_actual_size(self):
         self.fit_to_window = not self.fit_to_window
         if self.fit_to_window:
             self.zoom_factor = 1.0
         # The fit-to-window cache may be a reduced decode; actual-size needs the full source.
         self.show_current_image()
+        if self.fit_to_window:
+            self._hq_resample_timer.start(250)
     
     def next_image(self):
         if self.image_list and self.current_index < len(self.image_list) - 1:
@@ -3241,6 +3339,15 @@ class ImageViewer(QMainWindow):
         super().resizeEvent(event)
         if self.fit_to_window and not self._display_update_timer.isActive():
             self._display_update_timer.start(8)
+        if self.fit_to_window:
+            # Restarted (not just started-if-idle like the timer above) on
+            # every resize event, so it only actually fires once resizing
+            # has been quiet for the delay -- redoing a Lanczos resample on
+            # every single resize event during an active drag would make
+            # the drag itself feel laggy, which is a worse trade than a
+            # brief moment of slightly-softer image right after a resize
+            # or fit-to-window toggle.
+            self._hq_resample_timer.start(250)
     
     def closeEvent(self, event: QCloseEvent):
         self.show_cursor()
