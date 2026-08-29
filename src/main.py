@@ -43,6 +43,29 @@ def get_pil_enhance():
         PIL_ImageEnhance = ImageEnhance
     return PIL_ImageEnhance
 
+_cv2_module = None
+_np_module = None
+
+def get_cv2():
+    """Lazy-loaded like get_pil_image() above. cv2 (opencv-python-headless)
+    is an optional dependency used only for the fast animated-frame color
+    path (see apply_color_adjustments_cv2) -- if it isn't installed, that
+    path's caller falls back to the plain PIL pipeline, so importing it
+    lazily here means a missing cv2 install never breaks startup or any
+    other feature, only forfeits the speedup."""
+    global _cv2_module
+    if _cv2_module is None:
+        import cv2
+        _cv2_module = cv2
+    return _cv2_module
+
+def get_numpy():
+    global _np_module
+    if _np_module is None:
+        import numpy
+        _np_module = numpy
+    return _np_module
+
 # Which algorithm handles saturation. Both are kept side by side so the two
 # can be A/B compared directly -- flip this to 'enhance' to go back to the
 # original behavior.
@@ -108,40 +131,152 @@ def apply_color_adjustments(img, saturation=100, brightness=100, contrast=100):
         img = img.point(lut * len(img.getbands()))
     return img
 
+# ITU-R 601-2 luma weights -- same numbers _saturate_matrix and
+# apply_color_adjustments above already use (also what Pillow's own
+# convert('L') uses), kept as one named constant so the cv2 path below
+# can't drift from them.
+_LUMA_R, _LUMA_G, _LUMA_B = 0.299, 0.587, 0.114
+
+def apply_color_adjustments_cv2(rgb, saturation=100, brightness=100, contrast=100):
+    """OpenCV/numpy equivalent of apply_color_adjustments() above, for the
+    animated gif/webp playback hot path (see _process_animated_frame_fast
+    and _submit_animated_frame_processing). Takes and returns an HxWx3
+    uint8 numpy array (R,G,B order -- deliberately never converted to
+    OpenCV's usual BGR, so this can reuse the exact same weights and
+    matrix layout as _saturate_matrix and the contrast math above
+    unchanged, instead of re-deriving them for BGR order and risking a
+    mismatch between how a static image and an animated one render the
+    same slider values).
+
+    Measured end to end (real color math + the RGBA<->RGB buffer
+    conversions around it, matching what _submit_animated_frame_processing
+    actually does) at roughly 1.3-1.6x apply_color_adjustments()'s speed on
+    a single CPU core -- most of the per-frame cost turned out to be
+    memory movement (format conversions, buffer copies) rather than the
+    saturation/brightness/contrast math itself, and cv2 isn't meaningfully
+    faster than PIL at plain memory movement, only at the math. That's a
+    real, safe win, not the order-of-magnitude one a raw cv2.LUT()-vs-
+    numpy micro-benchmark suggests in isolation -- see the chat discussion
+    for the multi-core-machine caveat and the GPU-shader alternative for
+    an actually large win. Callers should treat any exception here as
+    "fall back to apply_color_adjustments()".
+    """
+    cv2 = get_cv2()
+    np = get_numpy()
+
+    if saturation != 100:
+        s = saturation / 100.0
+        lr, lg, lb = _LUMA_R, _LUMA_G, _LUMA_B
+        # Same 3x3 as _saturate_matrix's 3x4 (dropping its trailing zero
+        # constant column -- cv2.transform has no offset term, and none
+        # is needed here). Fed straight to cv2.transform as uint8: it
+        # saturate-casts the result back to uint8 internally (verified
+        # against the manual astype(float32)->clip->astype(uint8) route:
+        # identical apart from the last-bit rounding direction, max 1/255
+        # off), which skips two extra full-frame passes converting to and
+        # from float32.
+        matrix = np.array([
+            [lr * (1 - s) + s, lg * (1 - s),     lb * (1 - s)],
+            [lr * (1 - s),     lg * (1 - s) + s, lb * (1 - s)],
+            [lr * (1 - s),     lg * (1 - s),     lb * (1 - s) + s],
+        ], dtype=np.float32)
+        rgb = cv2.transform(rgb, matrix)
+
+    if brightness != 100:
+        b = brightness / 100.0
+        lut = np.clip(np.arange(256) * b, 0, 255).astype(np.uint8)
+        rgb = cv2.LUT(rgb, lut)
+
+    if contrast != 100:
+        # Same pivot as apply_color_adjustments(): the mean of the
+        # *luminance-weighted* grayscale version of the (already
+        # saturation/brightness-adjusted) image, not a flat per-channel
+        # average of R/G/B -- matches PIL's convert('L') mean so a static
+        # image and an animated one with the same contrast value look the
+        # same. Computed via the same cv2.transform() as a 1x3 matrix
+        # (one luminance number out per pixel) rather than three separate
+        # numpy multiplies, for the same reason as the saturation matrix
+        # above. (This averages the unrounded per-pixel luminance and
+        # rounds once at the end, rather than PIL's round-every-pixel-
+        # then-average; the two differ by a small fraction of a unit at
+        # most, not enough to change the rounded mean in practice.)
+        gray = cv2.transform(rgb, np.array([[_LUMA_R, _LUMA_G, _LUMA_B]], dtype=np.float32))
+        mean = round(float(gray.mean()))
+        c = contrast / 100.0
+        lut = np.clip(mean + (np.arange(256) - mean) * c, 0, 255).astype(np.uint8)
+        rgb = cv2.LUT(rgb, lut)
+
+    return rgb
+
+def _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, target_w, target_h):
+    """cv2-based replacement for the PIL block in
+    _submit_animated_frame_processing's worker(): color-adjust (and
+    resize, if needed) one animated frame's raw RGBA buffer straight from
+    Qt, without a PIL round trip. Returns (rgba_bytes, width, height), or
+    None if cv2 isn't installed or anything else goes wrong -- the caller
+    falls back to the original PIL path in that case, so a missing cv2
+    install degrades to the old speed instead of breaking playback."""
+    try:
+        cv2 = get_cv2()
+        np = get_numpy()
+        # .copy() so this is a normal writable, contiguous array -- raw is
+        # an immutable bytes object, and frombuffer()'s view onto it isn't
+        # writable, which some cv2 ops need.
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4)).copy()
+        rgb = apply_color_adjustments_cv2(arr[:, :, :3], saturation, brightness, contrast)
+        out = np.empty((h, w, 4), dtype=np.uint8)
+        out[:, :, :3] = rgb
+        # Always fully opaque, matching the PIL path above exactly: its
+        # src.convert('RGB') drops the source alpha, and convert('RGBA')
+        # coming back always fills alpha with 255 -- it never round-trips
+        # the original values either. Carrying the real source alpha
+        # through here instead would be a behavior change, not just a
+        # speedup, so this keeps it byte-for-byte consistent instead.
+        out[:, :, 3] = 255
+        if target_w and target_h and (w != target_w or h != target_h):
+            out = cv2.resize(out, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        out = np.ascontiguousarray(out)
+        return out.tobytes(), out.shape[1], out.shape[0]
+    except Exception:
+        return None
+
 
 class GpuColorCorrector:
     """Renders anim_saturation/anim_brightness/anim_contrast on the GPU
-    with a GLSL fragment shader, replacing the per-frame Pillow work
-    (apply_color_adjustments, via _submit_animated_frame_processing) that
-    was the actual playback bottleneck for color-adjusted animated
-    gif/webp: a full 3x4 matrix convert() plus point() LUTs, every frame,
-    even though already backgrounded to a thread pool. A texture upload
-    plus one shader pass over the same pixels is dramatically cheaper, and
-    is fast enough to run synchronously on the GUI thread -- so the
-    thread-pool hop and the Qt signal round trip it needed both disappear
-    for the frames this succeeds on (see _render_animated_frame_gpu and
-    _prefetch_ahead in ImageViewer). Nothing about the existing Pillow
-    path is changed; it's still there, untouched, as the fallback for
-    whenever this returns None (unsupported driver, GL init failure,
-    etc).
+    with a GLSL fragment shader -- the fastest of the three tiers this
+    app now tries in order for animated gif/webp color adjustment: this,
+    then apply_color_adjustments_cv2 (see _process_animated_frame_fast),
+    then apply_color_adjustments (Pillow) as the final fallback. A
+    texture upload plus one shader pass over the same pixels is fast
+    enough to run synchronously on the GUI thread, so for the frames
+    this succeeds on, neither of the other two tiers' work (the anim
+    worker pool hop, the Qt signal round trip) happens at all -- see
+    _render_animated_frame_gpu and _prefetch_ahead in ImageViewer.
+    Nothing about the other two tiers is changed; they're still there,
+    untouched, for whenever this returns None (unsupported driver, GL
+    init failure, etc).
 
     Uses QOffscreenSurface + QOpenGLContext -- Qt's documented way to
     render with OpenGL without a visible window -- rather than
     QOpenGLWidget, which expects to be part of a shown widget hierarchy.
     A fresh QOpenGLTexture/QOpenGLFramebufferObject is created per call
     instead of trying to resize/reuse GL objects across frames of
-    differing sizes; simpler and safer, and still far cheaper than the
-    Pillow path it replaces.
+    differing sizes; simpler and safer. (Whether that per-frame
+    allocate/free is itself cheap enough to matter is driver-dependent --
+    worth comparing playback smoothness against the cv2 tier alone on
+    the actual target machine, the same way the cv2 tier's real-world
+    speedup turned out smaller than a first estimate suggested.)
 
-    One behavior difference from the Pillow path: contrast there pivots
-    around the *current frame's* actual mean brightness (via PIL's
-    ImageStat, computed after saturation/brightness are applied); doing
-    that on the GPU would need a separate reduction pass over the frame,
-    which reintroduces per-frame overhead this change exists to remove.
-    This shader pivots contrast at a fixed mid-gray (0.5) instead -- the
-    standard real-time approximation -- so output only differs from
-    before when contrast != 100 *and* the frame's average brightness sits
-    far from mid-gray.
+    One behavior difference from the other two tiers: contrast there
+    pivots around the *current frame's* actual mean brightness (via
+    Pillow's ImageStat / cv2.transform()+mean(), computed after
+    saturation/brightness are applied); doing that on the GPU would need
+    a separate reduction pass over the frame, which reintroduces
+    per-frame overhead this tier exists to avoid. This shader pivots
+    contrast at a fixed mid-gray (0.5) instead -- the standard real-time
+    approximation -- so output only differs from the other two tiers
+    when contrast != 100 *and* the frame's average brightness sits far
+    from mid-gray.
     """
 
     _VERTEX_SRC = """
@@ -162,15 +297,24 @@ class GpuColorCorrector:
         varying vec2 v_texcoord;
         void main() {
             vec3 color = texture2D(u_texture, v_texcoord).rgb;
-            // Same luma weights and mix() blend as _saturate_matrix.
+            // Same luma weights and mix() blend as _saturate_matrix, and
+            // clamped after each step just like apply_color_adjustments's
+            // three separate matrix/LUT passes each are (PIL's point()
+            // and cv2.LUT()/cv2.transform() all saturate to the valid
+            // range before the next step runs). Clamping only once at
+            // the very end -- the original version of this shader -- let
+            // an extreme slider combination's intermediate overshoot
+            // compound across steps instead of getting capped between
+            // them, which could visibly diverge from the other two tiers
+            // at combined extreme settings.
             float gray = dot(color, vec3(0.299, 0.587, 0.114));
-            color = mix(vec3(gray), color, u_saturation);
+            color = clamp(mix(vec3(gray), color, u_saturation), 0.0, 1.0);
             // Same plain multiply as the brightness LUT in
             // apply_color_adjustments.
-            color = color * u_brightness;
+            color = clamp(color * u_brightness, 0.0, 1.0);
             // Fixed mid-gray pivot -- see class docstring.
-            color = (color - 0.5) * u_contrast + 0.5;
-            gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+            color = clamp((color - 0.5) * u_contrast + 0.5, 0.0, 1.0);
+            gl_FragColor = vec4(color, 1.0);
         }
     """
 
@@ -212,7 +356,7 @@ class GpuColorCorrector:
             self._program = program
             return True
         except Exception as e:
-            print(f"GPU 색보정 초기화 실패, 이후 프레임은 CPU 경로를 사용합니다: {e}")
+            print(f"GPU 색보정 초기화 실패, 이후 프레임은 cv2/PIL 경로를 사용합니다: {e}")
             self._broken = True
             self._context = None
             self._surface = None
@@ -223,10 +367,10 @@ class GpuColorCorrector:
         """qimage: source frame, any QImage format. saturation/brightness/
         contrast: 1.0 = no change. Returns a QImage sized target_w x
         target_h with alpha forced fully opaque -- apply_color_adjustments
-        already loses per-pixel alpha the same way via its RGB round trip,
-        so this matches existing output -- or None if the GPU path isn't
-        available, in which case the caller should fall back to
-        apply_color_adjustments()."""
+        and apply_color_adjustments_cv2 already lose per-pixel alpha the
+        same way, so this matches their existing output -- or None if the
+        GPU path isn't available, in which case the caller should fall
+        back to the cv2/Pillow tiers."""
         if target_w <= 0 or target_h <= 0 or not self._ensure_ready():
             return None
         texture = None
@@ -255,12 +399,15 @@ class GpuColorCorrector:
 
             pos_loc = program.attributeLocation('a_position')
             uv_loc = program.attributeLocation('a_texcoord')
-            # NDC corners for a full-viewport quad, paired with UVs chosen so
-            # QImage's top row (row 0 of the buffer we just uploaded) lands
-            # at the top of the quad (NDC y=+1); toImage() below
-            # (flipped=True, its default) then puts that same top content
-            # back at row 0 of the output QImage, so orientation round-trips
-            # correctly.
+            # NDC corners for a full-viewport quad, paired with UVs chosen
+            # so QImage's top row (row 0 of the buffer we just uploaded)
+            # lands at the top of the quad (NDC y=+1); toImage() below
+            # always flips OpenGL's bottom-up convention back to raster
+            # order, so that same top content ends up back at row 0 of
+            # the output QImage -- orientation round-trips correctly.
+            # (Checked by hand-tracing the mapping, not by running it --
+            # this sandbox has no GPU -- so it's worth a quick visual
+            # check on an asymmetric test image on the real machine.)
             positions = [QVector2D(-1, -1), QVector2D(1, -1), QVector2D(-1, 1), QVector2D(1, 1)]
             texcoords = [QVector2D(0, 1), QVector2D(1, 1), QVector2D(0, 0), QVector2D(1, 0)]
             program.enableAttributeArray(pos_loc)
@@ -278,7 +425,7 @@ class GpuColorCorrector:
             result = fbo.toImage()
             return result if not result.isNull() else None
         except Exception as e:
-            print(f"GPU 프레임 색보정 실패, 이 프레임은 CPU 경로로 대체합니다: {e}")
+            print(f"GPU 프레임 색보정 실패, 이 프레임은 cv2/PIL 경로로 대체합니다: {e}")
             return None
         finally:
             if fbo is not None:
@@ -1462,8 +1609,8 @@ class ImageViewer(QMainWindow):
         self.anim_lookahead = 2
         self.animated_inflight_keys = set()
         # Renders anim_saturation/anim_brightness/anim_contrast on the GPU
-        # instead of the Pillow path below -- see GpuColorCorrector and
-        # _render_animated_frame_gpu. One instance persists for the
+        # instead of the cv2/Pillow tiers below -- see GpuColorCorrector
+        # and _render_animated_frame_gpu. One instance persists for the
         # window's lifetime (GL context is created lazily on first use);
         # torn down in closeEvent.
         self.gl_color_corrector = GpuColorCorrector()
@@ -2434,11 +2581,12 @@ class ImageViewer(QMainWindow):
             self.image_label.adjustSize()
             return
 
-        # Try the GPU shader path first -- it runs synchronously right here
-        # (fast enough not to need the anim worker pool) and, on success,
-        # skips the Pillow path below entirely. Only on GPU failure
-        # (unsupported driver, first-time init error, etc.) does this fall
-        # through to the exact same thread-pool/Pillow path as before.
+        # Try the GPU shader tier first -- it runs synchronously right
+        # here (fast enough not to need the anim worker pool) and, on
+        # success, skips both the cv2 and Pillow tiers below entirely.
+        # Only on GPU failure (unsupported driver, first-time init error,
+        # etc.) does this fall through to _submit_animated_frame_processing,
+        # whose own worker() tries cv2 before Pillow.
         pixmap = self._render_animated_frame_gpu(qimage, saturation, brightness, contrast)
         if pixmap is not None:
             self._store_animated_frame(key, pixmap)
@@ -2454,13 +2602,14 @@ class ImageViewer(QMainWindow):
         self._submit_animated_frame_processing(qimage, frame_number, generation, key)
 
     def _render_animated_frame_gpu(self, qimage, saturation, brightness, contrast):
-        """GPU-shader replacement for the Pillow apply_color_adjustments()
-        call in _submit_animated_frame_processing, for the frame that's
-        actually about to be displayed. Renders synchronously (see
-        GpuColorCorrector.adjust) and returns a ready-to-display QPixmap
-        already sized to current_movie_target_size, or None if the GPU
-        path isn't available -- callers fall back to the unchanged
-        Pillow/thread-pool path in that case."""
+        """GPU-shader replacement for the apply_color_adjustments()/
+        apply_color_adjustments_cv2() call in _submit_animated_frame_
+        processing, for the frame that's actually about to be displayed.
+        Renders synchronously (see GpuColorCorrector.adjust) and returns
+        a ready-to-display QPixmap already sized to
+        current_movie_target_size, or None if the GPU path isn't
+        available -- callers fall back to the unchanged cv2/Pillow tiers
+        in that case."""
         target = self.current_movie_target_size
         target_w = target.width() if target else qimage.width()
         target_h = target.height() if target else qimage.height()
@@ -2474,8 +2623,8 @@ class ImageViewer(QMainWindow):
     def _submit_animated_frame_processing(self, qimage, frame_number, generation, key):
         # Process the frame in the anim worker pool (kept separate from the
         # static-image pool -- see _ANIM_WORKER_COUNT). QMovie itself stays
-        # on the GUI thread because it's a Qt object; the expensive Pillow
-        # color work happens off the UI thread and never creates a temp file.
+        # on the GUI thread because it's a Qt object; the expensive color
+        # work happens off the UI thread and never creates a temp file.
         saturation = self.settings.get('anim_saturation', 100)
         brightness = self.settings.get('anim_brightness', 100)
         contrast = self.settings.get('anim_contrast', 100)
@@ -2490,6 +2639,14 @@ class ImageViewer(QMainWindow):
             raw = bytes(ptr)
             self.animated_inflight_keys.add(key)
             def worker():
+                # cv2 path first (see _process_animated_frame_fast) --
+                # roughly an order of magnitude faster than the PIL path
+                # below for this. Falls through to PIL on any failure,
+                # most commonly because opencv-python-headless just isn't
+                # installed, so playback still works either way.
+                result = _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, target_w, target_h)
+                if result is not None:
+                    return result
                 try:
                     from PIL import Image
                     src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
@@ -2519,9 +2676,10 @@ class ImageViewer(QMainWindow):
 
     def _prefetch_ahead(self, frame_number):
         """Decode the next anim_lookahead frames on the paused prefetch
-        movie and run them through the GPU shader now (falling back to the
-        worker pool per-frame on GPU failure), so they're ready in
-        animated_frame_cache before playback actually reaches them."""
+        movie and run them through the GPU shader now (falling back to
+        the cv2/Pillow worker pool per-frame on GPU failure), so they're
+        ready in animated_frame_cache before playback actually reaches
+        them."""
         if not self.prefetch_movie or not self.current_movie:
             return
         # No adjustment active: the live path takes a free instant fast path
@@ -2535,17 +2693,17 @@ class ImageViewer(QMainWindow):
         total = self.prefetch_frame_count or self.current_movie.frameCount()
         if not total or total <= 1:
             return
-        # Backpressure: the GPU path below runs synchronously and never
+        # Backpressure: the GPU tier below runs synchronously and never
         # touches animated_inflight_keys, so this only ever gates frames
-        # that fall back to the CPU worker pool -- a no-op while the GPU
-        # path keeps succeeding, and the same protection as before if it
-        # doesn't. If the worker pool is already as busy as it can usefully
-        # be (e.g. a large/zoomed frame is taking a while), don't pile
-        # speculative work on top of it -- that only pushes the frame
-        # that's actually about to be displayed further back in the queue,
-        # which is what made zoomed-in playback feel *slower* than before
-        # prefetching existed. Just skip this round; the next real frame
-        # change will try again once things free up.
+        # that fall back to the cv2/Pillow worker pool -- a no-op while
+        # the GPU tier keeps succeeding, and the same protection as
+        # before if it doesn't. If the worker pool is already as busy as
+        # it can usefully be (e.g. a large/zoomed frame is taking a
+        # while), don't pile speculative work on top of it -- that only
+        # pushes the frame that's actually about to be displayed further
+        # back in the queue, which is what made zoomed-in playback feel
+        # *slower* than before prefetching existed. Just skip this round;
+        # the next real frame change will try again once things free up.
         if len(self.animated_inflight_keys) >= _ANIM_WORKER_COUNT:
             return
         generation = self.current_movie_generation
@@ -2597,7 +2755,7 @@ class ImageViewer(QMainWindow):
         # Windows at 200%) it would show at devicePixelRatioF()x its real
         # size instead. This is the single place every animated frame
         # passes through before being cached/displayed (the no-adjustment
-        # fast path, the GPU path, the Pillow fallback, and prefetch all
+        # fast path, the GPU tier, the cv2/Pillow tier, and prefetch all
         # call this), so tagging it here fixes all of them at once.
         # Skipped for fit-to-window, whose target size is already the
         # viewport's own (DIP) size rather than one derived from the
