@@ -2034,8 +2034,18 @@ class ImageViewer(QMainWindow):
         if not self.fit_to_window:
             return None
         size = self.scroll_area.size()
-        # Small safety margin prevents repeated reloads caused by tiny widget changes.
-        return (max(64, size.width() + 64), max(64, size.height() + 64))
+        dpr = self.devicePixelRatioF()
+        # Decode at physical-pixel resolution, not device-independent-pixel
+        # resolution -- on a scaled display (e.g. Windows at 200%) the DIP
+        # size is only half the physical detail the screen can actually
+        # show, so fit-to-window images decoded at that size look softer
+        # than they need to. The matching fix that actually keeps this
+        # extra detail on screen instead of immediately downscaling it away
+        # again is the scaled-to-physical-size + setDevicePixelRatio() call
+        # in update_image_display's fit_to_window branch below.
+        # Small safety margin (also scaled) prevents repeated reloads
+        # caused by tiny widget changes.
+        return (max(64, int((size.width() + 64) * dpr)), max(64, int((size.height() + 64) * dpr)))
 
     def _source_cache_get(self, key):
         value = self._source_image_cache.get(key)
@@ -2749,20 +2759,19 @@ class ImageViewer(QMainWindow):
             self.image_label.adjustSize()
 
     def _store_animated_frame(self, key, pixmap):
-        # "Actual size" (fit_to_window == False) is meant to show one image
-        # pixel per physical screen pixel. An untagged QPixmap is laid out
-        # in device-independent pixels, so on a scaled display (e.g.
-        # Windows at 200%) it would show at devicePixelRatioF()x its real
-        # size instead. This is the single place every animated frame
-        # passes through before being cached/displayed (the no-adjustment
-        # fast path, the GPU tier, the cv2/Pillow tier, and prefetch all
-        # call this), so tagging it here fixes all of them at once.
-        # Skipped for fit-to-window, whose target size is already the
-        # viewport's own (DIP) size rather than one derived from the
-        # frame's native pixel dimensions -- tagging it too would make it
-        # render at half the intended size.
-        if not self.fit_to_window:
-            pixmap.setDevicePixelRatio(self.devicePixelRatioF())
+        # Every animated frame is now rendered at physical-pixel
+        # resolution before reaching here -- update_image_display's
+        # fit_to_window branch targets scroll_area.size() * dpr (for
+        # sharpness on a scaled display), and the non-fit-to-window branch
+        # targets native_size * zoom_factor, which is a physical-pixel
+        # quantity by construction. An untagged QPixmap is laid out in
+        # device-independent pixels, so either way it would show at
+        # devicePixelRatioF()x its intended size without this. This is the
+        # single place every animated frame passes through before being
+        # cached/displayed (the no-adjustment fast path, the GPU tier, the
+        # cv2/Pillow tier, and prefetch all call this), so tagging it here
+        # fixes all of them at once.
+        pixmap.setDevicePixelRatio(self.devicePixelRatioF())
         self.animated_frame_cache[key] = pixmap
         self.animated_frame_cache.move_to_end(key)
         while len(self.animated_frame_cache) > self.animated_frame_cache_limit:
@@ -2811,7 +2820,16 @@ class ImageViewer(QMainWindow):
                         self.current_movie_original_size = original_size
                 if original_size.width() > 0 and original_size.height() > 0:
                     if self.fit_to_window:
-                        scaled_size = original_size.scaled(self.scroll_area.size(), Qt.KeepAspectRatio)
+                        # Physical-pixel target, same reasoning as
+                        # _target_decode_size for the static-image path --
+                        # scaling to the bare DIP viewport size here would
+                        # throw away half the detail on a 200%-scaled
+                        # display before it ever reached the screen.
+                        # _store_animated_frame's setDevicePixelRatio()
+                        # call is what keeps this rendering at the correct
+                        # on-screen size despite the larger pixel count.
+                        dpr = self.devicePixelRatioF()
+                        scaled_size = original_size.scaled(self.scroll_area.size() * dpr, Qt.KeepAspectRatio)
                     else:
                         scaled_size = QSize(int(original_size.width() * self.zoom_factor),
                                            int(original_size.height() * self.zoom_factor))
@@ -2829,11 +2847,19 @@ class ImageViewer(QMainWindow):
         
         if self.current_pixmap:
             if self.fit_to_window:
+                dpr = self.devicePixelRatioF()
                 scaled = self.current_pixmap.scaled(
-                    self.scroll_area.size(),
+                    self.scroll_area.size() * dpr,
                     Qt.KeepAspectRatio,
                     Qt.FastTransformation if self.settings.get('zoom_quality', 'balanced') == 'speed' else Qt.SmoothTransformation
                 )
+                # current_pixmap is now decoded at physical resolution too
+                # (see _target_decode_size), so without this the extra
+                # detail decoded above would just get thrown away again
+                # right here -- same reasoning as the zoom branch below and
+                # _store_animated_frame's version of this for animated
+                # frames.
+                scaled.setDevicePixelRatio(dpr)
                 self.image_label.setPixmap(scaled)
             else:
                 new_size = self.current_pixmap.size() * self.zoom_factor
