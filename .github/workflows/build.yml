@@ -19,19 +19,19 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PyQt5 Pillow opencv-python-headless pyinstaller
+          pip install PyQt5 Pillow pyinstaller
 
       - name: Build with icon
         working-directory: src
         shell: cmd
         run: |
           if exist icon.ico (
-            pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm --clean --hidden-import numpy --hidden-import cv2 main.py
+            pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm --clean main.py
           ) else if exist ..\icon.ico (
             copy ..\icon.ico .
-            pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm --clean --hidden-import numpy --hidden-import cv2 main.py
+            pyinstaller --windowed --icon=icon.ico --add-data "icon.ico;." --name Pekoviewer --noconfirm --clean main.py
           ) else (
-            pyinstaller --windowed --name Pekoviewer --noconfirm --clean --hidden-import numpy --hidden-import cv2 main.py
+            pyinstaller --windowed --name Pekoviewer --noconfirm --clean main.py
           )
 
       - name: Upload Portable Folder
