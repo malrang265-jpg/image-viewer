@@ -3703,6 +3703,28 @@ class ImageViewer(QMainWindow):
         target_w, target_h = target.width(), target.height()
         if target_w <= 0 or target_h <= 0:
             return
+        # current_pixmap only ever holds as much resolution as
+        # _target_decode_size() asked for at the window size that was
+        # current when it was decoded (see _submit_image_load). If the
+        # window has since grown past that -- most obviously right after
+        # launch, when double-clicking the file opens a small/default
+        # window and the window is then immediately maximized/fullscreened
+        # -- current_pixmap is now smaller than target_w x target_h.
+        # PIL's thumbnail() below never upscales an image past its current
+        # size, so resampling it here wouldn't sharpen anything -- it would
+        # just re-clamp the image back down to that old, smaller size,
+        # visibly shrinking it right after update_image_display's quick
+        # Qt-upscale had already shown it correctly large (the
+        # grows-then-snaps-back-to-actual-size bug). When the source is too
+        # small like this, ask the loader for a proper re-decode at the
+        # new, larger target size instead of resampling what we already
+        # have -- show_current_image() serves it from cache if that size
+        # was already decoded, or decodes it in the background and shows
+        # it via the normal _on_background_loaded -> _display_pixmap path
+        # once ready, same as navigating to a new image does.
+        if self.current_pixmap.width() < target_w - 2 or self.current_pixmap.height() < target_h - 2:
+            self.show_current_image()
+            return
         try:
             rgba = self.current_pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
             w, h = rgba.width(), rgba.height()
