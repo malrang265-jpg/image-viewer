@@ -3718,10 +3718,20 @@ class ImageViewer(QMainWindow):
         def worker():
             try:
                 Image = get_pil_image()
-                src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1).convert('RGB')
+                # Stay in RGBA the whole way through -- converting to RGB
+                # here (an earlier version of this did) drops the alpha
+                # channel entirely, and Image.convert('RGB') doesn't
+                # composite transparent pixels onto anything first, it
+                # just keeps whatever RGB values happened to be stored
+                # under the now-discarded alpha -- which for a PNG with a
+                # transparent background is often solid black. That's what
+                # was turning transparent backgrounds black the moment
+                # this high-quality pass replaced the initial (correctly
+                # transparent) Qt-scaled pixmap.
+                src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
                 resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
                 src.thumbnail((target_w, target_h), resample)
-                return src.tobytes('raw', 'RGB'), src.width, src.height
+                return src.tobytes('raw', 'RGBA'), src.width, src.height
             except Exception:
                 return None
         future = ImageLoader._executor.submit(worker)
@@ -3749,7 +3759,7 @@ class ImageViewer(QMainWindow):
         if not result:
             return
         raw, w, h = result
-        qimg = QImage(raw, w, h, w * 3, QImage.Format_RGB888).copy()
+        qimg = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888).copy()
         pixmap = QPixmap.fromImage(qimg)
         if pixmap.isNull():
             return
