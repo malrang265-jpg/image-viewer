@@ -1401,10 +1401,11 @@ _DECODE_WORKER_COUNT = max(2, min(8, (os.cpu_count() or 4)))
 # split, playing a color-adjusted gif/webp while neighboring images preload
 # in the background makes both compete for the same workers -- the
 # animation stalls waiting behind preload jobs and preload slows down too.
-# Kept small (1-3) on purpose: only one frame is ever "live" per movie plus
-# a couple of look-ahead frames, so extra workers here wouldn't speed up a
-# single animation, they'd just take workers away from the shared pool.
-_ANIM_WORKER_COUNT = max(1, min(3, (os.cpu_count() or 4) // 2))
+# Kept small (1-4) on purpose: only one frame is ever "live" per movie plus
+# anim_lookahead frames ahead of it (see ImageViewer.anim_lookahead), so
+# more workers than that wouldn't speed up a single animation, they'd just
+# take workers away from the shared pool.
+_ANIM_WORKER_COUNT = max(1, min(4, (os.cpu_count() or 4) // 2))
 
 # Upper bound on the *output* pixel count (target_w * target_h) the
 # synchronous GPU animated-color-correction tier will attempt -- see
@@ -2363,7 +2364,15 @@ class ImageViewer(QMainWindow):
         self.prefetch_movie = None
         self.prefetch_buffer = None
         self.prefetch_frame_count = None
-        self.anim_lookahead = 2
+        # 2 -> 3: gives the first (uncached) loop of a demanding animation
+        # a slightly deeper buffer to work with before playback can catch
+        # up to an unprocessed frame -- paired with _ANIM_WORKER_COUNT's
+        # matching bump above. This only changes how far ahead
+        # _prefetch_ahead looks for work to hand the pool; it doesn't
+        # change per-frame cost, so it helps most when a frame or two of
+        # head start is what's missing, not when a single frame's own
+        # processing time already exceeds the animation's frame interval.
+        self.anim_lookahead = 3
         self.animated_inflight_keys = set()
         # Renders anim_saturation/anim_brightness/anim_contrast on the GPU
         # instead of the cv2/Pillow tiers below -- see GpuColorCorrector
@@ -3193,11 +3202,25 @@ class ImageViewer(QMainWindow):
 
         return movie, buffer, frame_count, data
 
-    def _build_qmovie(self, current_file, data):
+    def _build_qmovie(self, current_file, data, validate_first_frame=True):
         """Build one playable QMovie from either raw bytes (data, for a zip
         entry) or a path on disk (current_file, when data is None). Used
         both for the live/display movie and for the independent look-ahead
-        movie in show_current_image, so the two always decode identically."""
+        movie in show_current_image, so the two always decode identically.
+
+        validate_first_frame decodes frame 0 right away to confirm the
+        movie actually plays (not just that QMovie recognized the
+        format) -- needed the first time this data is built into a
+        movie, but wasted work the second time: show_current_image
+        builds a second, independent QMovie from the exact same bytes
+        for read-ahead (self.prefetch_movie), and decoding frame 0
+        twice back to back on the GUI thread was adding a full extra
+        synchronous frame decode on top of the one already needed just
+        to switch to a large animated file -- measured around 100ms+
+        each for just a 1080p frame, so a real, directly-felt part of
+        "opening a big webp is slow". Pass False for that second build:
+        if the primary movie's identical data just decoded frame 0
+        fine, this one will too."""
         buffer = None
         movie = None
         try:
@@ -3212,10 +3235,11 @@ class ImageViewer(QMainWindow):
                 movie = QMovie(current_file)
             if not movie.isValid():
                 raise ValueError('invalid movie')
-            movie.jumpToFrame(0)
-            first_frame = movie.currentPixmap()
-            if first_frame.isNull() or first_frame.width() <= 0:
-                raise ValueError('first frame failed to decode')
+            if validate_first_frame:
+                movie.jumpToFrame(0)
+                first_frame = movie.currentPixmap()
+                if first_frame.isNull() or first_frame.width() <= 0:
+                    raise ValueError('first frame failed to decode')
         except Exception:
             if buffer is not None:
                 try:
@@ -3260,7 +3284,11 @@ class ImageViewer(QMainWindow):
 
             # Built before the scaled-size is applied below so
             # _apply_anim_scaled_size can sync both movies in one place.
-            self.prefetch_movie, self.prefetch_buffer = self._build_qmovie(current_file, movie_source)
+            # validate_first_frame=False: the primary `movie` above just
+            # proved this exact data decodes fine, so re-decoding frame 0
+            # a second time here would only cost GUI-thread time without
+            # learning anything new -- see _build_qmovie's docstring.
+            self.prefetch_movie, self.prefetch_buffer = self._build_qmovie(current_file, movie_source, validate_first_frame=False)
 
             scaled_size = None
             if self.current_movie_original_size.width() > 0:
