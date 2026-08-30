@@ -1406,6 +1406,18 @@ _DECODE_WORKER_COUNT = max(2, min(8, (os.cpu_count() or 4)))
 # single animation, they'd just take workers away from the shared pool.
 _ANIM_WORKER_COUNT = max(1, min(3, (os.cpu_count() or 4) // 2))
 
+# Upper bound on the *output* pixel count (target_w * target_h) the
+# synchronous GPU animated-color-correction tier will attempt -- see
+# _render_animated_frame_gpu. That tier does a full texture upload + FBO
+# render + CPU readback on the GUI thread every call, so its cost scales
+# with pixel count; past this it can itself take long enough to be a
+# visible stall, which is worse than just taking the (async, off-thread)
+# cv2/Pillow tiers below it. Set a bit above a typical 1440p fit-to-window
+# target so ordinary playback is unaffected -- only frames clearly past
+# that give up the GPU tier's latency advantage for the async tiers'
+# never-blocks-the-UI guarantee.
+_ANIM_GPU_MAX_PIXELS = 2560 * 1440
+
 class ImageLoader:
     _shutdown = False
     # bmp/tif(f)/ico added on top of the original set -- Pillow already
@@ -1445,6 +1457,26 @@ class ImageLoader:
             with Image.open(filepath) as src:
                 if getattr(src, 'is_animated', False):
                     src.seek(0)
+                if max_size and max_size[0] > 0 and max_size[1] > 0:
+                    # JPEG-only fast path: lets libjpeg decode at a reduced
+                    # DCT scale instead of fully decoding every source pixel
+                    # only to immediately throw most of them away in the
+                    # thumbnail() resize below -- a no-op for every other
+                    # format (PNG/WebP/GIF/...), so always safe to call.
+                    # Without this, the saturation==100 branch above got a
+                    # cheap scaled decode for free from
+                    # QImageReader.setScaledSize(), but the moment any
+                    # adjustment was non-default, this branch fully decoded
+                    # a large JPEG at native resolution on every single
+                    # navigation -- even though only a small fit-to-window
+                    # preview was ever needed. This is the main reason
+                    # image-to-image navigation felt much slower with
+                    # saturation/brightness/contrast turned on than at
+                    # defaults.
+                    try:
+                        src.draft('RGB', max_size)
+                    except Exception:
+                        pass
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
                     # BILINEAR here trades a little resample quality for real
@@ -1620,6 +1652,13 @@ class ZipHandler:
             with Image.open(BytesIO(data)) as src:
                 if getattr(src, 'is_animated', False):
                     src.seek(0)
+                if max_size and max_size[0] > 0 and max_size[1] > 0:
+                    # See the matching comment in ImageLoader.load_image_data --
+                    # same JPEG-only reduced-scale decode, same reason.
+                    try:
+                        src.draft('RGB', max_size)
+                    except Exception:
+                        pass
                 img = src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
                     resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
@@ -2814,9 +2853,14 @@ class ImageViewer(QMainWindow):
             old = self._source_image_cache_order.pop(0)
             self._source_image_cache.pop(old, None)
 
-    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast):
+    def _adjusted_cache_key(self, filepath, saturation, brightness, contrast, max_size):
         source = f'{self.current_zip}|{filepath}' if self.current_zip else filepath
-        return (source, int(saturation), int(brightness), int(contrast))
+        # max_size is included so a color-adjusted image decoded for one
+        # window/display size is never handed back as the result for a
+        # request at a different size (e.g. right after a resize) -- see
+        # _submit_image_load. It's already a plain (w, h) int tuple or
+        # None from _target_decode_size(), so it's hashable as-is.
+        return (source, int(saturation), int(brightness), int(contrast), max_size)
 
     def _adjusted_cache_get(self, key):
         value = self._adjusted_image_cache.get(key)
@@ -2870,7 +2914,7 @@ class ImageViewer(QMainWindow):
                     )
                     return
 
-            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast)
+            adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast, max_size)
             # For non-default adjustments, reuse the expensive color-adjusted
             # source when available. The existing display cache still handles
             # the fit-to-window/full-size distinction.
@@ -3417,6 +3461,14 @@ class ImageViewer(QMainWindow):
         target = self.current_movie_target_size
         target_w = target.width() if target else qimage.width()
         target_h = target.height() if target else qimage.height()
+        # See _ANIM_GPU_MAX_PIXELS: past this size, the synchronous
+        # upload+render+readback below is itself slow enough to stall the
+        # GUI thread for a visible moment, which is exactly the "large
+        # animated webp playback is slow" complaint -- the async cv2/
+        # Pillow tiers the caller falls back to don't have that problem,
+        # since they run off the GUI thread.
+        if target_w * target_h > _ANIM_GPU_MAX_PIXELS:
+            return None
         result = self.gl_color_corrector.adjust(
             qimage, saturation / 100.0, brightness / 100.0, contrast / 100.0,
             target_w, target_h)
@@ -3480,10 +3532,20 @@ class ImageViewer(QMainWindow):
 
     def _prefetch_ahead(self, frame_number):
         """Decode the next anim_lookahead frames on the paused prefetch
-        movie and run them through the GPU shader now (falling back to
-        the cv2/Pillow worker pool per-frame on GPU failure), so they're
-        ready in animated_frame_cache before playback actually reaches
-        them."""
+        movie and dispatch them to the cv2/Pillow worker pool now (see
+        _submit_animated_frame_processing), so they're ready in
+        animated_frame_cache before playback actually reaches them.
+
+        Deliberately never uses the synchronous GPU tier
+        (_render_animated_frame_gpu) here, even though
+        _render_animated_frame does for the frame that's actually about
+        to be displayed: prefetching exists precisely because these
+        frames *aren't* needed yet, so there's no reason to pay a
+        synchronous GUI-thread cost for them. That used to cost up to two
+        extra synchronous texture-upload+FBO-render+readback round trips
+        on the GUI thread per frame change -- worse for playback
+        smoothness the larger the frame, and worse than just letting this
+        work happen off-thread, which is the whole point of prefetching."""
         if not self.prefetch_movie or not self.current_movie:
             return
         # No adjustment active: the live path takes a free instant fast path
@@ -3497,13 +3559,11 @@ class ImageViewer(QMainWindow):
         total = self.prefetch_frame_count or self.current_movie.frameCount()
         if not total or total <= 1:
             return
-        # Backpressure: the GPU tier below runs synchronously and never
-        # touches animated_inflight_keys, so this only ever gates frames
-        # that fall back to the cv2/Pillow worker pool -- a no-op while
-        # the GPU tier keeps succeeding, and the same protection as
-        # before if it doesn't. If the worker pool is already as busy as
-        # it can usefully be (e.g. a large/zoomed frame is taking a
-        # while), don't pile speculative work on top of it -- that only
+        # Backpressure: every prefetch frame goes through the cv2/Pillow
+        # worker pool (see docstring above), so this caps how much
+        # speculative work rides along on top of it. If the pool is
+        # already as busy as it can usefully be (e.g. a large/zoomed
+        # frame is taking a while), don't pile more onto it -- that only
         # pushes the frame that's actually about to be displayed further
         # back in the queue, which is what made zoomed-in playback feel
         # *slower* than before prefetching existed. Just skip this round;
@@ -3527,10 +3587,6 @@ class ImageViewer(QMainWindow):
                 if qimage.isNull():
                     continue
             except Exception:
-                continue
-            pixmap = self._render_animated_frame_gpu(qimage, saturation, brightness, contrast)
-            if pixmap is not None:
-                self._store_animated_frame(key, pixmap)
                 continue
             self._submit_animated_frame_processing(qimage, target, generation, key)
 
