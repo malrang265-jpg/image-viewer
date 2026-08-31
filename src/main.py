@@ -4,6 +4,7 @@ import json
 import zipfile
 import threading
 import re
+import time
 import ctypes
 import ctypes.wintypes
 import concurrent.futures
@@ -326,6 +327,10 @@ class GpuColorCorrector:
         self._context = None
         self._surface = None
         self._program = None
+        # Bound via ctypes directly against opengl32.dll instead of PyQt5's
+        # own OpenGL-functions wrapper -- see _ensure_ready for why.
+        self._gl_viewport = None
+        self._gl_draw_arrays = None
         self._broken = False  # set once init fails, so we stop retrying every frame
 
     def _ensure_ready(self):
@@ -344,6 +349,28 @@ class GpuColorCorrector:
             if not context.makeCurrent(surface):
                 raise RuntimeError('makeCurrent 실패')
             try:
+                # Neither context.functions() nor PyQt5.QtGui.QOpenGLFunctions
+                # can be relied on -- confirmed from real logs that
+                # context.functions() raises "'QOpenGLContext' object has no
+                # attribute 'functions'" on one PyQt5 build, and importing
+                # QOpenGLFunctions itself raises ImportError on another (it
+                # simply isn't exposed there). Binding the two GL calls this
+                # class actually needs straight from opengl32.dll via ctypes
+                # sidesteps PyQt5's OpenGL-functions wrapper entirely --
+                # glViewport/glDrawArrays are core GL 1.1 entry points
+                # exported directly by every Windows opengl32.dll, and they
+                # operate on whatever context is current on this thread
+                # (set via context.makeCurrent above), regardless of which
+                # library issued the call. ctypes is already a hard
+                # dependency of this app (see the top-level ctypes.windll
+                # usage), so this adds nothing new.
+                gl32 = ctypes.windll.opengl32
+                gl_viewport = gl32.glViewport
+                gl_viewport.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                gl_viewport.restype = None
+                gl_draw_arrays = gl32.glDrawArrays
+                gl_draw_arrays.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int]
+                gl_draw_arrays.restype = None
                 program = QOpenGLShaderProgram()
                 if not program.addShaderFromSourceCode(QOpenGLShader.Vertex, self._VERTEX_SRC):
                     raise RuntimeError(program.log())
@@ -356,6 +383,9 @@ class GpuColorCorrector:
             self._surface = surface
             self._context = context
             self._program = program
+            self._gl_viewport = gl_viewport
+            self._gl_draw_arrays = gl_draw_arrays
+            print("GPU 색보정 초기화 성공 -- 이후 애니메이션 프레임은 GPU 경로를 우선 시도합니다")
             return True
         except Exception as e:
             print(f"GPU 색보정 초기화 실패, 이후 프레임은 cv2/PIL 경로를 사용합니다: {e}")
@@ -363,6 +393,8 @@ class GpuColorCorrector:
             self._context = None
             self._surface = None
             self._program = None
+            self._gl_viewport = None
+            self._gl_draw_arrays = None
             return False
 
     def adjust(self, qimage, saturation, brightness, contrast, target_w, target_h):
@@ -377,6 +409,7 @@ class GpuColorCorrector:
             return None
         texture = None
         fbo = None
+        _t0 = time.perf_counter()
         try:
             if not self._context.makeCurrent(self._surface):
                 return None
@@ -389,7 +422,7 @@ class GpuColorCorrector:
             fbo = QOpenGLFramebufferObject(target_w, target_h)
             if not fbo.bind():
                 return None
-            self._context.functions().glViewport(0, 0, target_w, target_h)
+            self._gl_viewport(0, 0, target_w, target_h)
 
             program = self._program
             program.bind()
@@ -417,7 +450,7 @@ class GpuColorCorrector:
             program.enableAttributeArray(uv_loc)
             program.setAttributeArray(uv_loc, texcoords)
 
-            self._context.functions().glDrawArrays(self._GL_TRIANGLE_STRIP, 0, 4)
+            self._gl_draw_arrays(self._GL_TRIANGLE_STRIP, 0, 4)
 
             program.disableAttributeArray(pos_loc)
             program.disableAttributeArray(uv_loc)
@@ -425,6 +458,8 @@ class GpuColorCorrector:
             program.release()
 
             result = fbo.toImage()
+            _elapsed_ms = (time.perf_counter() - _t0) * 1000
+            print(f"[GPU 색보정] {qimage.width()}x{qimage.height()} -> {target_w}x{target_h}: {_elapsed_ms:.1f}ms")
             return result if not result.isNull() else None
         except Exception as e:
             print(f"GPU 프레임 색보정 실패, 이 프레임은 cv2/PIL 경로로 대체합니다: {e}")
@@ -1406,18 +1441,6 @@ _DECODE_WORKER_COUNT = max(2, min(8, (os.cpu_count() or 4)))
 # more workers than that wouldn't speed up a single animation, they'd just
 # take workers away from the shared pool.
 _ANIM_WORKER_COUNT = max(1, min(4, (os.cpu_count() or 4) // 2))
-
-# Upper bound on the *output* pixel count (target_w * target_h) the
-# synchronous GPU animated-color-correction tier will attempt -- see
-# _render_animated_frame_gpu. That tier does a full texture upload + FBO
-# render + CPU readback on the GUI thread every call, so its cost scales
-# with pixel count; past this it can itself take long enough to be a
-# visible stall, which is worse than just taking the (async, off-thread)
-# cv2/Pillow tiers below it. Set a bit above a typical 1440p fit-to-window
-# target so ordinary playback is unaffected -- only frames clearly past
-# that give up the GPU tier's latency advantage for the async tiers'
-# never-blocks-the-UI guarantee.
-_ANIM_GPU_MAX_PIXELS = 2560 * 1440
 
 class ImageLoader:
     _shutdown = False
@@ -3485,18 +3508,22 @@ class ImageViewer(QMainWindow):
         a ready-to-display QPixmap already sized to
         current_movie_target_size, or None if the GPU path isn't
         available -- callers fall back to the unchanged cv2/Pillow tiers
-        in that case."""
+        in that case.
+
+        No pixel-count cutoff before attempting this (an earlier version
+        had one, out of unverified concern that a large frame's upload+
+        render+readback could itself stall the GUI thread for a visible
+        moment). Real logs from actual playback showed the opposite:
+        ~1080x1080 GPU calls ran ~5ms, and gating out a zoomed 2068x2068
+        frame (~4.3MP, over that old cutoff) forced it onto the cv2 tier
+        instead at 25-45ms -- worse, not safer. If a genuinely large
+        enough frame ever does make one GPU call slow enough to matter,
+        that's a real data point to reintroduce a cutoff from; guessing
+        a threshold with no measurement behind it did more harm than
+        good here."""
         target = self.current_movie_target_size
         target_w = target.width() if target else qimage.width()
         target_h = target.height() if target else qimage.height()
-        # See _ANIM_GPU_MAX_PIXELS: past this size, the synchronous
-        # upload+render+readback below is itself slow enough to stall the
-        # GUI thread for a visible moment, which is exactly the "large
-        # animated webp playback is slow" complaint -- the async cv2/
-        # Pillow tiers the caller falls back to don't have that problem,
-        # since they run off the GUI thread.
-        if target_w * target_h > _ANIM_GPU_MAX_PIXELS:
-            return None
         result = self.gl_color_corrector.adjust(
             qimage, saturation / 100.0, brightness / 100.0, contrast / 100.0,
             target_w, target_h)
@@ -3528,8 +3555,10 @@ class ImageViewer(QMainWindow):
                 # below for this. Falls through to PIL on any failure,
                 # most commonly because opencv-python-headless just isn't
                 # installed, so playback still works either way.
+                _t0 = time.perf_counter()
                 result = _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, target_w, target_h)
                 if result is not None:
+                    print(f"[cv2 색보정] {w}x{h} -> {target_w}x{target_h}: {(time.perf_counter() - _t0) * 1000:.1f}ms")
                     return result
                 try:
                     from PIL import Image
@@ -3544,8 +3573,10 @@ class ImageViewer(QMainWindow):
                         resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                         rgb = rgb.resize((target_w, target_h), resample)
                     out = rgb.convert('RGBA')
+                    print(f"[PIL 색보정 -- cv2 미사용/실패] {w}x{h} -> {rgb.width}x{rgb.height}: {(time.perf_counter() - _t0) * 1000:.1f}ms")
                     return out.tobytes('raw', 'RGBA'), rgb.width, rgb.height
-                except Exception:
+                except Exception as e:
+                    print(f"[애니메이션 프레임 색보정 실패] {e}")
                     return None
             future = ImageLoader._anim_executor.submit(worker)
             def done(fut, gen=generation, frame=frame_number, key=key):
@@ -4293,6 +4324,16 @@ def main():
     
     single_app = SingleApplication()
     if single_app.is_running():
+        # Relaying to an already-running instance -- this process exits
+        # right after send_message below without ever constructing
+        # ImageViewer, so none of that instance's code (including any
+        # print() diagnostics added there) runs here. Printed explicitly
+        # because otherwise this looks identical from the outside to a
+        # normal fresh launch -- the window that comes to front is the
+        # *old* instance, still running whatever code was in memory when
+        # *it* started, not whatever is currently on disk.
+        print("이미 실행 중인 인스턴스가 있어 그쪽으로 파일을 전달하고 이 프로세스는 종료합니다 "
+              "(콘솔 로그가 필요하면 기존 창을 모두 닫고 다시 실행하세요).")
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
