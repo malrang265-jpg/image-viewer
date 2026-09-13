@@ -7,6 +7,7 @@ import re
 import time
 import ctypes
 import ctypes.wintypes
+import winreg
 import concurrent.futures
 import base64
 from io import BytesIO
@@ -16,8 +17,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QMenu, QAction, QFileDialog, QVBoxLayout, QWidget,
                             QDialog, QHBoxLayout, QComboBox, QCheckBox, QPushButton,
                             QColorDialog, QGroupBox, QFormLayout, QSpinBox,
+                            QGridLayout,
                             QListWidget, QListWidgetItem, QMessageBox,
-                            QListView, QSlider)
+                            QListView, QSlider, QSplitter)
 from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint, QEvent, QBuffer, QIODevice
 from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform, QImageReader,
                         QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor, QPainter,
@@ -68,6 +70,72 @@ def get_numpy():
         import numpy
         _np_module = numpy
     return _np_module
+
+# Windows file-association support (see FileAssociationDialog). All of
+# this only ever touches HKEY_CURRENT_USER, never HKEY_LOCAL_MACHINE --
+# per-user file associations don't need administrator rights, and this
+# way a failure here can never require elevation to recover from.
+_FILE_ASSOC_PROG_ID = 'PekoviewerApp.Image'
+
+def _get_app_launch_command():
+    """Command line to register for a file association's "open" action.
+    sys.frozen is the standard way a PyInstaller-built .exe marks itself
+    at runtime; running from source instead needs the interpreter *and*
+    this script's own path, not just the interpreter."""
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}" "%1"'
+    script_path = os.path.abspath(sys.argv[0])
+    return f'"{sys.executable}" "{script_path}" "%1"'
+
+def is_extension_associated(ext):
+    """True only if this app itself currently owns ext's association --
+    never true for an association some other app or the system owns, so
+    checkbox state in FileAssociationDialog always reflects reality
+    rather than assuming."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f'Software\\Classes\\{ext}') as key:
+            value, _ = winreg.QueryValueEx(key, '')
+            return value == _FILE_ASSOC_PROG_ID
+    except OSError:
+        return False
+
+def set_extension_association(ext, associate):
+    """Register (associate=True) or unregister (False) ext to open with
+    this app. Unregistering only ever deletes the .ext key when it's
+    currently pointing at this app's own prog ID -- so toggling a
+    checkbox off can never disturb an association that belongs to a
+    different application, only ever undo what this dialog itself set.
+    Returns True on success; on any registry error, prints and returns
+    False so the caller can revert the checkbox instead of leaving it
+    showing a state that was never actually applied."""
+    try:
+        if associate:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f'Software\\Classes\\{ext}') as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, _FILE_ASSOC_PROG_ID)
+            prog_key_path = f'Software\\Classes\\{_FILE_ASSOC_PROG_ID}\\shell\\open\\command'
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, prog_key_path) as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, _get_app_launch_command())
+        else:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f'Software\\Classes\\{ext}', 0, winreg.KEY_READ) as key:
+                    current, _ = winreg.QueryValueEx(key, '')
+                if current == _FILE_ASSOC_PROG_ID:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f'Software\\Classes\\{ext}')
+            except FileNotFoundError:
+                pass
+        try:
+            # Tells Explorer the association table changed, so it picks
+            # this up immediately instead of needing a sign-out/in.
+            # SHCNE_ASSOCCHANGED, SHCNF_IDLIST -- failure here doesn't
+            # mean the registry change itself failed, so it's not
+            # allowed to turn this whole call into a reported failure.
+            ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"파일 연결 설정 오류 ({ext}): {e}")
+        return False
 
 # Which algorithm handles saturation. Both are kept side by side so the two
 # can be A/B compared directly -- flip this to 'enhance' to go back to the
@@ -229,13 +297,13 @@ def _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, ta
         rgb = apply_color_adjustments_cv2(arr[:, :, :3], saturation, brightness, contrast)
         out = np.empty((h, w, 4), dtype=np.uint8)
         out[:, :, :3] = rgb
-        # Always fully opaque, matching the PIL path above exactly: its
-        # src.convert('RGB') drops the source alpha, and convert('RGBA')
-        # coming back always fills alpha with 255 -- it never round-trips
-        # the original values either. Carrying the real source alpha
-        # through here instead would be a behavior change, not just a
-        # speedup, so this keeps it byte-for-byte consistent instead.
-        out[:, :, 3] = 255
+        # Preserve the source alpha instead of forcing full opacity --
+        # this used to hardcode 255 here (matching the PIL/GPU paths,
+        # which also used to discard alpha), which turned any
+        # transparent area solid-colored once the underlying RGB value
+        # a transparent pixel happens to store (often black) was no
+        # longer masked by transparency.
+        out[:, :, 3] = arr[:, :, 3]
         if target_w and target_h and (w != target_w or h != target_h):
             out = cv2.resize(out, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         out = np.ascontiguousarray(out)
@@ -299,7 +367,8 @@ class GpuColorCorrector:
         uniform float u_contrast;
         varying vec2 v_texcoord;
         void main() {
-            vec3 color = texture2D(u_texture, v_texcoord).rgb;
+            vec4 texColor = texture2D(u_texture, v_texcoord);
+            vec3 color = texColor.rgb;
             // Same luma weights and mix() blend as _saturate_matrix, and
             // clamped after each step just like apply_color_adjustments's
             // three separate matrix/LUT passes each are (PIL's point()
@@ -317,7 +386,13 @@ class GpuColorCorrector:
             color = clamp(color * u_brightness, 0.0, 1.0);
             // Fixed mid-gray pivot -- see class docstring.
             color = clamp((color - 0.5) * u_contrast + 0.5, 0.0, 1.0);
-            gl_FragColor = vec4(color, 1.0);
+            // Pass the source alpha through unchanged -- this used to be
+            // hardcoded to 1.0 (fully opaque), which silently destroyed
+            // any transparency in the source frame: a transparent pixel's
+            // RGB is often undefined/black once alpha is gone, so forcing
+            // opacity here baked that black in permanently instead of
+            // keeping the pixel see-through.
+            gl_FragColor = vec4(color, texColor.a);
         }
     """
 
@@ -400,16 +475,16 @@ class GpuColorCorrector:
     def adjust(self, qimage, saturation, brightness, contrast, target_w, target_h):
         """qimage: source frame, any QImage format. saturation/brightness/
         contrast: 1.0 = no change. Returns a QImage sized target_w x
-        target_h with alpha forced fully opaque -- apply_color_adjustments
-        and apply_color_adjustments_cv2 already lose per-pixel alpha the
-        same way, so this matches their existing output -- or None if the
-        GPU path isn't available, in which case the caller should fall
-        back to the cv2/Pillow tiers."""
+        target_h with the source alpha preserved per-pixel (matching
+        apply_color_adjustments/apply_color_adjustments_cv2, which do the
+        same), or None if the GPU path isn't available, in which case the
+        caller should fall back to the cv2/Pillow tiers. Callers pass the
+        frame's own native size as target_w/target_h now, not the
+        on-screen display size -- see _render_animated_frame_gpu."""
         if target_w <= 0 or target_h <= 0 or not self._ensure_ready():
             return None
         texture = None
         fbo = None
-        _t0 = time.perf_counter()
         try:
             if not self._context.makeCurrent(self._surface):
                 return None
@@ -458,8 +533,6 @@ class GpuColorCorrector:
             program.release()
 
             result = fbo.toImage()
-            _elapsed_ms = (time.perf_counter() - _t0) * 1000
-            print(f"[GPU 색보정] {qimage.width()}x{qimage.height()} -> {target_w}x{target_h}: {_elapsed_ms:.1f}ms")
             return result if not result.isNull() else None
         except Exception as e:
             print(f"GPU 프레임 색보정 실패, 이 프레임은 cv2/PIL 경로로 대체합니다: {e}")
@@ -1307,6 +1380,13 @@ class SingleApplication:
             data = socket.readAll().data().decode('utf-8', errors='ignore')
             if self.file_received_callback and data:
                 self.file_received_callback(data)
+                # waitForReadyRead above runs its own nested event loop;
+                # anything the callback scheduled (repaints, etc.) is
+                # meant to run on the normal event loop once this slot
+                # returns, but flushing it explicitly here removes any
+                # dependency on exactly how Qt schedules that after a
+                # reentrant wait like this one.
+                QApplication.processEvents()
         socket.disconnectFromServer()
 
     def set_file_received_callback(self, callback):
@@ -1452,7 +1532,23 @@ class ImageLoader:
     # decoding, and the existing cache. No change to per-frame/playback
     # cost for gif or webp.
     SUPPORTED_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.webp',
-                          '.bmp', '.tif', '.tiff', '.ico'}
+                          '.bmp', '.tif', '.tiff', '.ico',
+                          # Added on request ("확장자 늘려줘, 속도 지장 없는 범위
+                          # 에서"): all of these decode through the exact same
+                          # QImageReader/Pillow paths already used above, so
+                          # there's no new decode machinery and no speed
+                          # impact -- confirmed each is actually registered
+                          # in Pillow (not just assumed) before adding.
+                          # .jfif is plain JPEG data under a different
+                          # extension. .heic/.heif were left out: Pillow
+                          # doesn't read them without an extra plugin
+                          # (pillow-heif) that isn't confirmed installed
+                          # here, and listing them as supported when they'd
+                          # just fail to decode would be worse than not
+                          # listing them.
+                          '.jfif', '.tga', '.dds',
+                          '.pbm', '.pgm', '.ppm', '.pnm',
+                          '.avif', '.avifs'}
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=_DECODE_WORKER_COUNT)
     _anim_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_WORKER_COUNT)
 
@@ -1462,46 +1558,120 @@ class ImageLoader:
 
     @staticmethod
     def load_image_data(filepath, saturation=100, brightness=100, contrast=100, max_size=None):
-        # Fast path: native Qt decoding avoids Pillow RGB conversion and byte copies.
         try:
+            # WebP-only, no-adjustment-only fast path. Real logs showed
+            # WebP decode through QImageReader.setScaledSize() below
+            # running 100-300ms per image even at defaults -- confirmed
+            # directly (not just inferred) that neither Pillow's draft()
+            # nor cv2's IMREAD_REDUCED_COLOR_* flags give WebP the kind
+            # of efficient reduced-scale decode JPEG gets from either
+            # library, so there's no cheap-scaled-decode shortcut for
+            # this format available anywhere in this codebase's toolbox.
+            # cv2's plain full decode was still consistently ~30% faster
+            # than Pillow's or Qt's for WebP in direct testing, though,
+            # so worth taking when it applies.
+            # Scoped to no-adjustment only because that's the specific
+            # case real logs showed as slow; the adjustment branch below
+            # already goes through Pillow regardless of decoder here, so
+            # this wouldn't help it anyway.
+            # EXIF safety: only taken when the file has no orientation
+            # tag (or orientation 1/normal) -- checked via a cheap,
+            # header-only Pillow open (no pixel decode), not by trying to
+            # replicate Pillow's/Qt's rotation handling in cv2 by hand.
+            # Anything else (a real rotation tag present) falls through
+            # to the QImageReader path below, which already handles EXIF
+            # correctly via setAutoTransform(True). Any failure at all
+            # here (cv2 missing, decode error, unexpected channel count)
+            # falls through the same way.
+            if (saturation == 100 and brightness == 100 and contrast == 100
+                    and filepath.lower().endswith('.webp')):
+                try:
+                    Image = get_pil_image()
+                    with Image.open(filepath) as probe:
+                        exif = probe.getexif()
+                        orientation = exif.get(274, 1) if exif else 1
+                    if orientation in (1, None):
+                        cv2 = get_cv2()
+                        if cv2 is not None:
+                            raw = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+                            if raw is not None and raw.ndim == 3 and raw.shape[2] in (3, 4):
+                                h0, w0 = raw.shape[:2]
+                                if max_size and max_size[0] > 0 and max_size[1] > 0 and (w0 > max_size[0] or h0 > max_size[1]):
+                                    scale = min(max_size[0] / w0, max_size[1] / h0)
+                                    raw = cv2.resize(raw, (max(1, round(w0 * scale)), max(1, round(h0 * scale))),
+                                                      interpolation=cv2.INTER_AREA)
+                                h1, w1 = raw.shape[:2]
+                                if raw.shape[2] == 4:
+                                    rgba = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGBA)
+                                    return QImage(rgba.tobytes(), w1, h1, w1 * 4, QImage.Format_RGBA8888).copy()
+                                rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+                                return QImage(rgb.tobytes(), w1, h1, w1 * 3, QImage.Format_RGB888).copy()
+                except Exception:
+                    pass  # fall through to the QImageReader path below
+
+            # Decode via Qt first regardless of whether an adjustment is
+            # active. QImageReader.setScaledSize() gets an efficient
+            # reduced-resolution decode for whatever formats its plugins
+            # support scaled reading for -- not just JPEG. The previous
+            # version only took this path when saturation/brightness/
+            # contrast were all 100 and fell back to a full Pillow decode
+            # otherwise; Image.draft() recovered some of that for JPEG,
+            # but draft() is a no-op for WebP/PNG/etc, so a static WebP
+            # with any adjustment on was still fully decoded at native
+            # resolution on every navigation -- exactly why adjusted
+            # navigation stayed slow for WebP specifically even after the
+            # draft() fix helped JPEG. Decoding through Qt unconditionally
+            # and only reaching into Pillow for the color math itself (on
+            # the already-small result) fixes that for every format
+            # uniformly, and is the same RGBA8888/bits()/byteCount()
+            # QImage<->Pillow handoff already used for animated frames
+            # elsewhere in this file.
+            reader = QImageReader(filepath)
+            reader.setAutoTransform(True)
+            if max_size and max_size[0] > 0 and max_size[1] > 0:
+                src_size = reader.size()
+                if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
+                    reader.setScaledSize(src_size.scaled(
+                        QSize(int(max_size[0]), int(max_size[1])), Qt.KeepAspectRatio))
+            image = reader.read()
+
             if saturation == 100 and brightness == 100 and contrast == 100:
-                reader = QImageReader(filepath)
-                reader.setAutoTransform(True)
-                if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    src_size = reader.size()
-                    if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
-                        reader.setScaledSize(src_size.scaled(
-                            QSize(int(max_size[0]), int(max_size[1])), Qt.KeepAspectRatio))
-                image = reader.read()
                 if not image.isNull():
                     return image
+            elif not image.isNull():
+                Image = get_pil_image()
+                rgba = image.convertToFormat(QImage.Format_RGBA8888)
+                w, h = rgba.width(), rgba.height()
+                ptr = rgba.bits()
+                ptr.setsize(rgba.byteCount())
+                pil_rgba = Image.frombuffer('RGBA', (w, h), bytes(ptr), 'raw', 'RGBA', 0, 1)
+                # Keep the source alpha untouched through the color math --
+                # apply_color_adjustments only takes/returns RGB, and a
+                # transparent pixel's underlying RGB value is often
+                # undefined/black once alpha is dropped, so a naive
+                # convert('RGB') here would bake that black in permanently.
+                # Splitting alpha out and re-attaching it after keeps
+                # genuinely transparent areas transparent.
+                alpha = pil_rgba.getchannel('A')
+                pil_rgb = apply_color_adjustments(pil_rgba.convert('RGB'), saturation, brightness, contrast)
+                pil_out = pil_rgb.convert('RGBA')
+                pil_out.putalpha(alpha)
+                data = pil_out.tobytes('raw', 'RGBA')
+                return QImage(data, pil_out.width, pil_out.height, pil_out.width * 4, QImage.Format_RGBA8888).copy()
 
-            # Keep Pillow for the color-adjustment path so output behavior stays the same.
+            # Pillow fallback -- only reached if Qt couldn't decode this
+            # file at all (exotic format/corruption).
             Image = get_pil_image()
             with Image.open(filepath) as src:
                 if getattr(src, 'is_animated', False):
                     src.seek(0)
+                has_alpha = src.mode in ('RGBA', 'LA', 'PA') or (src.mode == 'P' and 'transparency' in src.info)
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    # JPEG-only fast path: lets libjpeg decode at a reduced
-                    # DCT scale instead of fully decoding every source pixel
-                    # only to immediately throw most of them away in the
-                    # thumbnail() resize below -- a no-op for every other
-                    # format (PNG/WebP/GIF/...), so always safe to call.
-                    # Without this, the saturation==100 branch above got a
-                    # cheap scaled decode for free from
-                    # QImageReader.setScaledSize(), but the moment any
-                    # adjustment was non-default, this branch fully decoded
-                    # a large JPEG at native resolution on every single
-                    # navigation -- even though only a small fit-to-window
-                    # preview was ever needed. This is the main reason
-                    # image-to-image navigation felt much slower with
-                    # saturation/brightness/contrast turned on than at
-                    # defaults.
                     try:
                         src.draft('RGB', max_size)
                     except Exception:
                         pass
-                img = src.convert('RGB')
+                img = src.convert('RGBA') if has_alpha else src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
                     # BILINEAR here trades a little resample quality for real
                     # speed: this thumbnail gets scaled again by Qt to the
@@ -1510,7 +1680,16 @@ class ImageLoader:
                     # was mostly being thrown away anyway.
                     resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
-                img = apply_color_adjustments(img, saturation, brightness, contrast)
+                if saturation != 100 or brightness != 100 or contrast != 100:
+                    if has_alpha:
+                        alpha = img.getchannel('A')
+                        img = apply_color_adjustments(img.convert('RGB'), saturation, brightness, contrast).convert('RGBA')
+                        img.putalpha(alpha)
+                    else:
+                        img = apply_color_adjustments(img, saturation, brightness, contrast)
+                if has_alpha:
+                    data = img.tobytes('raw', 'RGBA')
+                    return QImage(data, img.width, img.height, img.width * 4, QImage.Format_RGBA8888).copy()
                 data = img.tobytes('raw', 'RGB')
                 return QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888).copy()
         except Exception as e:
@@ -1656,38 +1835,100 @@ class ZipHandler:
             with zf.open(filename, 'r') as fp:
                 data = fp.read()
 
+            # See the matching comment in ImageLoader.load_image_data --
+            # same WebP-only, no-adjustment-only, EXIF-safe cv2 fast path.
+            if (saturation == 100 and brightness == 100 and contrast == 100
+                    and filename.lower().endswith('.webp')):
+                try:
+                    Image = get_pil_image()
+                    with Image.open(BytesIO(data)) as probe:
+                        exif = probe.getexif()
+                        orientation = exif.get(274, 1) if exif else 1
+                    if orientation in (1, None):
+                        cv2 = get_cv2()
+                        if cv2 is not None:
+                            np = get_numpy()
+                            np_arr = np.frombuffer(data, dtype=np.uint8)
+                            raw = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
+                            if raw is not None and raw.ndim == 3 and raw.shape[2] in (3, 4):
+                                h0, w0 = raw.shape[:2]
+                                if max_size and max_size[0] > 0 and max_size[1] > 0 and (w0 > max_size[0] or h0 > max_size[1]):
+                                    scale = min(max_size[0] / w0, max_size[1] / h0)
+                                    raw = cv2.resize(raw, (max(1, round(w0 * scale)), max(1, round(h0 * scale))),
+                                                      interpolation=cv2.INTER_AREA)
+                                h1, w1 = raw.shape[:2]
+                                if raw.shape[2] == 4:
+                                    rgba = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGBA)
+                                    return QImage(rgba.tobytes(), w1, h1, w1 * 4, QImage.Format_RGBA8888).copy()
+                                rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+                                return QImage(rgb.tobytes(), w1, h1, w1 * 3, QImage.Format_RGB888).copy()
+                except Exception:
+                    pass  # fall through to the QImageReader path below
+
+            # See the matching comment in ImageLoader.load_image_data --
+            # decode via Qt first regardless of adjustments, so every
+            # format gets an efficient reduced-resolution decode, not
+            # just JPEG (which is all Pillow's draft() ever covered).
+            buffer = QBuffer()
+            buffer.setData(QByteArray(data))
+            buffer.open(QIODevice.ReadOnly)
+            reader = QImageReader(buffer)
+            reader.setAutoTransform(True)
+            if max_size and max_size[0] > 0 and max_size[1] > 0:
+                src_size = reader.size()
+                if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
+                    reader.setScaledSize(src_size.scaled(
+                        QSize(int(max_size[0]), int(max_size[1])), Qt.KeepAspectRatio))
+            image = reader.read()
+            buffer.close()
+
             if saturation == 100 and brightness == 100 and contrast == 100:
-                buffer = QBuffer()
-                buffer.setData(QByteArray(data))
-                buffer.open(QIODevice.ReadOnly)
-                reader = QImageReader(buffer)
-                reader.setAutoTransform(True)
-                if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    src_size = reader.size()
-                    if src_size.isValid() and src_size.width() > 0 and src_size.height() > 0:
-                        reader.setScaledSize(src_size.scaled(
-                            QSize(int(max_size[0]), int(max_size[1])), Qt.KeepAspectRatio))
-                image = reader.read()
-                buffer.close()
                 if not image.isNull():
                     return image
+            elif not image.isNull():
+                Image = get_pil_image()
+                rgba = image.convertToFormat(QImage.Format_RGBA8888)
+                w, h = rgba.width(), rgba.height()
+                ptr = rgba.bits()
+                ptr.setsize(rgba.byteCount())
+                pil_rgba = Image.frombuffer('RGBA', (w, h), bytes(ptr), 'raw', 'RGBA', 0, 1)
+                # See the matching comment in ImageLoader.load_image_data --
+                # keep the source alpha untouched through the color math
+                # instead of letting convert('RGB') bake in whatever
+                # undefined color a transparent pixel happens to store.
+                alpha = pil_rgba.getchannel('A')
+                pil_rgb = apply_color_adjustments(pil_rgba.convert('RGB'), saturation, brightness, contrast)
+                pil_out = pil_rgb.convert('RGBA')
+                pil_out.putalpha(alpha)
+                raw = pil_out.tobytes('raw', 'RGBA')
+                return QImage(raw, pil_out.width, pil_out.height, pil_out.width * 4, QImage.Format_RGBA8888).copy()
 
+            # Pillow fallback -- only reached if Qt couldn't decode this
+            # entry at all.
             Image = get_pil_image()
             with Image.open(BytesIO(data)) as src:
                 if getattr(src, 'is_animated', False):
                     src.seek(0)
+                has_alpha = src.mode in ('RGBA', 'LA', 'PA') or (src.mode == 'P' and 'transparency' in src.info)
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
-                    # See the matching comment in ImageLoader.load_image_data --
-                    # same JPEG-only reduced-scale decode, same reason.
                     try:
                         src.draft('RGB', max_size)
                     except Exception:
                         pass
-                img = src.convert('RGB')
+                img = src.convert('RGBA') if has_alpha else src.convert('RGB')
                 if max_size and max_size[0] > 0 and max_size[1] > 0:
                     resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
                     img.thumbnail(max_size, resample)
-                img = apply_color_adjustments(img, saturation, brightness, contrast)
+                if saturation != 100 or brightness != 100 or contrast != 100:
+                    if has_alpha:
+                        alpha = img.getchannel('A')
+                        img = apply_color_adjustments(img.convert('RGB'), saturation, brightness, contrast).convert('RGBA')
+                        img.putalpha(alpha)
+                    else:
+                        img = apply_color_adjustments(img, saturation, brightness, contrast)
+                if has_alpha:
+                    raw = img.tobytes('raw', 'RGBA')
+                    return QImage(raw, img.width, img.height, img.width * 4, QImage.Format_RGBA8888).copy()
                 raw = img.tobytes('raw', 'RGB')
                 return QImage(raw, img.width, img.height, img.width * 3, QImage.Format_RGB888).copy()
         except Exception as e:
@@ -1695,11 +1936,15 @@ class ZipHandler:
         return None
 
     @staticmethod
-    def load_image_from_zip(zip_path, filename, saturation=100, brightness=100, contrast=100):
-        image = ZipHandler.load_image_data(zip_path, filename, saturation, brightness, contrast)
+    def load_image_from_zip(zip_path, filename, saturation=100, brightness=100, contrast=100, max_size=None):
+        image = ZipHandler.load_image_data(zip_path, filename, saturation, brightness, contrast, max_size)
         if image and not image.isNull():
             return QPixmap.fromImage(image)
         return None
+
+    @staticmethod
+    def load_thumbnail(zip_path, filename, size=(150, 150)):
+        return ZipHandler.load_image_from_zip(zip_path, filename, max_size=size)
 
 
 class ImageLoadBridge(QObject):
@@ -1707,46 +1952,96 @@ class ImageLoadBridge(QObject):
     animated_frame = pyqtSignal(int, int, object)
     hq_resample = pyqtSignal(int, object)
 
+class ThumbnailLoadBridge(QObject):
+    loaded = pyqtSignal(int, object)
+
 class ImageListDialog(QDialog):
+    # Windows 11 Explorer's "Large icons" folder view renders thumbnails
+    # at 96x96 -- confirmed (not guessed) via web search, since getting
+    # this specific number wrong would be obviously off next to the real
+    # thing.
+    THUMB_SIZE = 96
+
     def __init__(self, image_list, current_index, parent=None, current_zip=None):
         super().__init__(parent)
         self.image_list = image_list
         self.current_index = current_index
         self.selected_index = current_index
         self.current_zip = current_zip
+        # Settings live on the main window (self.parent()), not this
+        # dialog -- same object _restore_geometry reads from and done()
+        # writes to below, so window position/size + splitter position
+        # persist across dialog opens the same way the main window's own
+        # geometry already does (see ImageViewer.save_settings).
+        self._settings = getattr(parent, 'settings', None)
+        self.thumb_bridge = ThumbnailLoadBridge()
+        self.thumb_bridge.loaded.connect(self._on_thumbnail_loaded)
+        self.thumb_generation = 0
+        # The full-size decode behind the current preview -- see
+        # show_preview/_rescale_preview. Kept around so resizing the
+        # preview pane (drag the splitter, or resize the whole dialog)
+        # only needs a cheap QPixmap.scaled() call, not a fresh decode.
+        self._preview_pixmap = None
         self.init_ui()
-    
+        self._load_list_thumbnails()
+
     def init_ui(self):
         self.setWindowTitle('이미지 목록')
         self.setModal(True)
-        self.setMinimumSize(400, 500)
+        self.setMinimumSize(280, 320)
         self.setStyleSheet("""
             QDialog { background-color: #2b2b2b; color: white; }
             QListWidget { background-color: #3c3c3c; color: white; border: 1px solid #555; }
+            QListWidget::item { padding: 4px; border-radius: 4px; }
             QListWidget::item:selected { background-color: #4a90d9; }
             QLabel { color: white; }
             QPushButton { background-color: #3c3c3c; color: white; border: 1px solid #555; padding: 5px; }
             QPushButton:hover { background-color: #4c4c4c; }
+            QSplitter::handle { background-color: #555; }
+            QSplitter::handle:vertical { height: 4px; }
         """)
         layout = QVBoxLayout(self)
+
+        # A splitter (not a plain stacked layout) so the preview pane and
+        # the file list can each be resized independently by dragging the
+        # handle between them, on request -- sizes are saved/restored in
+        # done()/_restore_geometry below, same as the window size.
+        self.splitter = QSplitter(Qt.Vertical)
+
         self.preview_label = QLabel('이미지를 선택하세요')
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(200)
+        self.preview_label.setMinimumHeight(60)
         self.preview_label.setStyleSheet("border: 1px solid #555; background-color: #3c3c3c;")
-        layout.addWidget(self.preview_label)
+        self.splitter.addWidget(self.preview_label)
+
+        self.splitter.splitterMoved.connect(lambda pos, index: self._rescale_preview())
+
         self.list_widget = QListWidget()
-        self.list_widget.setViewMode(QListView.ListMode)
-        self.list_widget.setSpacing(2)
+        # Grid-of-thumbnails instead of a plain text list -- see
+        # _load_list_thumbnails for how each icon actually gets filled in.
+        self.list_widget.setViewMode(QListView.IconMode)
+        self.list_widget.setIconSize(QSize(self.THUMB_SIZE, self.THUMB_SIZE))
+        self.list_widget.setResizeMode(QListView.Adjust)
+        self.list_widget.setMovement(QListView.Static)
+        self.list_widget.setWordWrap(True)
+        self.list_widget.setSpacing(8)
+        self.list_widget.setUniformItemSizes(True)
+        self.list_widget.setMinimumHeight(60)
+        placeholder = self._placeholder_icon()
         for i, image_path in enumerate(self.image_list):
             display_name = os.path.basename(image_path)
-            item = QListWidgetItem(display_name)
+            item = QListWidgetItem(placeholder, display_name)
             item.setData(Qt.UserRole, i)
+            item.setTextAlignment(Qt.AlignHCenter)
             self.list_widget.addItem(item)
         self.list_widget.setCurrentRow(self.current_index)
         self.list_widget.itemDoubleClicked.connect(self.on_double_click)
         self.list_widget.itemClicked.connect(self.on_item_clicked)
-        layout.addWidget(self.list_widget)
+        self.splitter.addWidget(self.list_widget)
+
+        layout.addWidget(self.splitter)
         self.show_preview(self.current_index)
+
         button_layout = QHBoxLayout()
         select_button = QPushButton('선택')
         select_button.clicked.connect(self.accept)
@@ -1755,7 +2050,131 @@ class ImageListDialog(QDialog):
         button_layout.addWidget(select_button)
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
-    
+
+        self._restore_geometry()
+        current_item = self.list_widget.item(self.current_index)
+        if current_item is not None:
+            QTimer.singleShot(0, lambda: self.list_widget.scrollToItem(
+                current_item, QListWidget.PositionAtCenter))
+        # By the time resize/splitter events fire from _restore_geometry
+        # above, the splitter may not have its restored proportions
+        # applied yet (setSizes happens after resize() in there), so the
+        # preview could get scaled once against a not-yet-final size.
+        # Harmless, but this deferred call -- running once everything
+        # from _restore_geometry has actually settled -- guarantees the
+        # preview ends up matching the real, final layout regardless of
+        # that ordering.
+        QTimer.singleShot(0, self._rescale_preview)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Cheap (scales an already-decoded pixmap, no re-decode), so no
+        # debounce needed here -- unlike the thumbnail grid, which used
+        # to also resize with the dialog and needed one because it had
+        # to re-decode every thumbnail at the new size. That turned out
+        # to not be what was actually wanted (the grid stays at a fixed
+        # Windows-11-large-icons size now); this preview rescale is what
+        # "resize with the window" meant instead.
+        self._rescale_preview()
+
+    def _rescale_preview(self):
+        if not self._preview_pixmap:
+            return
+        target = self.preview_label.size()
+        if target.width() <= 0 or target.height() <= 0:
+            return
+        scaled = self._preview_pixmap.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview_label.setPixmap(scaled)
+
+    def _placeholder_icon(self):
+        pm = QPixmap(self.THUMB_SIZE, self.THUMB_SIZE)
+        pm.fill(QColor('#4c4c4c'))
+        return QIcon(pm)
+
+    def _restore_geometry(self):
+        geom = self._settings.get('image_list_dialog_geometry') if self._settings else None
+        width = geom.get('width') if geom else None
+        height = geom.get('height') if geom else None
+        if width and height:
+            self.resize(width, height)
+        else:
+            self.resize(420, 620)
+        x = geom.get('x') if geom else None
+        y = geom.get('y') if geom else None
+        if x is not None and y is not None:
+            self.move(x, y)
+        sizes = geom.get('splitter_sizes') if geom else None
+        if sizes and len(sizes) == 2 and all(isinstance(s, int) and s > 0 for s in sizes):
+            self.splitter.setSizes(sizes)
+        else:
+            self.splitter.setSizes([200, 380])
+
+    def done(self, r):
+        # Overridden instead of closeEvent: QDialog.accept()/reject() --
+        # what the 선택/취소 buttons and double-clicking an item all
+        # call -- go through done() and then hide(), never through
+        # close(), so a closeEvent override never actually ran for any
+        # of this dialog's normal dismissal paths (only for the window's
+        # own X button, via Qt's default closeEvent->reject() handling).
+        # done() is the one place all three routes funnel through.
+        if self._settings:
+            pos = self.pos()
+            self._settings.set('image_list_dialog_geometry', {
+                'x': pos.x(),
+                'y': pos.y(),
+                'width': self.width(),
+                'height': self.height(),
+                'splitter_sizes': self.splitter.sizes(),
+            })
+        super().done(r)
+
+    def _load_list_thumbnails(self):
+        # One background job per file, reusing the same shared decode
+        # pool (and so the same efficient-scaled-decode/cv2 paths) the
+        # main viewer uses for everything else -- see ImageLoader.
+        # thumb_generation guards against a stale earlier batch's results
+        # landing on the wrong items if this ever gets called a second
+        # time while the dialog is still open (it currently isn't, but
+        # cheap insurance). The try/except around emit below is the
+        # actual guard against the dialog (and thumb_bridge with it)
+        # having already been closed and garbage-collected by the time a
+        # background job finishes -- closing the dialog doesn't cancel
+        # jobs already submitted to the shared pool.
+        self.thumb_generation += 1
+        generation = self.thumb_generation
+        current_zip = self.current_zip
+        size = (self.THUMB_SIZE, self.THUMB_SIZE)
+        for i, image_path in enumerate(self.image_list):
+            def worker(path=image_path):
+                try:
+                    if current_zip:
+                        return ZipHandler.load_thumbnail(current_zip, path, size=size)
+                    return ImageLoader.load_thumbnail(path, size=size)
+                except Exception:
+                    return None
+            future = ImageLoader._executor.submit(worker)
+            def done(fut, idx=i, gen=generation):
+                try:
+                    pixmap = fut.result()
+                except Exception:
+                    pixmap = None
+                try:
+                    self.thumb_bridge.loaded.emit(idx, (gen, pixmap))
+                except RuntimeError:
+                    pass  # dialog already closed/destroyed
+            future.add_done_callback(done)
+
+    def _on_thumbnail_loaded(self, index, payload):
+        generation, pixmap = payload
+        if generation != self.thumb_generation:
+            return
+        if not pixmap or pixmap.isNull():
+            return
+        item = self.list_widget.item(index)
+        if item is None:
+            return
+        item.setIcon(QIcon(pixmap))
+
     def on_item_clicked(self, item):
         self.selected_index = item.data(Qt.UserRole)
         self.show_preview(self.selected_index)
@@ -1769,14 +2188,23 @@ class ImageListDialog(QDialog):
             return
         self.preview_label.setText('로딩 중...')
         try:
+            # Decoded once at a reasonably large fixed size; resizeEvent/
+            # the splitter's splitterMoved above just rescale this same
+            # pixmap afterward (cheap) instead of re-decoding from disk
+            # every time the preview pane's size changes.
+            preview_size = (800, 800)
             if self.current_zip:
-                pixmap = ZipHandler.load_image_from_zip(self.current_zip, self.image_list[index])
+                pixmap = ZipHandler.load_thumbnail(self.current_zip, self.image_list[index], size=preview_size)
             else:
-                pixmap = ImageLoader.load_thumbnail(self.image_list[index])
+                pixmap = ImageLoader.load_thumbnail(self.image_list[index], size=preview_size)
             if pixmap and not pixmap.isNull():
-                scaled = pixmap.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.preview_label.setPixmap(scaled)
-        except:
+                self._preview_pixmap = pixmap
+                self._rescale_preview()
+            else:
+                self._preview_pixmap = None
+                self.preview_label.setText('미리보기 불가')
+        except Exception:
+            self._preview_pixmap = None
             self.preview_label.setText('미리보기 불가')
     
     def get_selected_index(self):
@@ -1959,6 +2387,56 @@ class ShortcutSettingsDialog(QDialog):
         self.settings.update_shortcuts_many(values)
         self.accept()
 
+class FileAssociationDialog(QDialog):
+    """One checkbox per supported extension (see ImageLoader.
+    SUPPORTED_FORMATS); toggling a box immediately registers/
+    unregisters that extension with this app in the Windows registry
+    (see set_extension_association) rather than needing a separate
+    save step -- matches how each checkbox's own state is read back
+    from the registry (is_extension_associated), so what's on screen
+    always reflects what's actually registered right now."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('파일 형식 연결')
+        self.setModal(True)
+        if parent is not None:
+            self.setStyleSheet(parent.styleSheet())
+        layout = QVBoxLayout(self)
+
+        note = QLabel(
+            '체크한 형식의 파일은 이 프로그램으로 열리도록 등록됩니다.\n'
+            '체크 해제하면 이 프로그램이 등록했던 연결만 해제되며,\n'
+            '다른 프로그램이 가진 연결은 건드리지 않습니다.'
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        grid_widget = QWidget()
+        grid = QGridLayout(grid_widget)
+        exts = sorted(ImageLoader.SUPPORTED_FORMATS)
+        self.checkboxes = {}
+        columns = 4
+        for i, ext in enumerate(exts):
+            checkbox = QCheckBox(ext)
+            checkbox.setChecked(is_extension_associated(ext))
+            checkbox.toggled.connect(lambda checked, e=ext: self._on_toggled(e, checked))
+            self.checkboxes[ext] = checkbox
+            grid.addWidget(checkbox, i // columns, i % columns)
+        layout.addWidget(grid_widget)
+
+        close_button = QPushButton('닫기')
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+    def _on_toggled(self, ext, checked):
+        ok = set_extension_association(ext, checked)
+        if not ok:
+            QMessageBox.warning(self, '파일 연결 실패', f'{ext} 연결 설정에 실패했습니다.')
+            checkbox = self.checkboxes[ext]
+            checkbox.blockSignals(True)
+            checkbox.setChecked(not checked)
+            checkbox.blockSignals(False)
+
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -1969,7 +2447,7 @@ class SettingsDialog(QDialog):
     def init_ui(self):
         self.setWindowTitle('설정')
         self.setModal(True)
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(820)
         self.setStyleSheet("""
             QDialog { background-color: #2b2b2b; color: #ffffff; }
             QGroupBox { color: #ffffff; border: 1px solid #555; margin-top: 10px; }
@@ -1985,6 +2463,17 @@ class SettingsDialog(QDialog):
             QPushButton:hover { background-color: #4c4c4c; }
         """)
         layout = QVBoxLayout(self)
+        # Two columns side by side instead of one long vertical stack, so
+        # the dialog stays roughly as tall as before even with the added
+        # file-association section -- see the addWidget calls below,
+        # which go to left_column/right_column instead of layout directly
+        # for everything except the Save/Cancel row at the very end.
+        columns_layout = QHBoxLayout()
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
+        columns_layout.addLayout(left_column)
+        columns_layout.addLayout(right_column)
+        layout.addLayout(columns_layout)
         
         display_group = QGroupBox('이미지 표시')
         display_layout = QFormLayout()
@@ -2006,7 +2495,7 @@ class SettingsDialog(QDialog):
             self.preload_count.addItem(label, count)
         display_layout.addRow('미리 로딩 범위:', self.preload_count)
         display_group.setLayout(display_layout)
-        layout.addWidget(display_group)
+        left_column.addWidget(display_group)
 
         zip_group = QGroupBox('압축 파일')
         zip_layout = QFormLayout()
@@ -2016,7 +2505,7 @@ class SettingsDialog(QDialog):
         zip_note.setWordWrap(True)
         zip_layout.addRow('', zip_note)
         zip_group.setLayout(zip_layout)
-        layout.addWidget(zip_group)
+        left_column.addWidget(zip_group)
         
         static_adjust_group = QGroupBox('정지 이미지 조절')
         static_adjust_layout = QFormLayout()
@@ -2053,7 +2542,7 @@ class SettingsDialog(QDialog):
         static_adjust_layout.addRow('', reset_adjust_button)
 
         static_adjust_group.setLayout(static_adjust_layout)
-        layout.addWidget(static_adjust_group)
+        left_column.addWidget(static_adjust_group)
 
         anim_adjust_group = QGroupBox('움직이는 이미지 조절 (GIF·애니메이션 WebP)')
         anim_adjust_layout = QFormLayout()
@@ -2090,11 +2579,11 @@ class SettingsDialog(QDialog):
         anim_adjust_layout.addRow('', reset_anim_adjust_button)
 
         anim_adjust_group.setLayout(anim_adjust_layout)
-        layout.addWidget(anim_adjust_group)
+        left_column.addWidget(anim_adjust_group)
 
         apply_button = QPushButton('현재 이미지에 즉시 적용')
         apply_button.clicked.connect(self.apply_immediately)
-        layout.addWidget(apply_button)
+        left_column.addWidget(apply_button)
         
         snap_group = QGroupBox('창 자석 기능')
         snap_layout = QFormLayout()
@@ -2105,7 +2594,7 @@ class SettingsDialog(QDialog):
         self.snap_threshold.setSuffix(' 픽셀')
         snap_layout.addRow('자석 작동 거리:', self.snap_threshold)
         snap_group.setLayout(snap_layout)
-        layout.addWidget(snap_group)
+        right_column.addWidget(snap_group)
         
         slideshow_group = QGroupBox('슬라이드쇼')
         slideshow_layout = QFormLayout()
@@ -2122,22 +2611,25 @@ class SettingsDialog(QDialog):
         self.slideshow_gif_loops.setSuffix(' 회')
         slideshow_layout.addRow('GIF 재생 횟수:', self.slideshow_gif_loops)
         slideshow_group.setLayout(slideshow_layout)
-        layout.addWidget(slideshow_group)
+        right_column.addWidget(slideshow_group)
 
-        error_group = QGroupBox('오류 처리')
-        error_layout = QFormLayout()
-        error_note = QLabel('직접 이동 중 파일을 읽을 수 없으면 기본 대체 이미지가 표시됩니다.\n슬라이드쇼 중에는 대신 자동으로 다음 이미지로 건너뜁니다.')
-        error_note.setWordWrap(True)
-        error_layout.addRow('', error_note)
-        error_group.setLayout(error_layout)
-        layout.addWidget(error_group)
+        file_assoc_group = QGroupBox('파일 연결')
+        file_assoc_layout = QVBoxLayout()
+        file_assoc_note = QLabel('특정 이미지 형식을 이 프로그램으로 열리도록 등록합니다.')
+        file_assoc_note.setWordWrap(True)
+        file_assoc_layout.addWidget(file_assoc_note)
+        file_assoc_button = QPushButton('파일 형식 연결 설정...')
+        file_assoc_button.clicked.connect(self.open_file_association_dialog)
+        file_assoc_layout.addWidget(file_assoc_button)
+        file_assoc_group.setLayout(file_assoc_layout)
+        right_column.addWidget(file_assoc_group)
         
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel('배경색:'))
         self.color_button = QPushButton()
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
-        layout.addLayout(color_layout)
+        right_column.addLayout(color_layout)
         
         button_layout = QHBoxLayout()
         save_button = QPushButton('저장')
@@ -2221,6 +2713,10 @@ class SettingsDialog(QDialog):
         if color.isValid():
             self.current_color = color.name()
             self.update_color_button()
+    
+    def open_file_association_dialog(self):
+        dialog = FileAssociationDialog(self)
+        dialog.exec_()
     
     def update_color_button(self):
         self.color_button.setStyleSheet(f"background-color: {self.current_color}; color: white;")
@@ -2742,7 +3238,7 @@ class ImageViewer(QMainWindow):
         return [int(text) if text.isdigit() else text.lower() 
                 for text in re.split(r'(\d+)', s)]
     
-    def load_directory(self, directory):
+    def load_directory(self, directory, auto_show=True):
         self.load_generation += 1
         self.cache_manager.clear()
         self.image_list = []
@@ -2756,13 +3252,23 @@ class ImageViewer(QMainWindow):
             pass
         if self.image_list:
             self.current_index = 0
-            self.show_current_image()
+            if auto_show:
+                self.show_current_image()
         else:
             self.image_label.clear()
     
     def load_single_file(self, filepath):
         directory = os.path.dirname(filepath)
-        self.load_directory(directory)
+        # auto_show=False: without this, load_directory would decode and
+        # display index 0 (alphabetically first in the folder) only to
+        # immediately throw that away once the loop below finds this
+        # file's real index a few lines later -- wasted decode work that
+        # competed with this file's own request for a worker-pool slot.
+        # Confirmed as a real, not just theoretical, difference: load_zip
+        # below only ever calls show_current_image() once and doesn't
+        # have this problem; opening a single file from outside the app
+        # while it's already running did.
+        self.load_directory(directory, auto_show=False)
         try:
             abs_path = os.path.abspath(filepath)
             for i, img_path in enumerate(self.image_list):
@@ -2858,6 +3364,12 @@ class ImageViewer(QMainWindow):
         # extra detail on screen instead of immediately downscaling it away
         # again is the scaled-to-physical-size + setDevicePixelRatio() call
         # in update_image_display's fit_to_window branch below.
+        #
+        # A fast/DIP-resolution preview tier used to exist here too, shown
+        # during rapid navigation and upgraded to this sharp size once
+        # navigation settled -- removed on request: the blurry-then-sharp
+        # transition when it kicked in was more distracting than the
+        # slower navigation it was trading for.
         # Small safety margin (also scaled) prevents repeated reloads
         # caused by tiny widget changes.
         return (max(64, int((size.width() + 64) * dpr)), max(64, int((size.height() + 64) * dpr)))
@@ -2937,6 +3449,22 @@ class ImageViewer(QMainWindow):
         self.loading_keys.add(key)
         source_zip = self.current_zip
         def worker():
+            if generation != self.load_generation:
+                # Superseded by a later navigation before this job even
+                # started running. With a worker pool of limited size,
+                # rapid navigation (e.g. holding an arrow key, or flicking
+                # quickly through static WebP files) can queue up more
+                # decode jobs -- both "the image now on screen" and
+                # _preload_neighbors' speculative ones -- than can finish
+                # before the user has already moved past them. Bailing out
+                # here before doing any real decode work lets a backlog of
+                # now-irrelevant jobs drain almost instantly instead of
+                # each one running its full decode first, which is what
+                # let a big backlog visibly delay the image the user
+                # actually landed on.
+                self.loading_keys.discard(key)
+                print(f"[정적 이미지] stale 요청 건너뜀: {filename}")
+                return
             source_fast_key = ((source_zip, filename), max_size)
             if (saturation, brightness, contrast) == (100, 100, 100):
                 source_cached = self._source_cache_get(source_fast_key)
@@ -2957,6 +3485,7 @@ class ImageViewer(QMainWindow):
                     self.load_bridge.loaded.emit(generation, key, image, index == self.current_index)
                     return
 
+            _t0 = time.perf_counter()
             if source_zip:
                 image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size)
             else:
@@ -2966,6 +3495,7 @@ class ImageViewer(QMainWindow):
                         image = QImage(filename)
                     except Exception:
                         image = None
+            print(f"[정적 이미지] {'현재' if index == self.current_index else '프리로드'} {filename}: {(time.perf_counter() - _t0) * 1000:.1f}ms (max_size={max_size})")
 
             if image is not None and (saturation, brightness, contrast) != (100, 100, 100):
                 self._adjusted_cache_put(adjustment_key, image)
@@ -3133,7 +3663,20 @@ class ImageViewer(QMainWindow):
             return
         self.current_pixmap = pixmap
         self.original_pixmap = pixmap
+        _t0 = time.perf_counter()
         self.update_image_display()
+        # setPixmap() above only *schedules* a repaint for whenever Qt's
+        # event loop next gets to it -- normally fine, but this can be
+        # called from inside SingleApplication.on_new_connection's
+        # socket.waitForReadyRead(), itself a nested/reentrant event loop
+        # (see the comment there). A scheduled-but-not-yet-run repaint in
+        # that context was what let a single image file opened from
+        # outside the app (while it was already running) sit on screen
+        # unchanged until something else -- a window resize -- forced a
+        # real repaint. repaint() forces it synchronously, right here,
+        # regardless of which event loop this ends up being called from.
+        self.image_label.repaint()
+        print(f"[정적 이미지] 화면 갱신(GUI 스레드): {(time.perf_counter() - _t0) * 1000:.1f}ms")
         if self.settings.get('show_filename', False):
             current_file = self.image_list[self.current_index]
             display_name = os.path.basename(current_file) if not self.current_zip else current_file
@@ -3153,9 +3696,26 @@ class ImageViewer(QMainWindow):
 
         # Preload symmetrically around the current image. Nearer images are
         # submitted first so the immediately-next image gets priority.
+        #
+        # Backpressure: stop once the decode pool is already as busy as it
+        # can usefully be. Confirmed from real logs that WebP decode
+        # through this pipeline runs 100-300ms per image on this machine
+        # -- with only _DECODE_WORKER_COUNT workers, rapid navigation
+        # (e.g. holding an arrow key) can queue up preload jobs for
+        # images already skipped past faster than the pool can clear
+        # them, which pushed the currently-displayed image's own request
+        # further back behind them in the same queue and made navigation
+        # itself feel like it was lagging behind the keypresses. The
+        # staleness check in _submit_image_load's worker already
+        # discards a request once it *starts*, but that's after it
+        # already occupied a worker slot for however long the job ahead
+        # of it took; this stops it from being queued in the first place
+        # when the pool has no spare capacity to begin with.
         generation = self.load_generation
         for distance in range(1, count + 1):
             for direction in (1, -1):
+                if len(self.loading_keys) >= _DECODE_WORKER_COUNT:
+                    return
                 idx = self.current_index + (distance * direction)
                 if 0 <= idx < len(self.image_list):
                     self._submit_image_load(idx, generation)
@@ -3353,17 +3913,49 @@ class ImageViewer(QMainWindow):
             # never actually settled down no matter how long you waited.
             frame_count = known_frame_count or movie.frameCount()
             if frame_count and frame_count > 0:
-                w = scaled_size.width() if scaled_size else self.current_movie_original_size.width()
-                h = scaled_size.height() if scaled_size else self.current_movie_original_size.height()
+                # Frames are now cached at their native/decode resolution
+                # (see _animated_cache_key/_show_animated_pixmap), which
+                # is scaled_size capped at native when zoomed in past 1:1
+                # -- exactly what _anim_decode_size already computes for
+                # QMovie itself. Using the raw (possibly much larger,
+                # zoomed) target size here instead would overestimate
+                # bytes per frame and size the cache smaller than the
+                # memory budget actually allows.
+                decode_size = self._anim_decode_size(scaled_size) if scaled_size else self.current_movie_original_size
+                w = decode_size.width() if decode_size else self.current_movie_original_size.width()
+                h = decode_size.height() if decode_size else self.current_movie_original_size.height()
                 if w > 0 and h > 0:
                     bytes_per_frame = w * h * 4
-                    budget = 800 * 1024 * 1024  # ~800MB ceiling for this cache
+                    # Confirmed from real logs: a 385-frame animation
+                    # viewed zoomed in (~2081x2081 output, ~17.3MB/frame)
+                    # only got 124 frames of cache room at the previous
+                    # 2GB budget -- nowhere near the full loop, so most
+                    # loops still recomputed the majority of frames from
+                    # scratch. Doubled to 4GB, which comfortably covers
+                    # 385 frames at ordinary (non-zoomed) sizes and gets
+                    # meaningfully further at this zoomed size too (~237
+                    # frames), though a long animation watched zoomed in
+                    # for many loops can still exceed even this -- the
+                    # cache stores each frame at its current on-screen
+                    # (zoomed) size rather than a fixed native size, so
+                    # there's no budget that covers every zoom level for
+                    # an arbitrarily long loop. Caching at native
+                    # resolution and scaling for display separately (like
+                    # the static-image pipeline already does) would fix
+                    # that properly without needing more memory, but is a
+                    # bigger change than raising this number -- worth
+                    # doing if the "[애니메이션 캐시]" line below still
+                    # shows up often for real usage.
+                    budget = 4096 * 1024 * 1024  # ~4GB ceiling for this cache
                     by_memory = max(1, budget // max(1, bytes_per_frame))
-                    self.animated_frame_cache_limit = max(24, min(frame_count, by_memory, 600))
+                    self.animated_frame_cache_limit = max(24, min(frame_count, by_memory, 1000))
                 else:
                     self.animated_frame_cache_limit = max(24, min(frame_count, 300))
             else:
                 self.animated_frame_cache_limit = 24
+
+            if frame_count and self.animated_frame_cache_limit < frame_count:
+                print(f"[애니메이션 캐시] 프레임 수({frame_count})가 캐시 한도({self.animated_frame_cache_limit})보다 많아 루프마다 일부 프레임이 다시 계산됩니다 (프레임 크기 {w}x{h})")
 
             self.prefetch_frame_count = frame_count if frame_count and frame_count > 0 else None
 
@@ -3395,14 +3987,20 @@ class ImageViewer(QMainWindow):
         self._preload_neighbors()
 
     def _animated_cache_key(self, frame_number):
+        # Deliberately does NOT include zoom/window size (it used to:
+        # fit_to_window, zoom_factor, scroll_area size). Frames are now
+        # color-adjusted and cached at their own native resolution (see
+        # _show_animated_pixmap), with the zoom/window-fit scale applied
+        # as a separate, cheap step every time a frame is shown -- so the
+        # same cached, color-adjusted frame is valid at any zoom level or
+        # window size, not just the one it happened to be computed at.
+        # Previously, zooming or resizing the window mid-playback threw
+        # away every cached frame and forced a full recompute of the
+        # entire animation from scratch.
         return (frame_number,
                 self.settings.get('anim_saturation', 100),
                 self.settings.get('anim_brightness', 100),
-                self.settings.get('anim_contrast', 100),
-                self.fit_to_window,
-                self.zoom_factor,
-                self.scroll_area.size().width(),
-                self.scroll_area.size().height())
+                self.settings.get('anim_contrast', 100))
 
     def _anim_decode_size(self, target_size):
         """The size QMovie should actually decode/scale a frame to. Capped
@@ -3460,24 +4058,21 @@ class ImageViewer(QMainWindow):
         cached = self.animated_frame_cache.get(key)
         if cached is not None:
             self.animated_frame_cache.move_to_end(key)
-            self.current_pixmap = cached
-            self.image_label.setPixmap(cached)
-            self.image_label.adjustSize()
+            self._show_animated_pixmap(cached)
             return
 
         saturation = self.settings.get('anim_saturation', 100)
         brightness = self.settings.get('anim_brightness', 100)
         contrast = self.settings.get('anim_contrast', 100)
         if saturation == 100 and brightness == 100 and contrast == 100:
+            # Native size -- no color math needed, so nothing to gain by
+            # rendering straight to the display target the way this used
+            # to. Caching (and scaling for display) the same way as the
+            # adjusted tiers below means this frame stays valid across
+            # zoom/window-resize changes too.
             pixmap = QPixmap.fromImage(qimage)
-            target = self.current_movie_target_size
-            if target and (pixmap.width() != target.width() or pixmap.height() != target.height()):
-                mode = Qt.FastTransformation if self.settings.get('zoom_quality', 'balanced') == 'speed' else Qt.SmoothTransformation
-                pixmap = pixmap.scaled(target, Qt.KeepAspectRatio, mode)
             self._store_animated_frame(key, pixmap)
-            self.current_pixmap = pixmap
-            self.image_label.setPixmap(pixmap)
-            self.image_label.adjustSize()
+            self._show_animated_pixmap(pixmap)
             return
 
         # Try the GPU shader tier first -- it runs synchronously right
@@ -3489,9 +4084,7 @@ class ImageViewer(QMainWindow):
         pixmap = self._render_animated_frame_gpu(qimage, saturation, brightness, contrast)
         if pixmap is not None:
             self._store_animated_frame(key, pixmap)
-            self.current_pixmap = pixmap
-            self.image_label.setPixmap(pixmap)
-            self.image_label.adjustSize()
+            self._show_animated_pixmap(pixmap)
             return
 
         # A look-ahead prefetch may already be processing this exact frame;
@@ -3500,15 +4093,42 @@ class ImageViewer(QMainWindow):
             return
         self._submit_animated_frame_processing(qimage, frame_number, generation, key)
 
+    def _show_animated_pixmap(self, native_pixmap):
+        """Scale a native-resolution animated frame pixmap (cached or
+        just computed -- animated_frame_cache always stores frames at
+        their own native resolution now, see _animated_cache_key) to the
+        current display target and show it. This is the one place that
+        scale actually happens, separate from the color math, so a
+        zoom or window-resize change only needs this cheap step, not a
+        full recompute of every cached frame."""
+        target = self.current_movie_target_size
+        pixmap = native_pixmap
+        if target and (pixmap.width() != target.width() or pixmap.height() != target.height()):
+            mode = Qt.FastTransformation if self.settings.get('zoom_quality', 'balanced') == 'speed' else Qt.SmoothTransformation
+            pixmap = pixmap.scaled(target, Qt.KeepAspectRatio, mode)
+        # target is already a physical-pixel quantity (see the old
+        # comment on _store_animated_frame) -- tag the pixmap actually
+        # being shown, not the native-resolution one that may still be
+        # sitting in animated_frame_cache.
+        pixmap.setDevicePixelRatio(self.devicePixelRatioF())
+        self.current_pixmap = pixmap
+        self.image_label.setPixmap(pixmap)
+        self.image_label.adjustSize()
+
     def _render_animated_frame_gpu(self, qimage, saturation, brightness, contrast):
         """GPU-shader replacement for the apply_color_adjustments()/
         apply_color_adjustments_cv2() call in _submit_animated_frame_
         processing, for the frame that's actually about to be displayed.
-        Renders synchronously (see GpuColorCorrector.adjust) and returns
-        a ready-to-display QPixmap already sized to
-        current_movie_target_size, or None if the GPU path isn't
-        available -- callers fall back to the unchanged cv2/Pillow tiers
-        in that case.
+        Renders synchronously (see GpuColorCorrector.adjust) at the
+        frame's own native resolution and returns that as a QPixmap, or
+        None if the GPU path isn't available -- callers fall back to the
+        unchanged cv2/Pillow tiers in that case. Scaling to the current
+        display target happens separately in _show_animated_pixmap, same
+        as the cv2/Pillow tiers already do (see the matching comment in
+        _submit_animated_frame_processing) -- this used to render
+        straight to current_movie_target_size instead, which meant a
+        cached result was only ever valid at the exact zoom/window size
+        it was computed for.
 
         No pixel-count cutoff before attempting this (an earlier version
         had one, out of unverified concern that a large frame's upload+
@@ -3521,12 +4141,10 @@ class ImageViewer(QMainWindow):
         that's a real data point to reintroduce a cutoff from; guessing
         a threshold with no measurement behind it did more harm than
         good here."""
-        target = self.current_movie_target_size
-        target_w = target.width() if target else qimage.width()
-        target_h = target.height() if target else qimage.height()
+        w, h = qimage.width(), qimage.height()
         result = self.gl_color_corrector.adjust(
             qimage, saturation / 100.0, brightness / 100.0, contrast / 100.0,
-            target_w, target_h)
+            w, h)
         if result is None or result.isNull():
             return None
         return QPixmap.fromImage(result)
@@ -3539,9 +4157,6 @@ class ImageViewer(QMainWindow):
         saturation = self.settings.get('anim_saturation', 100)
         brightness = self.settings.get('anim_brightness', 100)
         contrast = self.settings.get('anim_contrast', 100)
-        target = self.current_movie_target_size
-        target_w = target.width() if target else None
-        target_h = target.height() if target else None
         try:
             rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
             w, h = rgba.width(), rgba.height()
@@ -3555,25 +4170,30 @@ class ImageViewer(QMainWindow):
                 # below for this. Falls through to PIL on any failure,
                 # most commonly because opencv-python-headless just isn't
                 # installed, so playback still works either way.
-                _t0 = time.perf_counter()
-                result = _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, target_w, target_h)
+                #
+                # No target_w/target_h passed here anymore -- output
+                # stays at native (w, h) resolution so the cached,
+                # color-adjusted result is reusable at any zoom/window
+                # size, not just the one in effect right now.
+                # _show_animated_pixmap does the (cheap) scale to
+                # whatever the current display target is, separately,
+                # every time a frame is actually shown, cached or not.
+                result = _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, None, None)
                 if result is not None:
-                    print(f"[cv2 색보정] {w}x{h} -> {target_w}x{target_h}: {(time.perf_counter() - _t0) * 1000:.1f}ms")
                     return result
                 try:
                     from PIL import Image
                     src = Image.frombuffer('RGBA', (w, h), raw, 'raw', 'RGBA', 0, 1)
+                    # Keep the source alpha through the color math instead
+                    # of letting convert('RGB') discard it -- see the
+                    # matching fix in _process_animated_frame_fast/the GPU
+                    # shader for why forcing full opacity here was turning
+                    # transparent areas solid-colored.
+                    alpha = src.getchannel('A')
                     rgb = src.convert('RGB')
-                    # Color math runs at native (w, h) resolution -- see
-                    # _anim_decode_size -- so the upscale to the on-screen
-                    # target size, if any, happens once here at the end
-                    # instead of the filter paying for the extra pixels.
                     rgb = apply_color_adjustments(rgb, saturation, brightness, contrast)
-                    if target_w and target_h and (rgb.width != target_w or rgb.height != target_h):
-                        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
-                        rgb = rgb.resize((target_w, target_h), resample)
                     out = rgb.convert('RGBA')
-                    print(f"[PIL 색보정 -- cv2 미사용/실패] {w}x{h} -> {rgb.width}x{rgb.height}: {(time.perf_counter() - _t0) * 1000:.1f}ms")
+                    out.putalpha(alpha)
                     return out.tobytes('raw', 'RGBA'), rgb.width, rgb.height
                 except Exception as e:
                     print(f"[애니메이션 프레임 색보정 실패] {e}")
@@ -3590,21 +4210,35 @@ class ImageViewer(QMainWindow):
             self.animated_inflight_keys.discard(key)
 
     def _prefetch_ahead(self, frame_number):
-        """Decode the next anim_lookahead frames on the paused prefetch
-        movie and dispatch them to the cv2/Pillow worker pool now (see
-        _submit_animated_frame_processing), so they're ready in
-        animated_frame_cache before playback actually reaches them.
+        """Decode ONE not-yet-cached frame from within the next
+        anim_lookahead frames on the paused prefetch movie, and dispatch
+        it to the cv2/Pillow worker pool now (see
+        _submit_animated_frame_processing), so it's ready in
+        animated_frame_cache before playback actually reaches it.
 
         Deliberately never uses the synchronous GPU tier
         (_render_animated_frame_gpu) here, even though
         _render_animated_frame does for the frame that's actually about
         to be displayed: prefetching exists precisely because these
         frames *aren't* needed yet, so there's no reason to pay a
-        synchronous GUI-thread cost for them. That used to cost up to two
-        extra synchronous texture-upload+FBO-render+readback round trips
-        on the GUI thread per frame change -- worse for playback
-        smoothness the larger the frame, and worse than just letting this
-        work happen off-thread, which is the whole point of prefetching."""
+        synchronous GUI-thread cost for them.
+
+        Deliberately decodes at most ONE frame per call, not all of
+        anim_lookahead at once, even though this function runs on every
+        single frame change and so still fills the lookahead window over
+        the next few frame changes either way. jumpToFrame()+
+        currentImage() on prefetch_movie is a real, synchronous decode on
+        the GUI thread -- the color math after it is what's offloaded to
+        the worker pool, not this part -- so decoding up to
+        anim_lookahead frames back-to-back in one call meant that on an
+        uncached (first) loop, nearly every frame change paid for
+        anim_lookahead-many synchronous decodes stacked on top of the
+        one already needed for the live frame in _render_animated_frame.
+        That's what was making a color-adjusted animation's first loop
+        take much longer in wall-clock time than the file's own declared
+        duration (e.g. a 6s loop measured closer to 11s+), independent of
+        how fast the GPU/cv2 color pass itself is -- the decode this
+        function does was the part actually stacking up."""
         if not self.prefetch_movie or not self.current_movie:
             return
         # No adjustment active: the live path takes a free instant fast path
@@ -3635,8 +4269,6 @@ class ImageViewer(QMainWindow):
             key = self._animated_cache_key(target)
             if key in self.animated_frame_cache or key in self.animated_inflight_keys:
                 continue
-            if len(self.animated_inflight_keys) >= _ANIM_WORKER_COUNT:
-                break
             try:
                 if not self.prefetch_movie.jumpToFrame(target):
                     continue
@@ -3648,6 +4280,11 @@ class ImageViewer(QMainWindow):
             except Exception:
                 continue
             self._submit_animated_frame_processing(qimage, target, generation, key)
+            # One synchronous decode is enough for this call -- see
+            # docstring. The remaining lookahead frames get their turn on
+            # the next few frame-changed events instead of all landing
+            # here at once.
+            return
 
     def _on_animated_frame_ready(self, generation, frame_number, payload):
         key, result = payload
@@ -3663,24 +4300,15 @@ class ImageViewer(QMainWindow):
             return
         self._store_animated_frame(key, pixmap)
         if self.current_movie_frame == frame_number:
-            self.current_pixmap = pixmap
-            self.image_label.setPixmap(pixmap)
-            self.image_label.adjustSize()
+            self._show_animated_pixmap(pixmap)
 
     def _store_animated_frame(self, key, pixmap):
-        # Every animated frame is now rendered at physical-pixel
-        # resolution before reaching here -- update_image_display's
-        # fit_to_window branch targets scroll_area.size() * dpr (for
-        # sharpness on a scaled display), and the non-fit-to-window branch
-        # targets native_size * zoom_factor, which is a physical-pixel
-        # quantity by construction. An untagged QPixmap is laid out in
-        # device-independent pixels, so either way it would show at
-        # devicePixelRatioF()x its intended size without this. This is the
-        # single place every animated frame passes through before being
-        # cached/displayed (the no-adjustment fast path, the GPU tier, the
-        # cv2/Pillow tier, and prefetch all call this), so tagging it here
-        # fixes all of them at once.
-        pixmap.setDevicePixelRatio(self.devicePixelRatioF())
+        # Frames are cached at their own native resolution now (see
+        # _animated_cache_key/_show_animated_pixmap) -- no devicePixelRatio
+        # tagging here, since this pixmap isn't necessarily sized to any
+        # particular display target yet. _show_animated_pixmap tags the
+        # pixmap it actually puts on screen instead, after scaling it to
+        # the current target.
         self.animated_frame_cache[key] = pixmap
         self.animated_frame_cache.move_to_end(key)
         while len(self.animated_frame_cache) > self.animated_frame_cache_limit:
@@ -3908,6 +4536,20 @@ class ImageViewer(QMainWindow):
         self.fit_to_window = not self.fit_to_window
         if self.fit_to_window:
             self.zoom_factor = 1.0
+        else:
+            # Any fit-to-window timer armed before this toggle (most
+            # notably right after launch: window-geometry restoration
+            # fires a resizeEvent that arms both of these before the user
+            # has had a chance to do anything) is now moot. Both timers'
+            # own handlers already re-check fit_to_window when they
+            # fire/complete and bail out if it's since gone False, so
+            # this isn't required for correctness -- but stopping them
+            # here means that leftover work never runs at all instead of
+            # computing a result that just gets thrown away, which rules
+            # it out entirely as a contributor to only-the-first-time
+            # flakiness right after launch.
+            self._hq_resample_timer.stop()
+            self._display_update_timer.stop()
         # The fit-to-window cache may be a reduced decode; actual-size needs the full source.
         self.show_current_image()
         if self.fit_to_window:
