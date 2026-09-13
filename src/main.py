@@ -2447,7 +2447,7 @@ class SettingsDialog(QDialog):
     def init_ui(self):
         self.setWindowTitle('설정')
         self.setModal(True)
-        self.setMinimumWidth(820)
+        self.setMinimumWidth(400)
         self.setStyleSheet("""
             QDialog { background-color: #2b2b2b; color: #ffffff; }
             QGroupBox { color: #ffffff; border: 1px solid #555; margin-top: 10px; }
