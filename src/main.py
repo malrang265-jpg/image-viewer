@@ -1,15 +1,14 @@
 import sys
 import os
 import json
-import zipfile
 import threading
 import re
 import time
+import struct
+import queue
 import ctypes
-import ctypes.wintypes
-import winreg
 import concurrent.futures
-import base64
+from functools import lru_cache
 from io import BytesIO
 from collections import OrderedDict
 
@@ -20,10 +19,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QGridLayout,
                             QListWidget, QListWidgetItem, QMessageBox,
                             QListView, QSlider, QSplitter)
-from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, QThread, pyqtSignal, QPoint, QEvent, QBuffer, QIODevice
-from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QTransform, QImageReader,
-                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor, QPainter,
-                        QPen, QPolygon,
+from PyQt5.QtCore import Qt, QTimer, QObject, QByteArray, QSize, pyqtSignal, QPoint, QEvent, QBuffer, QIODevice
+from PyQt5.QtGui import (QImage, QPixmap, QKeySequence, QWheelEvent, QImageReader,
+                        QMovie, QKeyEvent, QCloseEvent, QMouseEvent, QIcon, QColor,
                         QOpenGLContext, QOffscreenSurface, QOpenGLFramebufferObject,
                         QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture, QVector2D)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
@@ -32,7 +30,6 @@ user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
 PIL_Image = None
-PIL_ImageEnhance = None
 
 def get_pil_image():
     global PIL_Image
@@ -40,13 +37,6 @@ def get_pil_image():
         from PIL import Image
         PIL_Image = Image
     return PIL_Image
-
-def get_pil_enhance():
-    global PIL_ImageEnhance
-    if PIL_ImageEnhance is None:
-        from PIL import ImageEnhance
-        PIL_ImageEnhance = ImageEnhance
-    return PIL_ImageEnhance
 
 _cv2_module = None
 _np_module = None
@@ -71,6 +61,42 @@ def get_numpy():
         _np_module = numpy
     return _np_module
 
+_warmup_done = set()
+_warmup_lock = threading.Lock()
+
+def _warm_up(kind, loaders):
+    with _warmup_lock:
+        if kind in _warmup_done:
+            return
+        _warmup_done.add(kind)
+
+    def run():
+        for loader in loaders:
+            try:
+                loader()
+            except Exception:
+                pass
+
+    threading.Thread(target=run, name=f'import-warmup-{kind}', daemon=True).start()
+
+def request_cv2_warmup():
+    """Import numpy + cv2 in the background, once. The webp fast path only
+    switches on after this has finished; until then images simply go through
+    Qt's own reader, instead of a decode worker stalling on a cold import."""
+    _warm_up('cv2', (get_pil_image, get_numpy, get_cv2))
+
+def warm_up_for_first_file(ext):
+    """Pillow (and, for webp, numpy + cv2) are imported lazily on first use and
+    a cold import costs tens to hundreds of ms. For a gif/webp that first use
+    lands on the GUI thread (get_frame_count) and would hold up the very first
+    image, so those imports are started on a background thread as soon as the
+    window is up, overlapping with Qt's first paint and the first decode.
+    Nothing is imported for a plain jpg/png, which never needs them."""
+    if ext in ('.gif', '.webp'):
+        _warm_up('pil', (get_pil_image,))
+    if ext == '.webp':
+        request_cv2_warmup()
+
 # Windows file-association support (see FileAssociationDialog). All of
 # this only ever touches HKEY_CURRENT_USER, never HKEY_LOCAL_MACHINE --
 # per-user file associations don't need administrator rights, and this
@@ -92,6 +118,7 @@ def is_extension_associated(ext):
     never true for an association some other app or the system owns, so
     checkbox state in FileAssociationDialog always reflects reality
     rather than assuming."""
+    import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f'Software\\Classes\\{ext}') as key:
             value, _ = winreg.QueryValueEx(key, '')
@@ -108,6 +135,7 @@ def set_extension_association(ext, associate):
     Returns True on success; on any registry error, prints and returns
     False so the caller can revert the checkbox instead of leaving it
     showing a state that was never actually applied."""
+    import winreg
     try:
         if associate:
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f'Software\\Classes\\{ext}') as key:
@@ -137,22 +165,6 @@ def set_extension_association(ext, associate):
         print(f"파일 연결 설정 오류 ({ext}): {e}")
         return False
 
-# Which algorithm handles saturation. Both are kept side by side so the two
-# can be A/B compared directly -- flip this to 'enhance' to go back to the
-# original behavior.
-#   'matrix'  (default) -- does the exact same blend math as
-#             ImageEnhance.Color (out = gray*(1-s) + channel*s, using
-#             Pillow's own ITU-R 601-2 luma weights) but as a single 3x4
-#             color-matrix convert() instead of building a full-size
-#             grayscale "degenerate" image and blending against it.
-#             Benchmarked ~20-35% faster across 480p-4K on this machine,
-#             with pixel output within +/-1 of 'enhance' (rounding only).
-#   'enhance' -- the original ImageEnhance.Color(img).enhance(...) path.
-SATURATION_METHOD = 'matrix'
-
-def _saturate_enhance(img, saturation):
-    return get_pil_enhance().Color(img).enhance(saturation / 100.0)
-
 def _saturate_matrix(img, saturation):
     s = saturation / 100.0
     lr, lg, lb = 0.299, 0.587, 0.114  # same weights Pillow's convert('L') uses
@@ -175,21 +187,15 @@ def apply_color_adjustments(img, saturation=100, brightness=100, contrast=100):
     applied as one fast 256-entry point() lookup table instead of
     ImageEnhance's blend-against-a-full-size-degenerate-image, which
     benchmarked ~2.7x faster for those two alone on a 24MP image. Saturation
-    is handled by _saturate_matrix/_saturate_enhance above depending on
-    SATURATION_METHOD -- see that constant for how the two compare (a
-    hand-written numpy version was also tried for this and was slower than
-    either of PIL's own C implementations, so it isn't offered as a third
-    option).
+    is a single 3x4 color-matrix convert() (_saturate_matrix): same blend
+    math as ImageEnhance.Color, ~20-35% faster, output within +/-1.
     The contrast LUT's pivot is computed from the *current* image (after
     saturation/brightness were already applied, same as ImageEnhance does
     internally) via PIL's own fast ImageStat, so the sequential-clipping
     behavior matches too.
     """
     if saturation != 100:
-        if SATURATION_METHOD == 'matrix':
-            img = _saturate_matrix(img, saturation)
-        else:
-            img = _saturate_enhance(img, saturation)
+        img = _saturate_matrix(img, saturation)
     if brightness != 100:
         b = brightness / 100.0
         lut = [max(0, min(255, round(x * b))) for x in range(256)]
@@ -460,7 +466,6 @@ class GpuColorCorrector:
             self._program = program
             self._gl_viewport = gl_viewport
             self._gl_draw_arrays = gl_draw_arrays
-            print("GPU 색보정 초기화 성공 -- 이후 애니메이션 프레임은 GPU 경로를 우선 시도합니다")
             return True
         except Exception as e:
             print(f"GPU 색보정 초기화 실패, 이후 프레임은 cv2/PIL 경로를 사용합니다: {e}")
@@ -1294,6 +1299,7 @@ def get_app_dir():
     else:
         return os.path.dirname(os.path.abspath(__file__))
 
+@lru_cache(maxsize=None)
 def get_icon_path():
     possible_paths = [
         os.path.join(get_app_dir(), 'icon.ico'),
@@ -1305,6 +1311,26 @@ def get_icon_path():
         if path and os.path.exists(path):
             return path
     return None
+
+_app_icon = None
+
+def get_app_icon():
+    """One shared QIcon, loaded once. The window, the application and every
+    show event each used to re-run the path search and re-read icon.ico."""
+    global _app_icon
+    if _app_icon is None:
+        path = get_icon_path()
+        _app_icon = QIcon(path) if path else QIcon()
+    return _app_icon
+
+_NATURAL_SPLIT = re.compile(r'(\d+)').split
+
+def natural_sort_key(s):
+    # Splitting on a digit run puts the numbers at the odd positions. (Telling
+    # numbers apart with str.isdigit() instead also accepts characters like
+    # '²' that int() rejects, which made the sort -- and with it the whole
+    # folder listing -- fail for a file name containing one.)
+    return [int(p) if i & 1 else p.lower() for i, p in enumerate(_NATURAL_SPLIT(s))]
 
 def get_frame_count(filepath):
     """Return a file's real animated-frame count via Pillow, or 0 if it
@@ -1327,6 +1353,705 @@ def get_frame_count(filepath):
     except:
         pass
     return 0
+
+# Once an animated webp's first loop has put every frame into
+# animated_frame_cache, later loops are shown straight from that cache on
+# our own timer, with QMovie paused (see
+# ImageViewer._try_start_anim_cache_playback). QMovie decodes (and scales)
+# every frame again on every loop even when we then ignore the result in
+# favor of the cached one, which is why the 2nd, 3rd, ... loop of a
+# high-res webp was no faster than the first.
+
+# Keep the finished frame cache of an animation you navigate away from (up to
+# ANIMATED_CACHE_RETAIN_MAX of them, only while there's RAM to spare and
+# "주변 이미지 미리 로딩" is on), so coming back to it replays from the cache at
+# once instead of decoding the whole first loop again -- the same way an
+# image you leave stays cached and shows instantly when you return.
+ANIMATED_CACHE_RETAIN_MAX = 2
+
+def read_webp_animation_info(source):
+    """Per-frame display durations (ms) and loop count of an animated WebP,
+    read straight from its RIFF container -- no pixel decoding, so it costs a
+    handful of chunk-header reads even for a huge file.
+
+    source is the raw bytes (a zip entry) or a path on disk. Returns
+    (durations, loop_count) -- loop_count 0 means "loop forever", as in the
+    WebP container spec -- or None if this isn't a well-formed animated WebP.
+    Read from the file itself, rather than sampled off QMovie while the first
+    loop plays, so cached replay timing doesn't depend on how long each frame
+    happened to take to decode."""
+    try:
+        f = BytesIO(source) if isinstance(source, (bytes, bytearray)) else open(source, 'rb')
+        with f:
+            head = f.read(12)
+            if len(head) < 12 or head[:4] != b'RIFF' or head[8:12] != b'WEBP':
+                return None
+            end = 8 + int.from_bytes(head[4:8], 'little')
+            durations = []
+            loop_count = 0
+            pos = 12
+            while pos + 8 <= end:
+                f.seek(pos)
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    break
+                tag = chunk[:4]
+                size = int.from_bytes(chunk[4:8], 'little')
+                if tag == b'ANIM':
+                    # background color (4 bytes), then loop count (2 bytes)
+                    body = f.read(6)
+                    if len(body) == 6:
+                        loop_count = int.from_bytes(body[4:6], 'little')
+                elif tag == b'ANMF':
+                    # x, y, width-1, height-1 (3 bytes each), then the
+                    # frame duration (3 bytes), then a flags byte
+                    body = f.read(16)
+                    if len(body) < 16:
+                        return None
+                    durations.append(int.from_bytes(body[12:15], 'little'))
+                pos += 8 + size + (size & 1)
+            return (durations, loop_count) if durations else None
+    except Exception:
+        return None
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ('dwLength', ctypes.c_uint32),      # DWORD (fixed 4 bytes, unlike c_ulong off Windows)
+        ('dwMemoryLoad', ctypes.c_uint32),
+        ('ullTotalPhys', ctypes.c_ulonglong),
+        ('ullAvailPhys', ctypes.c_ulonglong),
+        ('ullTotalPageFile', ctypes.c_ulonglong),
+        ('ullAvailPageFile', ctypes.c_ulonglong),
+        ('ullTotalVirtual', ctypes.c_ulonglong),
+        ('ullAvailVirtual', ctypes.c_ulonglong),
+        ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+    ]
+
+def get_available_physical_memory():
+    """Bytes of physical RAM that can be handed out right now without
+    paging anything to disk (free + standby lists), or None if Windows
+    won't say."""
+    try:
+        status = _MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+    except Exception:
+        pass
+    return None
+
+# Never smaller than the fixed 4GB this used to be, never larger than 24GB.
+_ANIM_CACHE_BUDGET_FLOOR = 4096 * 1024 * 1024
+_ANIM_CACHE_BUDGET_CAP = 24 * 1024 * 1024 * 1024
+
+def animated_cache_budget_bytes(avail=None, extra_bytes=0):
+    """How much memory one animation's frame cache may use: 80% of the RAM
+    that's actually free right now, clamped to [4GB, 24GB]. Cached replay
+    (ImageViewer._try_start_anim_cache_playback) only works if the *whole*
+    loop fits, so a fixed ceiling that a long high-res animation happens
+    to exceed silently turns it off for that animation; following the free
+    RAM instead lets it engage whenever the machine can really hold the
+    loop.
+
+    avail is the free-RAM reading to use (a fresh one when omitted) and
+    extra_bytes memory that is about to be handed back on top of it: a
+    caller that drops retained caches to make room passes the one reading it
+    took before dropping anything plus what it dropped, rather than reading
+    again afterwards and counting the same memory twice."""
+    if avail is None:
+        avail = get_available_physical_memory()
+    if not avail:
+        return _ANIM_CACHE_BUDGET_FLOOR
+    return int(min(max((avail + extra_bytes) * 0.8, _ANIM_CACHE_BUDGET_FLOOR), _ANIM_CACHE_BUDGET_CAP))
+
+def animated_preload_budget_bytes(avail=None):
+    """How much memory a *speculative* neighbor preload may claim: 60% of
+    the RAM that is free right now, capped, and -- unlike
+    animated_cache_budget_bytes -- with no floor. That function's 4GB floor
+    is right for the animation actually on screen (it has to be cached to
+    play smoothly), but pushing a machine that has less than that free into
+    paging for something nobody asked to see yet just makes the animation
+    that IS playing hitch. Memory already held by retained caches is not
+    counted as available (it is already resident, so it is already
+    reflected in what's free); the 40% left over is headroom for the rest
+    of the system. Returns 0 (don't preload) if free RAM can't be read."""
+    if avail is None:
+        avail = get_available_physical_memory()
+    if avail is None:
+        return 0
+    return int(min(0.6 * max(0, avail), _ANIM_CACHE_BUDGET_CAP))
+
+def animated_cache_frame_limit(frame_count, frame_w, frame_h, budget_bytes):
+    """How many frames of an animation the frame cache may hold: the whole
+    loop if it fits in budget_bytes at frame_w x frame_h (4 bytes/pixel),
+    otherwise as many as do (at least 24), and never more than 3000."""
+    bytes_per_frame = max(1, frame_w * frame_h * 4)
+    by_memory = max(1, budget_bytes // bytes_per_frame)
+    return max(24, min(frame_count, by_memory, 3000))
+
+def compute_anim_decode_size(orig_w, orig_h, fit_to_window, box_w, box_h, zoom_factor):
+    """Pure-arithmetic twin of the size the live path decodes an animation
+    at (show_current_image's scaled_size, then ImageViewer._anim_decode_
+    size), parameterized by an arbitrary native size instead of always
+    reading self.current_movie_original_size -- so ImageViewer.
+    _preload_neighbor_animations can work out the size a *neighbor* file
+    would use (its native size can differ from the file on screen) without
+    constructing a QMovie for it, and without touching any Qt object from
+    a worker thread: box_w/box_h (already dpr-scaled, taken from the same
+    QSize * dpr the live path uses) and zoom_factor are plain numbers read
+    on the GUI thread and handed in, and this function does no Qt calls.
+
+    The result has to match the live path to the pixel, not just roughly:
+    a preloaded frame that is even one pixel off the on-screen target is
+    silently re-scaled (smooth, per frame) every time it is shown by
+    _show_animated_pixmap. So fit_to_window uses QSize.scaled(box,
+    Qt.KeepAspectRatio)'s own integer arithmetic (not a float scale that
+    can land a pixel away), and not fit_to_window scales by zoom_factor
+    exactly as the live path does. Either way the result is capped at the
+    native size when it would exceed it, like _anim_decode_size.
+    Returns (w, h)."""
+    if orig_w <= 0 or orig_h <= 0:
+        return orig_w, orig_h
+    if fit_to_window and box_w and box_h:
+        rw = box_h * orig_w // orig_h
+        if rw <= box_w:
+            tw, th = rw, box_h
+        else:
+            tw, th = box_w, box_w * orig_h // orig_w
+    else:
+        tw, th = int(orig_w * zoom_factor), int(orig_h * zoom_factor)
+    if tw <= 0 or th <= 0:
+        return orig_w, orig_h
+    if tw <= orig_w and th <= orig_h:
+        return tw, th
+    return orig_w, orig_h
+
+# SetThreadPriority's dedicated "background processing mode" (Vista+):
+# lowers the calling thread's CPU scheduling priority *and* its I/O and
+# memory priority together, and can only target the calling thread itself.
+_THREAD_MODE_BACKGROUND_BEGIN = 0x00010000
+
+def _lower_current_thread_to_background_priority():
+    """Drop the CALLING thread's OS-level priority for the rest of its
+    life. Used by ImageLoader._anim_preload_executor's worker (see
+    _submit_anim_preload): that pool has exactly one persistent thread
+    (_ANIM_PRELOAD_WORKER_COUNT=1), doing sustained, back-to-back decode +
+    resize + color-adjust work across hundreds of frames per neighbor --
+    heavy enough, even confined to its own thread pool, that plain OS
+    scheduling could still let it compete with the GUI thread for CPU
+    right when the GUI thread's own frame timer needs it, which is what
+    caused the playback stutter this preload feature introduced. Lowering
+    this thread's priority (once, permanently -- there's no foreground
+    work this specific thread ever needs to do) asks Windows to prefer the
+    GUI thread whenever both want the CPU at once.
+
+    Safe to call on every task this thread ever runs: once it has entered
+    background mode, the call just fails harmlessly on every later call
+    (nothing to undo it, since this thread never does anything else)."""
+    try:
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), _THREAD_MODE_BACKGROUND_BEGIN)
+    except Exception:
+        pass
+
+def decode_webp_animation_frames(source, frame_count, target_w, target_h,
+                                  saturation, brightness, contrast, is_cancelled):
+    """_decode_webp_animation_frames_pillow 와 같은 결과를 내는데, 먼저 더 빠른 경로를 시도한다:
+    webp 를 프레임 단위로 잘라서 (전체 캔버스를 덮는 알파 없는 프레임은 cv2 로 한 번에,
+    나머지는 키프레임 구간 단위로 Pillow 로) 푼다 -- 첫 루프 병렬 디코딩 (FirstLoopJob) 이 쓰는
+    것과 같은 작업 계획이고, 여기서는 이 스레드 하나에서 순서대로 푼다. 구조를 못 읽거나 도중에
+    실패하면 예전 Pillow 순차 디코딩으로 처음부터 다시 한다. 취소되면 None."""
+    try:
+        plan = _WebpDecodePlan.build(source, frame_count, target_w, target_h,
+                                     saturation, brightness, contrast)
+        if plan is not None:
+            frames = [None] * frame_count
+
+            def emit(idx, raw, w, h, opaque):
+                frames[idx] = (raw, w, h)
+
+            for item in plan.items:
+                if is_cancelled():
+                    return None
+                plan.decode_item(item, emit, is_cancelled)
+            if all(f is not None for f in frames):
+                return frames
+    except _DecodeCancelled:
+        return None
+    except Exception:
+        pass
+    if is_cancelled():
+        return None
+    return _decode_webp_animation_frames_pillow(source, frame_count, target_w, target_h,
+                                                saturation, brightness, contrast, is_cancelled)
+
+
+def _decode_webp_animation_frames_pillow(source, frame_count, target_w, target_h,
+                                         saturation, brightness, contrast, is_cancelled):
+    """Fully decode+scale+color-adjust every frame of an animated image via
+    Pillow, entirely off the GUI thread -- no QMovie/QImage/QPixmap here
+    (Qt requires pixmap creation on the GUI thread; see
+    ImageViewer._anim_admit_step_impl for where this raw result
+    becomes QPixmaps). Used to pre-decode an eligible neighbor's whole
+    loop in the background (ImageViewer._preload_neighbor_animations)
+    using the same resize-then-color-adjust order and math as the live
+    per-frame path (_process_animated_frame_fast / apply_color_
+    adjustments: native decode, resize to (target_w, target_h) -- mirrors
+    QMovie's own setScaledSize() decode -- then color-adjust at that
+    size), so a preloaded frame matches one decoded live.
+
+    is_cancelled is polled between frames; once it returns True this stops
+    and returns None -- used when a neighbor falls out of the preload
+    range before its decode finishes (see _preload_neighbor_animations).
+
+    Returns a list of (raw_rgba_bytes, w, h) tuples, one per frame in
+    order, or None on any failure or cancellation. All-or-nothing: a
+    partial loop is no use to ImageViewer._take_retained_anim_cache, which
+    requires every frame present."""
+    try:
+        Image = get_pil_image()
+        frames = []
+        with Image.open(source) as im:
+            for i in range(frame_count):
+                if is_cancelled():
+                    return None
+                im.seek(i)
+                frame = im.convert('RGBA')
+                if frame.size != (target_w, target_h):
+                    frame = frame.resize((target_w, target_h), Image.BILINEAR)
+                w, h = frame.size
+                raw = frame.tobytes('raw', 'RGBA')
+                if saturation == 100 and brightness == 100 and contrast == 100:
+                    frames.append((raw, w, h))
+                    continue
+                result = _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, None, None)
+                if result is not None:
+                    frames.append(result)
+                    continue
+                # Pillow fallback -- mirrors _submit_animated_frame_processing's
+                # own fallback for when cv2 isn't installed.
+                alpha = frame.getchannel('A')
+                rgb = frame.convert('RGB')
+                rgb = apply_color_adjustments(rgb, saturation, brightness, contrast)
+                out = rgb.convert('RGBA')
+                out.putalpha(alpha)
+                frames.append((out.tobytes('raw', 'RGBA'), rgb.width, rgb.height))
+        if len(frames) != frame_count:
+            return None
+        return frames
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# 고해상도 애니메이션 webp: 첫 루프를 작업 스레드 여러 개로 미리 디코딩
+# ---------------------------------------------------------------------------
+# 예전에는 첫 루프를 QMovie 가 GUI 스레드에서 프레임 하나씩 디코딩했다. 프레임
+# 하나를 푸는 시간이 프레임 간격보다 길면 그만큼 느려지고 (3600x2688 / 186프레임
+# 파일: 프레임당 약 124ms 대 간격 33ms) UI 도 같이 멈칫거린다. 캐시 재생 덕분에
+# 2번째 루프부터는 빠르지만, 첫 루프는 어떤 식으로든 모든 프레임을 한 번은 풀어야
+# 한다.
+#
+# 그래서 이런 파일은 QMovie 를 시작하지 않고, 작업 스레드 여러 개가 루프 전체를
+# 풀어서 animated_frame_cache 를 채운다 (ImageViewer._start_first_loop_decode).
+# 재생은 기존 캐시 재생 (_anim_cache_tick) 이 맡고, 디코딩이 재생을 따라잡을 수
+# 있다고 판단되는 시점 (first_loop_can_start) 부터 시작한다.
+#
+# 속도를 내는 방법은 두 가지다.
+#  1) 병렬: 앞 프레임 없이 혼자 디코딩되는 프레임 (libwebp 의 "키프레임") 은
+#     서로 독립이라 여러 스레드가 나눠 풀 수 있다. 덜 독립적인 프레임은 키프레임
+#     에서 시작하는 구간 단위로 순서대로 푼다.
+#  2) 프레임 하나의 비용 줄이기: 전체 캔버스를 덮는 알파 없는 프레임은 단독 webp
+#     파일로 잘라서 cv2.imdecode 로 한 번에 풀고 cv2.resize (INTER_AREA) 로 줄인다.
+#     Pillow 의 애니메이션 디코더는 프레임마다 캔버스 전체 복사를 여러 번 하고 (3600x2688
+#     에서 프레임당 약 120ms) 리사이즈도 훨씬 느리다. 네이티브 크기 결과는 Pillow 와
+#     픽셀 단위로 같다.
+#
+# 구조가 맞지 않거나 (webp 가 아님, 프레임 수 불일치 ...) 어떤 단계든 실패하면
+# 기존 QMovie 재생으로 그대로 되돌아간다.
+
+# 원본 프레임의 픽셀 수가 이보다 작으면 (QMovie 로도 충분히 빠르므로) 예전 방식 그대로.
+ANIMATED_FIRST_LOOP_MIN_PIXELS = 1500000
+ANIMATED_FIRST_LOOP_MIN_FRAMES = 8
+# 재생이 따라잡을 수 있을 때까지 기다리는 최대 시간(초). 넘으면 덜 채워졌어도 재생을
+# 시작하고, 그때부터는 아직 안 풀린 프레임을 만날 때마다 그 프레임이 나올 때까지 기다린다.
+ANIMATED_FIRST_LOOP_MAX_PREBUFFER = 3.0
+
+# GUI 스레드와 OS 용으로 코어 2개는 남겨 둔다.
+_FIRST_LOOP_WORKER_COUNT = max(2, min(8, (os.cpu_count() or 4) - 2))
+
+
+class _DecodeCancelled(Exception):
+    pass
+
+
+def _set_current_thread_below_normal_priority():
+    """작업 스레드가 GUI 스레드보다 먼저 CPU 를 가져가지 않도록
+    THREAD_PRIORITY_BELOW_NORMAL 로 낮춘다 (호출한 스레드에만 적용)."""
+    try:
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), -1)
+    except Exception:
+        pass
+
+
+def _webp_frame_has_alpha(data, pos, end):
+    """ANMF 안쪽 이미지 청크에 알파가 있는지 (libwebp 의 has_alpha 와 같은 기준)."""
+    alpha = False
+    while pos + 8 <= end:
+        tag = data[pos:pos + 4]
+        size = int.from_bytes(data[pos + 4:pos + 8], 'little')
+        if tag == b'ALPH':
+            alpha = True
+        elif tag == b'VP8L' and pos + 13 <= len(data) and data[pos + 8] == 0x2F:
+            if (int.from_bytes(data[pos + 9:pos + 13], 'little') >> 28) & 1:
+                alpha = True
+        pos += 8 + size + (size & 1)
+    return alpha
+
+
+def parse_animated_webp(data):
+    """애니메이션 webp 의 RIFF 컨테이너에서 프레임 표를 만든다 (픽셀 디코딩 없음).
+
+    반환: {'vp8x': 바이트, 'anim': 바이트, 'canvas': (w, h), 'frames': [...]}
+    프레임 항목은 start/length (ANMF 청크 전체), inner (안쪽 이미지 청크 범위), w/h/x/y,
+    dur, no_blend, dispose_bg, alpha. 구조가 이상하면 None."""
+    try:
+        if len(data) < 30 or data[:4] != b'RIFF' or data[8:12] != b'WEBP':
+            return None
+        end = min(len(data), 8 + int.from_bytes(data[4:8], 'little'))
+        pos = 12
+        vp8x = anim = canvas = None
+        frames = []
+        while pos + 8 <= end:
+            tag = data[pos:pos + 4]
+            size = int.from_bytes(data[pos + 4:pos + 8], 'little')
+            total = 8 + size + (size & 1)
+            if pos + 8 + size > end:
+                return None
+            if tag == b'VP8X':
+                if size < 10:
+                    return None
+                vp8x = data[pos:pos + total]
+                canvas = (int.from_bytes(data[pos + 12:pos + 15], 'little') + 1,
+                          int.from_bytes(data[pos + 15:pos + 18], 'little') + 1)
+            elif tag == b'ANIM':
+                anim = data[pos:pos + total]
+            elif tag == b'ANMF':
+                if size < 16 + 8:
+                    return None
+                b = pos + 8
+                flags = data[b + 15]
+                frames.append({
+                    'start': pos, 'length': total, 'inner': (b + 16, pos + 8 + size),
+                    'x': 2 * int.from_bytes(data[b:b + 3], 'little'),
+                    'y': 2 * int.from_bytes(data[b + 3:b + 6], 'little'),
+                    'w': int.from_bytes(data[b + 6:b + 9], 'little') + 1,
+                    'h': int.from_bytes(data[b + 9:b + 12], 'little') + 1,
+                    'dur': int.from_bytes(data[b + 12:b + 15], 'little'),
+                    'dispose_bg': bool(flags & 1),
+                    'no_blend': bool(flags & 2),
+                    'alpha': _webp_frame_has_alpha(data, b + 16, pos + 8 + size),
+                })
+            pos += total
+        if not (vp8x and anim and canvas and frames):
+            return None
+        return {'vp8x': vp8x, 'anim': anim, 'canvas': canvas, 'frames': frames}
+    except Exception:
+        return None
+
+
+def _webp_keyframe_flags(frames, cw, ch):
+    """libwebp anim_decode.c 의 IsKeyFrame 과 같은 판정. 키프레임은 앞 프레임의
+    내용과 상관없이 (캔버스를 투명하게 비운 채로) 혼자 디코딩되는 프레임이다."""
+    keys = []
+    prev_key = False
+    for i, f in enumerate(frames):
+        full = f['w'] == cw and f['h'] == ch
+        if i == 0:
+            k = True
+        elif (not f['alpha'] or f['no_blend']) and full:
+            k = True
+        else:
+            p = frames[i - 1]
+            p_full = p['w'] == cw and p['h'] == ch
+            k = p['dispose_bg'] and (p_full or prev_key)
+        keys.append(bool(k))
+        prev_key = k
+    return keys
+
+
+def _plan_webp_decode(frames, cw, ch):
+    """작업 목록 [(시작, 끝, 방식)] 을 프레임 순서대로 만든다. 구간은 키프레임에서만
+    끊으므로 서로 독립이다.
+    'still': 전체 캔버스를 덮는 알파 없는 키프레임 하나 -> 단독 webp 로 잘라 cv2 로 푼다.
+    'anim' : 그 밖의 구간 -> 구간만 담은 작은 webp 를 만들어 Pillow 로 순서대로 푼다."""
+    keys = _webp_keyframe_flags(frames, cw, ch)
+    n = len(frames)
+    items = []
+    s = 0
+    for i in range(1, n + 1):
+        if i == n or keys[i]:
+            f = frames[s]
+            standalone = (i - s == 1 and f['w'] == cw and f['h'] == ch
+                          and f['x'] == 0 and f['y'] == 0 and not f['alpha'])
+            items.append((s, i, 'still' if standalone else 'anim'))
+            s = i
+    return items
+
+
+def _build_webp_still(data, frame, cw, ch):
+    """ANMF 프레임 하나의 이미지 데이터를 단독 webp 파일 바이트로 만든다."""
+    a, b = frame['inner']
+    flags = 0x10 if frame['alpha'] else 0
+    vp8x = (b'VP8X' + struct.pack('<I', 10) + bytes((flags, 0, 0, 0))
+            + (cw - 1).to_bytes(3, 'little') + (ch - 1).to_bytes(3, 'little'))
+    body = b'WEBP' + vp8x + data[a:b]
+    return b'RIFF' + struct.pack('<I', len(body)) + body
+
+
+def _build_webp_segment(data, vp8x, anim, frames, s, e):
+    """frames[s:e] 만 담은 독립적인 애니메이션 webp 바이트."""
+    body = b'WEBP' + vp8x + anim + b''.join(
+        data[f['start']:f['start'] + f['length']] for f in frames[s:e])
+    return b'RIFF' + struct.pack('<I', len(body)) + body
+
+
+def _apply_anim_adjustments_raw(raw, w, h, saturation, brightness, contrast):
+    """decode_webp_animation_frames 와 같은 색 보정 (cv2, 없으면 Pillow)."""
+    if saturation == 100 and brightness == 100 and contrast == 100:
+        return raw, w, h
+    result = _process_animated_frame_fast(raw, w, h, saturation, brightness, contrast, None, None)
+    if result is not None:
+        return result
+    Image = get_pil_image()
+    frame = Image.frombytes('RGBA', (w, h), raw)
+    alpha = frame.getchannel('A')
+    rgb = apply_color_adjustments(frame.convert('RGB'), saturation, brightness, contrast)
+    out = rgb.convert('RGBA')
+    out.putalpha(alpha)
+    return out.tobytes('raw', 'RGBA'), rgb.width, rgb.height
+
+
+class _WebpDecodePlan:
+    """한 webp 파일을 어떻게 나눠서 풀지 (items) 와, 작업 하나를 푸는 방법 (decode_item).
+    decode_item 은 여러 스레드에서 동시에 불러도 된다."""
+
+    def __init__(self, data, info, items, target_w, target_h, saturation, brightness, contrast):
+        self.data = data
+        self.vp8x = info['vp8x']
+        self.anim = info['anim']
+        self.cw, self.ch = info['canvas']
+        self.frames = info['frames']
+        self.items = items
+        self.target_w = target_w
+        self.target_h = target_h
+        self.saturation = saturation
+        self.brightness = brightness
+        self.contrast = contrast
+        self.cv2_ok = True
+
+    @staticmethod
+    def build(source, frame_count, target_w, target_h, saturation, brightness, contrast):
+        """source: 바이트(zip 항목) 또는 파일 경로. 지원하지 않는 구조면 None."""
+        if isinstance(source, (bytes, bytearray)):
+            data = bytes(source)
+        elif isinstance(source, BytesIO):
+            data = source.getvalue()
+        else:
+            with open(source, 'rb') as fp:
+                data = fp.read()
+        info = parse_animated_webp(data)
+        if not info or len(info['frames']) != frame_count:
+            return None
+        cw, ch = info['canvas']
+        items = _plan_webp_decode(info['frames'], cw, ch)
+        return _WebpDecodePlan(data, info, items, target_w, target_h, saturation, brightness, contrast)
+
+    def _decode_still(self, index):
+        cv2 = get_cv2()
+        np = get_numpy()
+        still = _build_webp_still(self.data, self.frames[index], self.cw, self.ch)
+        arr = cv2.imdecode(np.frombuffer(still, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if arr is None or arr.ndim != 3 or arr.dtype != np.uint8:
+            raise ValueError('cv2 webp 디코딩 실패')
+        h, w = arr.shape[:2]
+        if (w, h) != (self.target_w, self.target_h):
+            shrink = self.target_w < w or self.target_h < h
+            arr = cv2.resize(arr, (self.target_w, self.target_h),
+                             interpolation=cv2.INTER_AREA if shrink else cv2.INTER_LINEAR)
+        channels = arr.shape[2]
+        if channels == 3:
+            code = cv2.COLOR_BGR2RGBA
+        elif channels == 4:
+            code = cv2.COLOR_BGRA2RGBA
+        else:
+            raise ValueError('예상하지 못한 채널 수')
+        return cv2.cvtColor(arr, code).tobytes(), self.target_w, self.target_h
+
+    def _decode_segment_pillow(self, s, e, emit, is_cancelled):
+        Image = get_pil_image()
+        mini = _build_webp_segment(self.data, self.vp8x, self.anim, self.frames, s, e)
+        with Image.open(BytesIO(mini)) as im:
+            for k in range(e - s):
+                if is_cancelled():
+                    raise _DecodeCancelled()
+                im.seek(k)
+                frame = im.convert('RGBA')
+                if frame.size != (self.target_w, self.target_h):
+                    frame = frame.resize((self.target_w, self.target_h), Image.BILINEAR)
+                w, h = frame.size
+                raw = frame.tobytes('raw', 'RGBA')
+                raw, w, h = _apply_anim_adjustments_raw(
+                    raw, w, h, self.saturation, self.brightness, self.contrast)
+                emit(s + k, raw, w, h, False)
+
+    def decode_item(self, item, emit, is_cancelled):
+        """작업 하나를 풀어서 프레임마다 emit(index, raw_rgba, w, h, opaque) 을 부른다.
+        opaque 는 알파가 전부 255 임이 확실할 때만 True."""
+        s, e, mode = item
+        if mode == 'still' and self.cv2_ok:
+            decoded = None
+            try:
+                decoded = self._decode_still(s)
+            except ImportError:
+                self.cv2_ok = False
+            except Exception:
+                decoded = None
+            if decoded is not None:
+                raw, w, h = _apply_anim_adjustments_raw(
+                    decoded[0], decoded[1], decoded[2],
+                    self.saturation, self.brightness, self.contrast)
+                emit(s, raw, w, h, True)
+                return
+        self._decode_segment_pillow(s, e, emit, is_cancelled)
+
+
+def first_loop_can_start(total, decoded, elapsed, cum_s, workers, safety=1.25, margin=0.08):
+    """지금 재생을 시작해도 남은 프레임이 제때 나오는지 (= 끊김 없이 첫 루프를 재생할
+    수 있는지) 지금까지의 디코딩 속도로 어림한다.
+
+    total: 전체 프레임 수, decoded: 지금까지 디코딩이 끝난 프레임 수, elapsed: 디코딩을
+    시작한 뒤 지난 시간(초), cum_s[i]: 지금 재생을 시작하면 i 번째 프레임이 필요해지는
+    시각(초) = 앞 프레임들의 길이 합."""
+    if decoded >= total:
+        return True
+    # 속도를 믿을 만큼 측정되기 전에는 판단하지 않는다.
+    if elapsed < 0.3 or decoded < min(total, max(2, workers)):
+        return False
+    rate = decoded / elapsed
+    for i in range(decoded, total):
+        if (i + 1 - decoded) / rate * safety + margin > cum_s[i]:
+            return False
+    return True
+
+
+class FirstLoopJob:
+    """애니메이션 하나의 루프 전체를 작업 스레드 여러 개로 푸는 작업 (GUI 스레드 밖).
+    결과 프레임은 results 큐로 나오고, ImageViewer._first_loop_pump 가 GUI 스레드에서
+    QPixmap 으로 바꿔 animated_frame_cache 에 넣는다."""
+
+    def __init__(self, generation, source, frame_count, target_w, target_h,
+                 saturation, brightness, contrast, delays_ms):
+        self.generation = generation
+        self.source = source
+        self.frame_count = frame_count
+        self.target_w = target_w
+        self.target_h = target_h
+        self.saturation = saturation
+        self.brightness = brightness
+        self.contrast = contrast
+        self.settings_sig = (saturation, brightness, contrast)
+        self.cum_s = []
+        t = 0.0
+        for d in delays_ms:
+            self.cum_s.append(t)
+            t += d / 1000.0
+        self.results = queue.SimpleQueue()
+        self.plan = None
+        self.cancelled = False
+        self.error = None
+        self.t0 = time.perf_counter()
+        # 앞에서부터 연속으로 QPixmap 변환까지 끝난 프레임 수. 작업 스레드가 읽어서,
+        # GUI 스레드가 변환을 못 따라갈 때 원본 바이트가 메모리에 끝없이 쌓이지 않게 한다.
+        self.prefix = 0
+        self.window = max(_FIRST_LOOP_WORKER_COUNT * 3, 12)
+        self.decoded = 0
+        self.converted = 0
+        self._converted_idx = set()
+        self.first_shown = False
+        self.playing = False
+        self._lock = threading.Lock()
+
+    def start(self, executor):
+        executor.submit(self._prepare_and_submit, executor)
+
+    def cancel(self):
+        self.cancelled = True
+
+    def release(self):
+        """끝났거나 취소된 뒤 메모리 (파일 바이트, 큐에 남은 프레임) 를 돌려준다."""
+        self.plan = None
+        self.source = None
+        while True:
+            try:
+                self.results.get_nowait()
+            except queue.Empty:
+                break
+
+    def mark_converted(self, idx):
+        self.converted += 1
+        self._converted_idx.add(idx)
+        while self.prefix in self._converted_idx:
+            self._converted_idx.discard(self.prefix)
+            self.prefix += 1
+
+    def _prepare_and_submit(self, executor):
+        try:
+            if self.cancelled:
+                return
+            _set_current_thread_below_normal_priority()
+            plan = _WebpDecodePlan.build(self.source, self.frame_count, self.target_w, self.target_h,
+                                         self.saturation, self.brightness, self.contrast)
+            if plan is None:
+                self.error = 'webp 프레임 구조를 읽지 못했거나 프레임 수가 맞지 않음'
+                return
+            self.plan = plan
+            for item in plan.items:
+                if self.cancelled:
+                    return
+                executor.submit(self._run_item, item)
+        except Exception as e:
+            if self.error is None:
+                self.error = f'{type(e).__name__}: {e}'
+
+    def _run_item(self, item):
+        plan = self.plan
+        if plan is None or self.cancelled or self.error:
+            return
+        _set_current_thread_below_normal_priority()
+
+        def emit(idx, raw, w, h, opaque):
+            while not self.cancelled and idx - self.prefix >= self.window:
+                time.sleep(0.004)
+            if self.cancelled:
+                raise _DecodeCancelled()
+            with self._lock:
+                self.decoded += 1
+            self.results.put((idx, raw, w, h, opaque))
+
+        try:
+            plan.decode_item(item, emit, lambda: self.cancelled)
+        except _DecodeCancelled:
+            return
+        except Exception as e:
+            if self.error is None:
+                self.error = f'{type(e).__name__}: {e}'
+
+# ---------------------------------------------------------------------------
+# --noconsole 로 빌드한 exe 용 로그 파일
+# '실제 크기 / 창 크기' 토글을 이 시간(초) 안에 또 받으면 같은 입력의 중복으로 보고 무시한다.
+# 무시된 시도도 "마지막 시도"로 쳐서, 이어지는 입력 (틸트 휠을 한 번 기울였을 때 여러 개로 오는 이벤트,
+# 키 반복) 은 처음 하나만 동작한다. 정말 따로 누른 입력은 이 간격보다 길게 떨어져 있다.
+TOGGLE_ACTUAL_SIZE_MIN_INTERVAL_S = 0.30
+
 
 class SingleApplication:
     def __init__(self, app_name="PekoviewerApp"):
@@ -1422,11 +2147,29 @@ class Settings:
             self.data = self.default_settings()
     
     def save(self):
+        # Written to a side file and swapped in, so a crash or power loss in
+        # the middle of a write can't leave a half-written settings file:
+        # load() falls back to the defaults for an unreadable file, and the
+        # next save would then overwrite the user's real settings with them.
+        tmp = self.settings_file + '.tmp'
         try:
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+        except Exception:
+            return
+        try:
+            os.replace(tmp, self.settings_file)
+        except OSError:
+            # e.g. the target is briefly locked: overwrite it in place instead.
+            try:
+                with open(self.settings_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     
     def default_settings(self):
         return {
@@ -1497,12 +2240,6 @@ class Settings:
             return value[:2]
         return ['', '']
     
-    def set_shortcuts(self, action, shortcuts_list):
-        if 'shortcuts' not in self.data:
-            self.data['shortcuts'] = {}
-        self.data['shortcuts'][action] = shortcuts_list
-        self.save()
-
 # PIL releases the GIL during its C-level decode/enhance work, so these
 # worker threads genuinely run in parallel on multi-core machines. The old
 # cap of 4 could bottleneck once the current image plus several preloaded
@@ -1521,6 +2258,18 @@ _DECODE_WORKER_COUNT = max(2, min(8, (os.cpu_count() or 4)))
 # more workers than that wouldn't speed up a single animation, they'd just
 # take workers away from the shared pool.
 _ANIM_WORKER_COUNT = max(1, min(4, (os.cpu_count() or 4) // 2))
+
+# For _preload_neighbor_animations: fully decoding a whole animated-webp
+# loop ahead of time (hundreds of frames) is heavy, sustained CPU work --
+# very different from the one-frame-at-a-time jobs _anim_executor above is
+# sized for. Its own pool, capped at 1, so it can never take a worker away
+# from either that pool (which the currently-*playing* animation depends
+# on for smooth playback) or the static-image pool above (which the
+# image actually on screen depends on). One slot is enough: only the
+# nearest not-yet-cached eligible neighbor is ever being prepared at a
+# time (see ImageViewer._preload_neighbor_animations), the rest wait their
+# turn as navigation continues or a slot frees up.
+_ANIM_PRELOAD_WORKER_COUNT = 1
 
 class ImageLoader:
     _shutdown = False
@@ -1551,6 +2300,10 @@ class ImageLoader:
                           '.avif', '.avifs'}
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=_DECODE_WORKER_COUNT)
     _anim_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_WORKER_COUNT)
+    _anim_preload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_PRELOAD_WORKER_COUNT)
+    # 고해상도 애니메이션 webp 의 첫 루프 병렬 디코딩 전용 (FirstLoopJob). 재생 중인
+    # 애니메이션 하나를 위한 일이라 다른 풀과 섞지 않는다.
+    _first_loop_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_FIRST_LOOP_WORKER_COUNT)
 
     @staticmethod
     def is_supported(filename):
@@ -1583,8 +2336,14 @@ class ImageLoader:
             # correctly via setAutoTransform(True). Any failure at all
             # here (cv2 missing, decode error, unexpected channel count)
             # falls through the same way.
+            # cv2 is only used once the background import (request_cv2_warmup)
+            # has finished: importing it right here, on the first webp, would
+            # cost more than this path saves on one image, so until then
+            # images just go through the Qt reader below.
+            if _cv2_module is None and filepath.lower().endswith('.webp'):
+                request_cv2_warmup()
             if (saturation == 100 and brightness == 100 and contrast == 100
-                    and filepath.lower().endswith('.webp')):
+                    and filepath.lower().endswith('.webp') and _cv2_module is not None):
                 try:
                     Image = get_pil_image()
                     with Image.open(filepath) as probe:
@@ -1697,56 +2456,35 @@ class ImageLoader:
         return None
 
     @staticmethod
-    def load_pixmap(filepath, quality='balanced', saturation=100, brightness=100, contrast=100):
-        image = ImageLoader.load_image_data(filepath, saturation, brightness, contrast)
-        if image and not image.isNull():
-            return QPixmap.fromImage(image)
-        try:
-            pixmap = QPixmap(filepath)
-            return pixmap if not pixmap.isNull() else None
-        except Exception:
-            return None
-
-    @staticmethod
     def load_thumbnail(filepath, size=(150, 150)):
         image = ImageLoader.load_image_data(filepath, max_size=size)
         if image and not image.isNull():
             return QPixmap.fromImage(image)
         return None
 
-    @staticmethod
     @classmethod
     def shutdown_executor(cls):
         cls._shutdown = True
-        try:
-            cls._executor.shutdown(wait=True, cancel_futures=True)
-        except TypeError:
-            cls._executor.shutdown(wait=True)
-        except Exception:
-            pass
-        try:
-            cls._anim_executor.shutdown(wait=True, cancel_futures=True)
-        except TypeError:
-            cls._anim_executor.shutdown(wait=True)
-        except Exception:
-            pass
+        for name in ('_executor', '_anim_executor', '_anim_preload_executor', '_first_loop_executor'):
+            pool = getattr(cls, name)
+            # wait=False: queued jobs are dropped, a job that is already
+            # running finishes on its own -- closing the window must not
+            # block on a long decode.
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
 
     @classmethod
     def restart_executor(cls):
         if cls._shutdown:
             cls._executor = concurrent.futures.ThreadPoolExecutor(max_workers=_DECODE_WORKER_COUNT)
             cls._anim_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_WORKER_COUNT)
+            cls._anim_preload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_ANIM_PRELOAD_WORKER_COUNT)
+            cls._first_loop_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_FIRST_LOOP_WORKER_COUNT)
             cls._shutdown = False
-
-    @staticmethod
-    def load_movie(filepath):
-        try:
-            movie = QMovie(filepath)
-            if movie.isValid():
-                return movie
-        except Exception:
-            pass
-        return None
 
 
 class CacheManager:
@@ -1803,6 +2541,7 @@ class ZipHandler:
     @staticmethod
     def list_images(zip_path):
         images = []
+        import zipfile
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 for info in zf.infolist():
@@ -1810,9 +2549,7 @@ class ZipHandler:
                         images.append(info.filename)
         except Exception as e:
             print(f"ZIP 목록 로드 오류: {e}")
-        def natural_key(s):
-            return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
-        images.sort(key=natural_key)
+        images.sort(key=natural_sort_key)
         return images
 
     @staticmethod
@@ -1824,6 +2561,7 @@ class ZipHandler:
         key = os.path.abspath(zip_path)
         zf = handles.get(key)
         if zf is None or zf.fp is None:
+            import zipfile
             zf = zipfile.ZipFile(key, 'r')
             handles[key] = zf
         return zf
@@ -1837,8 +2575,10 @@ class ZipHandler:
 
             # See the matching comment in ImageLoader.load_image_data --
             # same WebP-only, no-adjustment-only, EXIF-safe cv2 fast path.
+            if _cv2_module is None and filename.lower().endswith('.webp'):
+                request_cv2_warmup()
             if (saturation == 100 and brightness == 100 and contrast == 100
-                    and filename.lower().endswith('.webp')):
+                    and filename.lower().endswith('.webp') and _cv2_module is not None):
                 try:
                     Image = get_pil_image()
                     with Image.open(BytesIO(data)) as probe:
@@ -1951,6 +2691,11 @@ class ImageLoadBridge(QObject):
     loaded = pyqtSignal(int, str, object, bool)
     animated_frame = pyqtSignal(int, int, object)
     hq_resample = pyqtSignal(int, object)
+    # (source_key, (filename, result_or_None)) -- see
+    # ImageViewer._submit_anim_preload/_on_anim_preload_ready. Deliberately
+    # not gated by current_movie_generation like animated_frame above: the
+    # whole point is to finish for a file that ISN'T the one on screen.
+    anim_preload_ready = pyqtSignal(object, object)
 
 class ThumbnailLoadBridge(QObject):
     loaded = pyqtSignal(int, object)
@@ -2447,7 +3192,7 @@ class SettingsDialog(QDialog):
     def init_ui(self):
         self.setWindowTitle('설정')
         self.setModal(True)
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(420)
         self.setStyleSheet("""
             QDialog { background-color: #2b2b2b; color: #ffffff; }
             QGroupBox { color: #ffffff; border: 1px solid #555; margin-top: 10px; }
@@ -2824,6 +3569,7 @@ class ImageViewer(QMainWindow):
         self.load_bridge.loaded.connect(self._on_background_loaded)
         self.load_bridge.animated_frame.connect(self._on_animated_frame_ready)
         self.load_bridge.hq_resample.connect(self._on_hq_resample_ready)
+        self.load_bridge.anim_preload_ready.connect(self._on_anim_preload_ready)
         self.load_generation = 0
         self.loading_keys = set()
         # Cache the expensive color-adjusted source separately from the
@@ -2831,9 +3577,6 @@ class ImageViewer(QMainWindow):
         self._adjusted_image_cache = {}
         self._adjusted_image_cache_order = []
         self._adjusted_image_cache_limit = 24
-        self._source_image_cache = {}
-        self._source_image_cache_order = []
-        self._source_image_cache_limit = 12
         self.load_retry_counts = {}
         self.preload_enabled = self.settings.get('preload_next', True)
         self.preload_count = max(0, min(10, int(self.settings.get('preload_count', 3))))
@@ -2893,6 +3636,65 @@ class ImageViewer(QMainWindow):
         # processing time already exceeds the animation's frame interval.
         self.anim_lookahead = 3
         self.animated_inflight_keys = set()
+        # Cached replay (see _try_start_anim_cache_playback): after the
+        # first loop, QMovie is paused and this timer shows the cached
+        # frames itself, using the per-frame durations in anim_frame_delays
+        # (read from the file by read_webp_animation_info; None when the
+        # current animation isn't eligible, e.g. a gif).
+        self.anim_frame_delays = None
+        self.anim_cache_playing = False
+        self.anim_cache_index = -1
+        self._anim_cache_deadline = 0.0
+        self.anim_cache_timer = QTimer(self)
+        self.anim_cache_timer.setSingleShot(True)
+        self.anim_cache_timer.setTimerType(Qt.PreciseTimer)
+        self.anim_cache_timer.timeout.connect(self._anim_cache_tick)
+        # 고해상도 애니메이션 webp 의 첫 루프 병렬 디코딩 (FirstLoopJob) 상태와, 그 결과를
+        # GUI 스레드에서 QPixmap 으로 바꿔 캐시에 넣는 타이머. _start_first_loop_decode 참고.
+        self._first_loop_job = None
+        self._first_loop_last_restart = 0.0
+        # See toggle_actual_size: when the last toggle attempt happened (our own clock, and the
+        # native input event's timestamp), and the timestamp of the input event being dispatched.
+        self._last_toggle_attempt = -1e9
+        self._last_toggle_attempt_ts = None
+        self._input_ts_ms = None
+        self._first_loop_timer = QTimer(self)
+        self._first_loop_timer.setTimerType(Qt.PreciseTimer)
+        self._first_loop_timer.timeout.connect(self._first_loop_pump)
+        # Finished frame caches kept from animations navigated away from
+        # (see _stash_animated_cache), least recently kept first, keyed by
+        # _animation_source_key. current_movie_source is that key for the
+        # animation on screen now.
+        self.retained_anim_caches = OrderedDict()
+        self.current_movie_source = None
+        # filename -> threading.Event, for neighbor animations currently
+        # being pre-decoded in the background (see
+        # _preload_neighbor_animations/_submit_anim_preload). Sized 1 in
+        # practice (_ANIM_PRELOAD_WORKER_COUNT), but keyed by name rather
+        # than assumed-singular so cancelling stale ones stays simple.
+        self.anim_preload_inflight = {}
+        # _animation_source_key(...) results confirmed NOT eligible for
+        # this feature (see worker()'s False returns below) -- skipped on
+        # sight instead of re-running the same container-metadata checks
+        # on every single navigation for as long as the file stays in
+        # range. Keyed by the same (path, size, mtime) identity as
+        # retained_anim_caches, so editing the file clears its entry
+        # naturally. Bounded like the app's other small caches.
+        self.anim_preload_ineligible = OrderedDict()
+        # Source keys of neighbors that finished decoding but were NOT kept
+        # (no room, or trimmed straight away). Skipped until the next
+        # navigation instead of being decoded all over again -- with
+        # nothing having changed, that would just repeat the same wasted
+        # work forever. Cleared by show_current_image.
+        self.anim_preload_declined = OrderedDict()
+        # retained_anim_caches' size the last time _preload_neighbor_
+        # animations_impl looked (see there): a file only gets a fresh
+        # look after being declined for lack of room once this actually
+        # DROPS, since that's the only thing that could free room for it.
+        self._anim_declined_pool_size = 0
+        # The finished decode currently being turned into pixmaps, a frame
+        # per timer tick (see _begin_anim_admission), or None.
+        self.anim_admit = None
         # Renders anim_saturation/anim_brightness/anim_contrast on the GPU
         # instead of the cv2/Pillow tiers below -- see GpuColorCorrector
         # and _render_animated_frame_gpu. One instance persists for the
@@ -2907,8 +3709,6 @@ class ImageViewer(QMainWindow):
         # being asked to decode at this size directly.
         self.current_movie_target_size = None
         self.current_pixmap = None
-        self.original_pixmap = None
-        self.is_loading = False
         self._default_broken_pixmap_cache = None
         self.dragging = False
         self.drag_start_pos = None
@@ -2946,19 +3746,17 @@ class ImageViewer(QMainWindow):
         self.slideshow.setInterval(self.settings.get('slideshow_interval', 3) * 1000)
     
     def setup_icon(self):
-        icon_path = get_icon_path()
-        if icon_path:
-            icon = QIcon(icon_path)
+        if get_icon_path():
+            icon = get_app_icon()
             self.setWindowIcon(icon)
             app = QApplication.instance()
             if app:
                 app.setWindowIcon(icon)
-    
+
     def showEvent(self, event):
         super().showEvent(event)
-        icon_path = get_icon_path()
-        if icon_path:
-            icon = QIcon(icon_path)
+        if get_icon_path():
+            icon = get_app_icon()
             self.setWindowIcon(icon)
             if self.windowHandle():
                 self.windowHandle().setIcon(icon)
@@ -3142,6 +3940,13 @@ class ImageViewer(QMainWindow):
                 return
         
         key_sequence = QKeySequence(event.modifiers() | event.key()).toString()
+        if not key_sequence:
+            # A key Qt has no name for gives an empty string, and every
+            # unassigned shortcut slot is an empty string too -- so such a key
+            # used to "match" whichever action came first with a free slot
+            # (even close_program, which is checked first).
+            event.accept()
+            return
         close_shortcuts = self.settings.get_shortcuts('close_program')
         if key_sequence in close_shortcuts:
             QTimer.singleShot(150, self.close)
@@ -3159,7 +3964,21 @@ class ImageViewer(QMainWindow):
         for action_name, callback in shortcut_actions.items():
             shortcuts = self.settings.get_shortcuts(action_name)
             if key_sequence in shortcuts:
-                callback()
+                if action_name in ('toggle_actual_size', 'toggle_fullscreen'):
+                    # Holding the key makes the OS repeat it; a toggle fired
+                    # again and again just flips back and forth.
+                    if event.isAutoRepeat():
+                        event.accept()
+                        return
+                    try:
+                        ts = event.timestamp()
+                    except Exception:
+                        ts = None
+                    self._input_ts_ms = ts
+                try:
+                    callback()
+                finally:
+                    self._input_ts_ms = None
                 event.accept()
                 return
         event.accept()
@@ -3212,17 +4031,18 @@ class ImageViewer(QMainWindow):
                 self.setGeometry(x, y, w, h)
     
     def save_settings(self):
+        values = {'zip_position_history': dict(self.zip_position_history)}
         if not self.isFullScreen():
             pos = self.pos()
             size = self.size()
-            geometry_data = {
+            values['window_geometry'] = {
                 'x': pos.x(),
                 'y': pos.y(),
                 'width': size.width(),
                 'height': size.height()
             }
-            self.settings.set('window_geometry', geometry_data)
-        self.settings.set('zip_position_history', dict(self.zip_position_history))
+        # One write of the settings file instead of one per key.
+        self.settings.update_many(values)
     
     def load_path(self, path):
         self.bring_to_front()
@@ -3234,49 +4054,44 @@ class ImageViewer(QMainWindow):
             else:
                 self.load_single_file(path)
     
-    def natural_sort_key(self, s):
-        return [int(text) if text.isdigit() else text.lower() 
-                for text in re.split(r'(\d+)', s)]
-    
     def load_directory(self, directory, auto_show=True):
         self.load_generation += 1
         self.cache_manager.clear()
         self.image_list = []
         self.current_zip = None
         try:
-            files = sorted(os.listdir(directory), key=self.natural_sort_key)
-            for filename in files:
-                if ImageLoader.is_supported(filename):
-                    self.image_list.append(os.path.join(directory, filename))
-        except:
-            pass
+            # Filter by extension first and sort only what is left: the
+            # regex-based natural key used to be computed for every file in
+            # the folder, images or not, which was the slowest part of
+            # opening one image out of a big folder.
+            names = [n for n in os.listdir(directory) if ImageLoader.is_supported(n)]
+            names.sort(key=natural_sort_key)
+            self.image_list = [os.path.join(directory, n) for n in names]
+        except Exception:
+            self.image_list = []
         if self.image_list:
             self.current_index = 0
             if auto_show:
                 self.show_current_image()
         else:
             self.image_label.clear()
-    
+
     def load_single_file(self, filepath):
-        directory = os.path.dirname(filepath)
-        # auto_show=False: without this, load_directory would decode and
-        # display index 0 (alphabetically first in the folder) only to
-        # immediately throw that away once the loop below finds this
-        # file's real index a few lines later -- wasted decode work that
-        # competed with this file's own request for a worker-pool slot.
-        # Confirmed as a real, not just theoretical, difference: load_zip
-        # below only ever calls show_current_image() once and doesn't
-        # have this problem; opening a single file from outside the app
-        # while it's already running did.
-        self.load_directory(directory, auto_show=False)
+        filepath = os.path.abspath(filepath)
+        # auto_show=False: otherwise load_directory would decode and display
+        # index 0 (alphabetically first in the folder) only to throw it away
+        # once this file's real index is found below.
+        self.load_directory(os.path.dirname(filepath), auto_show=False)
         try:
-            abs_path = os.path.abspath(filepath)
+            # Every entry lives in this same folder, so comparing the file
+            # names (case-insensitively, like the file system) is enough.
+            target = os.path.normcase(os.path.basename(filepath))
             for i, img_path in enumerate(self.image_list):
-                if os.path.abspath(img_path) == abs_path:
+                if os.path.normcase(os.path.basename(img_path)) == target:
                     self.current_index = i
                     break
             self.show_current_image()
-        except:
+        except Exception:
             pass
     
     def load_zip(self, zip_path):
@@ -3307,6 +4122,14 @@ class ImageViewer(QMainWindow):
             self.zip_position_history.popitem(last=False)
     
     def stop_current_movie(self):
+        # First, while everything about the animation being left is still in
+        # place: may move its finished frame cache into retained_anim_caches
+        # instead of having it cleared at the bottom.
+        kept_cache = self._stash_animated_cache()
+        self._cancel_first_loop_decode()
+        self._stop_anim_cache_playback()
+        self.anim_frame_delays = None
+        self.current_movie_source = None
         if self.current_movie:
             try:
                 self.current_movie.frameChanged.disconnect(self.on_gif_frame_changed)
@@ -3344,7 +4167,12 @@ class ImageViewer(QMainWindow):
         self.current_movie_generation += 1
         self.current_movie_frame = -1
         self.gif_last_frame = -1
-        self.animated_frame_cache.clear()
+        if kept_cache:
+            # The frames now belong to retained_anim_caches -- start a fresh
+            # dict rather than clear() the one that entry holds.
+            self.animated_frame_cache = OrderedDict()
+        else:
+            self.animated_frame_cache.clear()
     
     def _cache_key(self, filepath, saturation, brightness, contrast, max_size):
         size_key = 'full' if not max_size else f'{max_size[0]}x{max_size[1]}'
@@ -3373,29 +4201,6 @@ class ImageViewer(QMainWindow):
         # Small safety margin (also scaled) prevents repeated reloads
         # caused by tiny widget changes.
         return (max(64, int((size.width() + 64) * dpr)), max(64, int((size.height() + 64) * dpr)))
-
-    def _source_cache_get(self, key):
-        value = self._source_image_cache.get(key)
-        if value is not None:
-            try:
-                self._source_image_cache_order.remove(key)
-            except ValueError:
-                pass
-            self._source_image_cache_order.append(key)
-        return value
-
-    def _source_cache_put(self, key, image):
-        if image is None:
-            return
-        self._source_image_cache[key] = image
-        try:
-            self._source_image_cache_order.remove(key)
-        except ValueError:
-            pass
-        self._source_image_cache_order.append(key)
-        while len(self._source_image_cache_order) > self._source_image_cache_limit:
-            old = self._source_image_cache_order.pop(0)
-            self._source_image_cache.pop(old, None)
 
     def _adjusted_cache_key(self, filepath, saturation, brightness, contrast, max_size):
         source = f'{self.current_zip}|{filepath}' if self.current_zip else filepath
@@ -3463,17 +4268,7 @@ class ImageViewer(QMainWindow):
                 # let a big backlog visibly delay the image the user
                 # actually landed on.
                 self.loading_keys.discard(key)
-                print(f"[정적 이미지] stale 요청 건너뜀: {filename}")
                 return
-            source_fast_key = ((source_zip, filename), max_size)
-            if (saturation, brightness, contrast) == (100, 100, 100):
-                source_cached = self._source_cache_get(source_fast_key)
-                if source_cached is not None:
-                    self.load_bridge.loaded.emit(
-                        generation, key, source_cached, index == self.current_index
-                    )
-                    return
-
             adjustment_key = self._adjusted_cache_key(filename, saturation, brightness, contrast, max_size)
             # For non-default adjustments, reuse the expensive color-adjusted
             # source when available. The existing display cache still handles
@@ -3485,7 +4280,6 @@ class ImageViewer(QMainWindow):
                     self.load_bridge.loaded.emit(generation, key, image, index == self.current_index)
                     return
 
-            _t0 = time.perf_counter()
             if source_zip:
                 image = ZipHandler.load_image_data(source_zip, filename, saturation, brightness, contrast, max_size)
             else:
@@ -3495,7 +4289,6 @@ class ImageViewer(QMainWindow):
                         image = QImage(filename)
                     except Exception:
                         image = None
-            print(f"[정적 이미지] {'현재' if index == self.current_index else '프리로드'} {filename}: {(time.perf_counter() - _t0) * 1000:.1f}ms (max_size={max_size})")
 
             if image is not None and (saturation, brightness, contrast) != (100, 100, 100):
                 self._adjusted_cache_put(adjustment_key, image)
@@ -3540,7 +4333,6 @@ class ImageViewer(QMainWindow):
         # This fixes rapid navigation races where an older worker finishes late.
         if key == current_key:
             self._display_pixmap(pixmap)
-            self.is_loading = False
             self.slideshow_fail_streak = 0
 
     def _retry_or_fail_current_load(self, key):
@@ -3570,7 +4362,6 @@ class ImageViewer(QMainWindow):
         # replace the stale previous frame with an explicit "broken image"
         # placeholder rather than leaving old content on screen that looks
         # like it belongs to this file.
-        self.is_loading = False
         if self.slideshow_playing:
             self.slideshow_fail_streak += 1
             if self.slideshow_fail_streak > min(len(self.image_list), 200):
@@ -3588,60 +4379,19 @@ class ImageViewer(QMainWindow):
         # removed from Settings) -- the user's own illustration, embedded
         # as base64 (_BROKEN_IMAGE_B64 near the top of the file) so there's
         # no external image file a packaged build could end up missing.
-        # Falls back to a plain drawn placeholder if decoding ever fails
-        # (a corrupted constant, an unsupported Qt build, etc.) rather than
-        # showing nothing at all for a broken file.
+        # Falls back to a plain gray box if decoding ever fails.
         if self._default_broken_pixmap_cache is None:
+            import base64
             pixmap = QPixmap()
             try:
-                data = base64.b64decode(_BROKEN_IMAGE_B64)
-                if not pixmap.loadFromData(data, 'PNG') or pixmap.isNull():
-                    pixmap = None
+                ok = pixmap.loadFromData(base64.b64decode(_BROKEN_IMAGE_B64), 'PNG') and not pixmap.isNull()
             except Exception:
-                pixmap = None
-            if pixmap is None:
-                pixmap = self._draw_fallback_broken_pixmap()
+                ok = False
+            if not ok:
+                pixmap = QPixmap(400, 300)
+                pixmap.fill(QColor('#3c3c3c'))
             self._default_broken_pixmap_cache = pixmap
         return self._default_broken_pixmap_cache
-
-    def _draw_fallback_broken_pixmap(self):
-        # Only reached if decoding the embedded image above ever fails.
-        # Drawn entirely in code (no file of its own to go missing either)
-        # -- a simple picture-frame + mountain/sun glyph (the familiar
-        # "broken image" shape browsers use) with a crack through it to
-        # read as broken rather than just "a picture".
-        pixmap = QPixmap(400, 300)
-        pixmap.fill(QColor('#3c3c3c'))
-        painter = QPainter(pixmap)
-        try:
-            painter.setRenderHint(QPainter.Antialiasing)
-            frame = pixmap.rect().adjusted(130, 70, -130, -110)
-            painter.setPen(QPen(QColor('#888888'), 3))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(frame, 6, 6)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor('#888888'))
-            sun_d = 16
-            painter.drawEllipse(frame.right() - 28, frame.top() + 14, sun_d, sun_d)
-            mountains = QPolygon([
-                QPoint(frame.left() + 10, frame.bottom() - 10),
-                QPoint(frame.left() + 40, frame.bottom() - 45),
-                QPoint(frame.left() + 60, frame.bottom() - 25),
-                QPoint(frame.left() + 85, frame.bottom() - 55),
-                QPoint(frame.right() - 10, frame.bottom() - 10),
-            ])
-            painter.drawPolygon(mountains)
-            painter.setPen(QPen(QColor('#e06060'), 4))
-            painter.drawLine(frame.left() - 6, frame.top() - 6, frame.right() + 6, frame.bottom() + 6)
-            painter.setPen(QColor('#cccccc'))
-            font = painter.font()
-            font.setPointSize(13)
-            painter.setFont(font)
-            text_rect = pixmap.rect().adjusted(0, frame.bottom() + 20, 0, 0)
-            painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, '이미지를 불러올 수 없습니다')
-        finally:
-            painter.end()
-        return pixmap
 
     def _retry_current_load(self, key, generation):
         if generation != self.load_generation:
@@ -3662,8 +4412,6 @@ class ImageViewer(QMainWindow):
         if not pixmap or pixmap.isNull():
             return
         self.current_pixmap = pixmap
-        self.original_pixmap = pixmap
-        _t0 = time.perf_counter()
         self.update_image_display()
         # setPixmap() above only *schedules* a repaint for whenever Qt's
         # event loop next gets to it -- normally fine, but this can be
@@ -3676,7 +4424,6 @@ class ImageViewer(QMainWindow):
         # real repaint. repaint() forces it synchronously, right here,
         # regardless of which event loop this ends up being called from.
         self.image_label.repaint()
-        print(f"[정적 이미지] 화면 갱신(GUI 스레드): {(time.perf_counter() - _t0) * 1000:.1f}ms")
         if self.settings.get('show_filename', False):
             current_file = self.image_list[self.current_index]
             display_name = os.path.basename(current_file) if not self.current_zip else current_file
@@ -3719,12 +4466,6 @@ class ImageViewer(QMainWindow):
                 idx = self.current_index + (distance * direction)
                 if 0 <= idx < len(self.image_list):
                     self._submit_image_load(idx, generation)
-
-    def _set_display_pixmap(self, pixmap):
-        if pixmap is None or pixmap.isNull():
-            return False
-        self.image_label.setPixmap(pixmap)
-        return True
 
     def _load_animated_movie(self, current_file, ext):
         """Try to load current_file as a playable QMovie (an animated gif,
@@ -3860,6 +4601,7 @@ class ImageViewer(QMainWindow):
         if movie:
             self.current_movie = movie
             self.current_movie_buffer = movie_buffer
+            self.current_movie_source = self._animation_source_key(current_file)
             self.current_movie_generation += 1
             movie_generation = self.current_movie_generation
             self.current_movie_original_size = movie.currentPixmap().size()
@@ -3912,6 +4654,8 @@ class ImageViewer(QMainWindow):
             # so color processing (and the staleness that comes with it)
             # never actually settled down no matter how long you waited.
             frame_count = known_frame_count or movie.frameCount()
+            w = h = 0
+            restored = None
             if frame_count and frame_count > 0:
                 # Frames are now cached at their native/decode resolution
                 # (see _animated_cache_key/_show_animated_pixmap), which
@@ -3925,66 +4669,107 @@ class ImageViewer(QMainWindow):
                 w = decode_size.width() if decode_size else self.current_movie_original_size.width()
                 h = decode_size.height() if decode_size else self.current_movie_original_size.height()
                 if w > 0 and h > 0:
-                    bytes_per_frame = w * h * 4
-                    # Confirmed from real logs: a 385-frame animation
-                    # viewed zoomed in (~2081x2081 output, ~17.3MB/frame)
-                    # only got 124 frames of cache room at the previous
-                    # 2GB budget -- nowhere near the full loop, so most
-                    # loops still recomputed the majority of frames from
-                    # scratch. Doubled to 4GB, which comfortably covers
-                    # 385 frames at ordinary (non-zoomed) sizes and gets
-                    # meaningfully further at this zoomed size too (~237
-                    # frames), though a long animation watched zoomed in
-                    # for many loops can still exceed even this -- the
-                    # cache stores each frame at its current on-screen
-                    # (zoomed) size rather than a fixed native size, so
-                    # there's no budget that covers every zoom level for
-                    # an arbitrarily long loop. Caching at native
-                    # resolution and scaling for display separately (like
-                    # the static-image pipeline already does) would fix
-                    # that properly without needing more memory, but is a
-                    # bigger change than raising this number -- worth
-                    # doing if the "[애니메이션 캐시]" line below still
-                    # shows up often for real usage.
-                    budget = 4096 * 1024 * 1024  # ~4GB ceiling for this cache
-                    by_memory = max(1, budget // max(1, bytes_per_frame))
-                    self.animated_frame_cache_limit = max(24, min(frame_count, by_memory, 1000))
+                    # Budget = what's actually free on this machine (see
+                    # animated_cache_budget_bytes), not a fixed ceiling.
+                    # Cached replay needs the *whole* loop in this cache,
+                    # and w x h here depends on when this runs: opening the
+                    # file at launch happens before the window has been
+                    # laid out, so the scroll area is still at its tiny
+                    # default size, w x h comes out tiny, and any loop
+                    # "fits". Navigating to the same file (or double-
+                    # clicking it while the app is already running) uses
+                    # the real on-screen size instead, and a long high-res
+                    # loop then blew through the old fixed 4GB -- the cache
+                    # never held the whole loop, so replay never engaged.
+                    # (Earlier history: a 385-frame animation at
+                    # ~17.3MB/frame only got 124 frames at the original
+                    # 2GB budget.)
+                    need_bytes = frame_count * w * h * 4
+                    # A cache kept from the last time this animation was on
+                    # screen (see _stash_animated_cache) is taken back
+                    # first, before anything below can drop it to make room.
+                    restored = self._take_retained_anim_cache(self.current_movie_source, frame_count, w, h)
+                    # Free RAM is read once, before any retained cache is
+                    # dropped; what dropping gives back is added on top.
+                    avail = get_available_physical_memory()
+                    freed = 0
+                    if restored is None:
+                        freed = self._reclaim_retained_anim_caches(need_bytes, avail)
+                    budget = animated_cache_budget_bytes(avail, freed)
+                    self.animated_frame_cache_limit = animated_cache_frame_limit(frame_count, w, h, budget)
+                    if restored is not None:
+                        # Already resident, whatever the free RAM says now.
+                        self.animated_frame_cache_limit = max(self.animated_frame_cache_limit, frame_count)
                 else:
                     self.animated_frame_cache_limit = max(24, min(frame_count, 300))
             else:
                 self.animated_frame_cache_limit = 24
 
-            if frame_count and self.animated_frame_cache_limit < frame_count:
-                print(f"[애니메이션 캐시] 프레임 수({frame_count})가 캐시 한도({self.animated_frame_cache_limit})보다 많아 루프마다 일부 프레임이 다시 계산됩니다 (프레임 크기 {w}x{h})")
-
             self.prefetch_frame_count = frame_count if frame_count and frame_count > 0 else None
+
+            # Per-frame durations for cached replay (see
+            # _try_start_anim_cache_playback). Only for a webp that loops
+            # forever and whose ANMF chunk count matches Pillow's frame
+            # count -- anything else (gif, a finite loop count, an odd
+            # file) just keeps QMovie driving every loop as before.
+            self.anim_frame_delays = None
+            if restored is not None:
+                # Frames (and the durations they were timed by) kept from
+                # last time; the file is unchanged, see
+                # _animation_source_key.
+                self.animated_frame_cache = restored['frames']
+                self.anim_frame_delays = restored['delays']
+            elif self.prefetch_frame_count and ext == '.webp':
+                info = read_webp_animation_info(movie_source if movie_source is not None else current_file)
+                if info:
+                    durations, loop_count = info
+                    # Only an endlessly looping webp whose ANMF chunk count
+                    # matches the decoder's frame count can be replayed from
+                    # the cache. 10ms floor: a 0ms duration would otherwise
+                    # make the replay spin as fast as the GUI thread allows.
+                    if loop_count == 0 and len(durations) == self.prefetch_frame_count:
+                        self.anim_frame_delays = [max(10, d) for d in durations]
 
             # A new movie must reconnect slideshow loop counting.
             if self.slideshow_playing and self.slideshow_mode == 'loop':
                 self.connect_gif_loop()
             movie.frameChanged.connect(self.on_animated_frame_changed)
+            if restored is not None and self._start_retained_replay():
+                # The whole loop is already cached: play it from the first
+                # frame right now. QMovie stays unstarted unless replay has
+                # to hand back (see _leave_anim_cache_mode).
+                self._preload_neighbor_animations()
+                return
+            # 고해상도 애니메이션 webp: QMovie 가 GUI 스레드에서 프레임을 하나씩 푸는 대신
+            # 작업 스레드 여러 개가 루프 전체를 미리 푼다 (아래 _start_first_loop_decode 참고).
+            # QMovie 는 시작하지 않은 채로 두고, 이 방식이 중간에 실패하면 그때 시작한다.
+            if (restored is None and self._first_loop_eligible(ext, frame_count, w, h)
+                    and self._start_first_loop_decode(
+                        movie_source if movie_source is not None else current_file,
+                        frame_count, w, h, movie_generation)):
+                return
             movie.start()
             start_frame = movie.currentFrameNumber()
             self._render_animated_frame(start_frame, movie_generation)
             self._prefetch_ahead(start_frame)
-            self.is_loading = False
+            self._preload_neighbor_animations()
             return
 
         max_size = self._target_decode_size()
         key = self._cache_key(current_file, saturation, brightness, contrast, max_size)
         cached = self.cache_manager.get(key)
         if cached is not None:
-            self.is_loading = False
             self._display_pixmap(cached)
             self._preload_neighbors()
+            self._preload_neighbor_animations()
             return
 
-        self.is_loading = True
         # Keep the previous frame visible while the new image is decoding.
         # Clearing the label here caused the frequent black-screen effect during
         # rapid navigation. A successful decode will replace it atomically.
         self._submit_image_load(self.current_index, generation)
         self._preload_neighbors()
+        self._preload_neighbor_animations()
 
     def _animated_cache_key(self, frame_number):
         # Deliberately does NOT include zoom/window size (it used to:
@@ -4040,6 +4825,10 @@ class ImageViewer(QMainWindow):
             return
         self.current_movie_frame = frame_number
         self._render_animated_frame(frame_number, self.current_movie_generation)
+        # First loop done and every frame cached: stop decoding through
+        # QMovie and replay from the cache instead.
+        if self._try_start_anim_cache_playback(frame_number):
+            return
         # Keep the next couple of frames a step ahead of playback so their
         # color processing is already sitting in cache by the time the
         # movie actually reaches them, instead of starting cold each time.
@@ -4059,6 +4848,14 @@ class ImageViewer(QMainWindow):
         if cached is not None:
             self.animated_frame_cache.move_to_end(key)
             self._show_animated_pixmap(cached)
+            return
+
+        if self.anim_cache_playing:
+            # QMovie is paused while cached replay drives the display, so
+            # qimage above is the frame it stopped on, not frame_number's --
+            # processing it here would cache the wrong picture under this
+            # key. Hand playback back to QMovie instead.
+            self._leave_anim_cache_mode()
             return
 
         saturation = self.settings.get('anim_saturation', 100)
@@ -4314,6 +5111,979 @@ class ImageViewer(QMainWindow):
         while len(self.animated_frame_cache) > self.animated_frame_cache_limit:
             self.animated_frame_cache.popitem(last=False)
 
+    def _animation_source_key(self, filepath):
+        """Identity of an animation for the retained caches: which file (and
+        zip) it is plus that file's size and modified time, so a file that
+        has changed on disk is never replayed from its old frames. None if
+        it can't be worked out."""
+        try:
+            st = os.stat(self.current_zip or filepath)
+            return (self.current_zip, filepath, st.st_size, st.st_mtime_ns)
+        except Exception:
+            return None
+
+    def _stash_animated_cache(self):
+        """Called first thing by stop_current_movie, while the animation
+        being left is still fully described by self.*. If its whole loop is
+        sitting in animated_frame_cache, preloading is on and the machine can
+        spare the RAM, move it into retained_anim_caches instead of letting
+        stop_current_movie throw it away -- so coming back to the animation
+        replays from the cache at once instead of decoding the first loop
+        all over again (an image you leave stays cached the same way).
+        Returns True if the frames were kept, in which case the caller must
+        not clear() them."""
+        try:
+            if not (self.preload_enabled and self.preload_count > 0):
+                # Retention is off (e.g. preloading was just switched off in
+                # the settings): also let go of whatever was kept while it
+                # was on, rather than sit on that memory.
+                self.retained_anim_caches.clear()
+                return False
+            key = self.current_movie_source
+            total = self.prefetch_frame_count
+            delays = self.anim_frame_delays
+            cache = self.animated_frame_cache
+            if (not self.current_movie or key is None or not delays or not total
+                    or len(delays) != total or len(cache) < total):
+                return False
+            keys = [self._animated_cache_key(i) for i in range(total)]
+            if not all(k in cache for k in keys):
+                return False
+            last = cache[keys[-1]]
+            entry = {
+                'frames': cache,
+                'delays': list(delays),
+                'total': total,
+                'bytes': sum(pm.width() * pm.height() * 4 for pm in cache.values()),
+                'frame_size': (last.width(), last.height()),
+            }
+        except Exception:
+            return False
+        try:
+            self.retained_anim_caches.pop(key, None)
+            self.retained_anim_caches[key] = entry
+            # current_index is already the image being navigated TO here
+            # (see next_image/prev_image); if a cache for it is waiting in
+            # the pool, it is about to be taken -- don't let it cost a
+            # neighbor its slot meanwhile (see _trim_retained_anim_caches).
+            arrival_key = None
+            if 0 <= self.current_index < len(self.image_list):
+                arrival_key = self._animation_source_key(self.image_list[self.current_index])
+            self._trim_retained_anim_caches(spare_key=arrival_key if arrival_key in self.retained_anim_caches else None)
+            kept = key in self.retained_anim_caches
+            return kept
+        except Exception:
+            # Never let bookkeeping get in the way of navigating: fall back
+            # to the old behaviour (the caller clears the frames).
+            self.retained_anim_caches.pop(key, None)
+            return False
+
+    def _retained_anim_distance(self, key):
+        """How far, in list positions, a retained cache's file is from the
+        image on screen now; infinity if it isn't in the current list at
+        all (left over from another folder or zip)."""
+        try:
+            return abs(self.image_list.index(key[1]) - self.current_index)
+        except Exception:
+            return float('inf')
+
+    def _retained_eviction_order(self):
+        """Retained caches in the order they should be dropped: farthest
+        from the image on screen first -- the least likely to be visited
+        next. This used to be oldest-first, which threw away exactly the
+        neighbor that had just been prepared for the image being navigated
+        to: leaving an animation stashes ITS cache, and with the pool at
+        its limit the oldest entry -- the prepared next image -- went to
+        make room, so preloading never paid off however long you waited.
+        sorted() is stable, so equally far (or all unknown) entries keep
+        their insertion order, i.e. the least recently kept goes first."""
+        return sorted(self.retained_anim_caches, key=lambda k: -self._retained_anim_distance(k))
+
+    def _trim_retained_anim_caches(self, spare_key=None):
+        """Keep the retained caches within ANIMATED_CACHE_RETAIN_MAX entries
+        and within what the machine can spare -- the RAM free right now plus
+        what the retained caches themselves hold, at the same 80% rule as
+        animated_cache_budget_bytes -- dropping the farthest from the image
+        on screen first (see _retained_eviction_order).
+
+        spare_key is an entry that doesn't count toward the entry limit and
+        is never dropped for it: while an animation is being left, the
+        cache of the one about to be shown is still sitting in the pool
+        (it is taken out again a moment later, and becomes the on-screen
+        animation's own cache), so counting it would push out a neighbor
+        that's wanted only to have it prepared all over again."""
+        pool = self.retained_anim_caches
+        while len([k for k in pool if k != spare_key]) > ANIMATED_CACHE_RETAIN_MAX:
+            pool.pop([k for k in self._retained_eviction_order() if k != spare_key][0])
+        total = sum(e['bytes'] for e in pool.values())
+        budget = animated_cache_budget_bytes(extra_bytes=total)
+        while pool and total > budget:
+            dropped = pool.pop(self._retained_eviction_order()[0])
+            total -= dropped['bytes']
+
+    def _take_retained_anim_cache(self, key, frame_count, w, h):
+        """Take this animation's retained cache out of the pool if it's still
+        good for what's about to be shown: same frame count, every frame
+        present under the current anim color settings, and frames the size a
+        fresh decode would use now (w x h -- i.e. window/zoom unchanged).
+        Otherwise a fresh decode beats replaying frames of the wrong size or
+        color, and the entry is dropped rather than left sitting on memory.
+        Returns the entry, or None."""
+        entry = self.retained_anim_caches.pop(key, None) if key is not None else None
+        if entry is None:
+            return None
+        reason = None
+        try:
+            frames = entry['frames']
+            fw, fh = entry['frame_size']
+            if entry['total'] != frame_count or len(frames) < frame_count:
+                reason = '프레임 수가 달라서'
+            elif not all(self._animated_cache_key(i) in frames for i in range(frame_count)):
+                reason = '애니메이션 색 보정 설정이 바뀌어서'
+            elif abs(fw - w) > 2 or abs(fh - h) > 2:
+                reason = f'화면 크기가 바뀌어서(보관 {fw}x{fh} / 지금 {w}x{h})'
+        except Exception:
+            reason = '보관된 캐시를 확인하지 못해서'
+        if reason:
+            return None
+        return entry
+
+    def _reclaim_retained_anim_caches(self, need_bytes, avail):
+        """Retained caches are a convenience, so they give way to the
+        animation being loaded: if its whole loop wouldn't fit in the RAM
+        that's free (avail, read once by the caller before anything is
+        dropped), drop the least recently kept retained caches until it
+        does, or none are left. Returns how many bytes that gave back -- to
+        be added to the budget, since the memory only becomes free after
+        avail was read."""
+        pool = self.retained_anim_caches
+        freed = 0
+        while pool and need_bytes > animated_cache_budget_bytes(avail, freed):
+            dropped = pool.pop(self._retained_eviction_order()[0])
+            freed += dropped['bytes']
+        return freed
+
+    def _start_retained_replay(self):
+        """Start cached replay at once from a cache restored by
+        _take_retained_anim_cache, without ever starting QMovie (it is only
+        started if replay has to hand back, see _leave_anim_cache_mode).
+        Frame 0 goes on screen now and the rest follow on their own
+        durations. Returns False if it can't -- the caller then just starts
+        QMovie as usual, and the still-complete cache makes
+        _try_start_anim_cache_playback take over on frame 0 anyway."""
+        total = self.prefetch_frame_count
+        delays = self.anim_frame_delays
+        if not self.current_movie or not total or not delays or len(delays) != total:
+            return False
+        key = self._animated_cache_key(0)
+        pixmap = self.animated_frame_cache.get(key)
+        if pixmap is None:
+            return False
+        self.animated_frame_cache.move_to_end(key)
+        self.anim_cache_playing = True
+        self.anim_cache_index = 0
+        self.current_movie_frame = 0
+        self.on_gif_frame_changed(0)
+        self._show_animated_pixmap(pixmap)
+        self._anim_cache_deadline = time.perf_counter()
+        self._schedule_next_cached_frame()
+        return True
+
+    def _current_preload_wanted_keys(self, include_current=False):
+        """_animation_source_key() for every file presently within the
+        preload range (plus the image on screen itself when
+        include_current). Recomputed fresh, never cached, since it's read
+        both right before a submission and, later, when that job's result
+        is being admitted -- by which time real navigation may have moved
+        on. Used so preparing one neighbor never evicts a retained entry
+        that's ALSO still wanted: that one would just be resubmitted."""
+        if not self.image_list:
+            return set()
+        count = max(0, min(10, int(self.preload_count)))
+        keys = set()
+        for distance in range(1, count + 1):
+            for direction in (1, -1):
+                idx = self.current_index + (distance * direction)
+                if 0 <= idx < len(self.image_list):
+                    k = self._animation_source_key(self.image_list[idx])
+                    if k is not None:
+                        keys.add(k)
+        if include_current and 0 <= self.current_index < len(self.image_list):
+            k = self._animation_source_key(self.image_list[self.current_index])
+            if k is not None:
+                keys.add(k)
+        return keys
+
+    def _anim_evictable_keys(self, protected=None):
+        """Retained caches that can be dropped to make room for a newly
+        prepared neighbor without costing anything still wanted -- neither
+        within the preload range nor the image on screen -- farthest from
+        the image on screen first."""
+        if protected is None:
+            protected = self._current_preload_wanted_keys(include_current=True)
+        return [k for k in self._retained_eviction_order() if k not in protected]
+
+    def _preload_neighbor_animations(self):
+        # Runs at the very end of show_current_image and from timer/signal
+        # slots: a bug in this background preparation must never turn into
+        # an exception that breaks navigation or the event loop.
+        try:
+            self._preload_neighbor_animations_impl()
+        except Exception as e:
+            print(f"[애니메이션 미리 디코딩 오류] {e}")
+
+    def _preload_neighbor_animations_impl(self):
+        """Background-decode whole loops of eligible neighbor animations
+        (same eligibility as cached replay -- see where show_current_image
+        fills anim_frame_delays: an infinite-loop webp whose container frame
+        count matches Pillow's) within the preload range, straight into
+        retained_anim_caches -- the same place a *revisited* animation's
+        cache is kept (_stash_animated_cache). So by the time navigation
+        actually reaches one, _take_retained_anim_cache finds it already
+        warm and _start_retained_replay begins cached playback on frame 0
+        at once, instead of a first loop through QMovie.
+
+        Gated on preload_enabled/preload_count exactly like
+        _preload_neighbors (this piggybacks on that setting rather than
+        adding a separate one).
+        Uses its own tiny executor (ImageLoader._anim_preload_executor,
+        sized _ANIM_PRELOAD_WORKER_COUNT=1) -- never the static-image pool
+        or the live-playback per-frame pool. One neighbor is prepared at a
+        time, nearest first; the slot stays taken until its pixmaps have
+        been built too (_begin_anim_admission), and farther ones wait
+        their turn as it frees up (called again when one finishes) or
+        navigation continues (called again from show_current_image)."""
+        if not (self.preload_enabled and self.image_list):
+            return
+        count = max(0, min(10, int(self.preload_count)))
+        if count <= 0:
+            return
+
+        # A file declined earlier for lack of room (see
+        # _finish_anim_admission) deserves a fresh look once the pool has
+        # actually lost a member since -- that is the only thing that
+        # could free room for it. This is checked here (every call this
+        # function makes it past the gates above), not cleared on plain
+        # navigation: back-and-forth browsing that never actually frees a
+        # slot must not keep re-decoding the same too-big-to-fit file from
+        # scratch on every step -- which is exactly what unconditionally
+        # clearing this on every navigation used to do.
+        current_pool_size = len(self.retained_anim_caches)
+        if current_pool_size < self._anim_declined_pool_size:
+            self.anim_preload_declined.clear()
+        self._anim_declined_pool_size = current_pool_size
+
+        wanted = []
+        for distance in range(1, count + 1):
+            for direction in (1, -1):
+                idx = self.current_index + (distance * direction)
+                if 0 <= idx < len(self.image_list):
+                    wanted.append(self.image_list[idx])
+
+        # A neighbor that fell out of range since it was submitted (the
+        # user kept navigating) no longer needs preparing -- let its
+        # worker, or the pixmap conversion that follows it, notice and
+        # stop early.
+        wanted_set = set(wanted)
+        for fname, cancel_event in list(self.anim_preload_inflight.items()):
+            if fname not in wanted_set:
+                cancel_event.set()
+
+        if len(self.anim_preload_inflight) >= _ANIM_PRELOAD_WORKER_COUNT:
+            return
+
+        if (self.current_movie and self.anim_frame_delays
+                and (not self.anim_cache_playing or self._first_loop_job is not None)):
+            # The animation on screen is still filling its own frame cache
+            # (its slow first loop). That's when the GUI thread is busiest
+            # and when its memory use is still growing, so preparing
+            # neighbors now would compete with exactly what the person is
+            # waiting on. Wait until it switches to cached replay (which
+            # calls back into here, see _try_start_anim_cache_playback).
+            return
+
+        dpr = self.devicePixelRatioF()
+        fit_to_window = self.fit_to_window
+        # Exactly the QSize the live path builds (QSize * dpr rounds the
+        # way Qt does), so preloaded frames come out the same size.
+        box = self.scroll_area.size() * dpr
+        box_w = box.width() if fit_to_window else None
+        box_h = box.height() if fit_to_window else None
+        zoom_factor = self.zoom_factor
+        reserve_bytes = self._current_anim_pending_cache_bytes()
+        saturation = self.settings.get('anim_saturation', 100)
+        brightness = self.settings.get('anim_brightness', 100)
+        contrast = self.settings.get('anim_contrast', 100)
+
+        # Every candidate's source key, computed once up front: needed
+        # both to skip an already-retained/ineligible one below, and (as
+        # protected) to tell a genuinely-stale retained entry from one
+        # that's still in range -- see the room check below.
+        candidate_keys = {}
+        for filename in wanted:
+            if os.path.splitext(filename)[1].lower() == '.webp':
+                k = self._animation_source_key(filename)
+                if k is not None:
+                    candidate_keys[filename] = k
+        protected = set(candidate_keys.values())
+        if 0 <= self.current_index < len(self.image_list):
+            current_key = self._animation_source_key(self.image_list[self.current_index])
+            if current_key is not None:
+                protected.add(current_key)
+
+        for filename in wanted:
+            if os.path.splitext(filename)[1].lower() != '.webp':
+                # Only ever eligible kind for cached replay -- see
+                # show_current_image. Preloading a gif or a finite-loop
+                # webp's frames would still skip their first-loop color-
+                # adjustment cost, but the current retained-cache format
+                # requires anim_frame_delays (webp, loop=0), and extending
+                # that is a larger change than this preload feature.
+                continue
+            if filename in self.anim_preload_inflight:
+                continue
+            key = candidate_keys.get(filename)
+            if (key is None or key in self.retained_anim_caches
+                    or key in self.anim_preload_ineligible or key in self.anim_preload_declined):
+                continue
+            if len(self.retained_anim_caches) + len(self.anim_preload_inflight) >= ANIMATED_CACHE_RETAIN_MAX:
+                # No free slot. Worth trying only if at least one
+                # currently-retained entry is a genuine eviction target
+                # (not in range, not on screen) -- otherwise preparing this
+                # one would just force out another that's equally still
+                # wanted, which would then immediately be resubmitted right
+                # back. Nothing else in `wanted` can do better than this
+                # same check, so stop for this call.
+                if not self._anim_evictable_keys(protected):
+                    return
+            self._submit_anim_preload(filename, key, fit_to_window, box_w, box_h,
+                                       zoom_factor, saturation, brightness, contrast,
+                                       reserve_bytes)
+            return
+
+    def _current_anim_pending_cache_bytes(self):
+        """Bytes the animation on screen has still to add to its own frame
+        cache (0 if none is playing or it's already full). Reserved out of
+        the free RAM a neighbor preload may claim, since that memory is
+        about to be taken."""
+        try:
+            if not self.current_movie:
+                return 0
+            missing = self.animated_frame_cache_limit - len(self.animated_frame_cache)
+            if missing <= 0:
+                return 0
+            if self.animated_frame_cache:
+                pm = next(reversed(self.animated_frame_cache.values()))
+                per_frame = pm.width() * pm.height() * 4
+            else:
+                size = self.current_movie_target_size or self.current_movie_original_size
+                size = self._anim_decode_size(size) if size else None
+                per_frame = size.width() * size.height() * 4 if size else 0
+            return missing * per_frame
+        except Exception:
+            return 0
+
+    def _submit_anim_preload(self, filename, key, fit_to_window, box_w, box_h,
+                              zoom_factor, saturation, brightness, contrast,
+                              reserve_bytes=0):
+        """Kick off the background decode for one neighbor (see
+        _preload_neighbor_animations). Everything the worker needs is
+        captured here, on the GUI thread, as plain values -- never a Qt
+        object, never a live read of self.settings/self.current_zip from
+        the worker thread itself (same discipline _submit_image_load and
+        _submit_animated_frame_processing already follow).
+
+        reserve_bytes is memory the animation on screen is about to take
+        for its own cache: the worker refuses to start a decode whose
+        result the *remaining* free RAM couldn't comfortably hold."""
+        source_zip = self.current_zip
+        cancel_event = threading.Event()
+        self.anim_preload_inflight[filename] = cancel_event
+
+        def worker():
+            _lower_current_thread_to_background_priority()
+            try:
+                data = None
+                if source_zip:
+                    try:
+                        zf = ZipHandler._get_zip(source_zip)
+                        with zf.open(filename, 'r') as fp:
+                            data = fp.read()
+                    except Exception:
+                        return None
+                if cancel_event.is_set():
+                    return None
+
+                # False below means "this file itself will never qualify,
+                # regardless of window/zoom/memory state" -- see
+                # anim_preload_ineligible above. None means "worth trying
+                # again later" (cancelled, or no room right now).
+                frame_count = get_frame_count(BytesIO(data) if data is not None else filename)
+                if not frame_count or frame_count <= 1:
+                    return False
+                info = read_webp_animation_info(data if data is not None else filename)
+                if not info:
+                    return False
+                durations, loop_count = info
+                if loop_count != 0 or len(durations) != frame_count:
+                    return False
+                delays = [max(10, d) for d in durations]
+
+                Image = get_pil_image()
+                with Image.open(BytesIO(data) if data is not None else filename) as im:
+                    orig_w, orig_h = im.size
+                target_w, target_h = compute_anim_decode_size(
+                    orig_w, orig_h, fit_to_window, box_w, box_h, zoom_factor)
+                if target_w <= 0 or target_h <= 0:
+                    # Only reachable via a corrupt/zero-sized orig_w/orig_h
+                    # from Pillow -- compute_anim_decode_size itself never
+                    # returns non-positive from a positive input.
+                    return False
+
+                need_bytes = frame_count * target_w * target_h * 4
+                avail = get_available_physical_memory()
+                if avail is not None:
+                    avail = max(0, avail - reserve_bytes)
+                budget = animated_preload_budget_bytes(avail)
+                if need_bytes > budget:
+                    return None
+                if cancel_event.is_set():
+                    return None
+
+                frames = decode_webp_animation_frames(
+                    BytesIO(data) if data is not None else filename,
+                    frame_count, target_w, target_h, saturation, brightness, contrast,
+                    cancel_event.is_set)
+                if not frames:
+                    # Cancelled (the neighbor fell out of range mid-decode)
+                    # is transient; an actual decode failure on this data
+                    # (past the lightweight container checks above) is not.
+                    return None if cancel_event.is_set() else False
+                total_bytes = sum(len(raw) for raw, _, _ in frames)
+                return {'frames': frames, 'delays': delays, 'total': frame_count,
+                        'frame_size': (target_w, target_h), 'bytes': total_bytes,
+                        'saturation': saturation, 'brightness': brightness, 'contrast': contrast}
+            except Exception as e:
+                print(f"[애니메이션 미리 디코딩 오류] {os.path.basename(filename)}: {e}")
+                return None
+
+        future = ImageLoader._anim_preload_executor.submit(worker)
+        def done(fut, key=key, filename=filename):
+            try:
+                result = fut.result()
+            except Exception:
+                result = None
+            self.load_bridge.anim_preload_ready.emit(key, (filename, result))
+        future.add_done_callback(done)
+
+    def _mark_anim_ineligible(self, key):
+        if key is None:
+            return
+        self.anim_preload_ineligible[key] = True
+        self.anim_preload_ineligible.move_to_end(key)
+        while len(self.anim_preload_ineligible) > 500:
+            self.anim_preload_ineligible.popitem(last=False)
+
+    def _mark_anim_declined(self, key):
+        if key is None:
+            return
+        self.anim_preload_declined[key] = True
+        self.anim_preload_declined.move_to_end(key)
+        while len(self.anim_preload_declined) > 100:
+            self.anim_preload_declined.popitem(last=False)
+
+    def _on_anim_preload_ready(self, key, payload):
+        filename, result = payload
+        if result is False:
+            self.anim_preload_inflight.pop(filename, None)
+            self._mark_anim_ineligible(key)
+            # Safe to chain: this candidate is now excluded, so each
+            # chained call strictly shrinks the pool of candidates left.
+            self._preload_neighbor_animations()
+            return
+        if not result:
+            # Transient (cancelled, or not enough memory right now):
+            # nothing has changed since this job was submitted, so chaining
+            # straight into another attempt at the same candidate could
+            # spin indefinitely if it's the only one in range. Leave it for
+            # a later navigation to retry.
+            self.anim_preload_inflight.pop(filename, None)
+            return
+        # The decode itself is done, but its frames are still raw bytes.
+        # Turning them into QPixmaps has to happen on this (GUI) thread;
+        # all of them in one go used to freeze playback for seconds and
+        # hold a second copy of the whole loop in memory meanwhile, so it
+        # is done a frame at a time instead.
+        self._begin_anim_admission(key, filename, result)
+
+    def _anim_admission_problem(self, key, filename):
+        """Why a finished decode should NOT be admitted into the retained
+        pool right now, or None if it can be. Checked when its conversion
+        starts and again when it finishes, since navigation may have moved
+        on in between."""
+        # The file's identity is re-checked against what it is *now*, not
+        # what it was when the job started -- it may have changed on disk.
+        if key is None or self._animation_source_key(filename) != key:
+            return 'changed'
+        if key in self.retained_anim_caches:
+            return 'have'
+        if not (self.preload_enabled and self.preload_count > 0 and self.image_list):
+            return 'off'
+        if 0 <= self.current_index < len(self.image_list) and self.image_list[self.current_index] == filename:
+            # Navigation reached this very file while it was being
+            # prepared: it is on screen now, being decoded the ordinary
+            # way, and must not also be kept in the pool.
+            return 'current'
+        if len(self.retained_anim_caches) >= ANIMATED_CACHE_RETAIN_MAX and not self._anim_evictable_keys():
+            # Every retained entry is equally still wanted: keeping this
+            # one would just push another out, to be prepared again.
+            return 'full'
+        return None
+
+    def _begin_anim_admission(self, key, filename, result):
+        st = {'key': key, 'filename': filename, 'result': result, 'index': 0,
+              'frames_dict': OrderedDict(),
+              # Pacing (see _anim_admit_step_impl): how long one frame's
+              # conversion has taken lately, and how many times in a row a
+              # step has been put off to keep clear of a replay tick.
+              'cost_ms': 8.0, 'deferrals': 0}
+        problem = self._anim_admission_problem(key, filename)
+        if problem:
+            self._end_anim_admission(st, chain=False, declined=(problem == 'full'))
+            return
+        self.anim_admit = st
+        QTimer.singleShot(0, self._anim_admit_step)
+
+    def _anim_admit_step(self):
+        st = self.anim_admit
+        if not st:
+            return
+        try:
+            self._anim_admit_step_impl(st)
+        except Exception as e:
+            print(f"[애니메이션 미리 디코딩 오류] {os.path.basename(st['filename'])}: {e}")
+            self._end_anim_admission(st, chain=False)
+
+    def _anim_admit_step_impl(self, st):
+        """Convert ONE frame to a QPixmap, release its raw bytes, and
+        schedule the next -- so playback of the animation on screen only
+        ever waits for a single frame's conversion at a time, never the
+        whole loop's."""
+        filename = st['filename']
+        cancel_event = self.anim_preload_inflight.get(filename)
+        if (cancel_event is None or cancel_event.is_set()
+                or not (self.preload_enabled and self.preload_count > 0)
+                or (0 <= self.current_index < len(self.image_list)
+                    and self.image_list[self.current_index] == filename)):
+            # Fell out of range (or was reached, or preloading was turned
+            # off) while converting: stop and give the memory back.
+            self._end_anim_admission(st, chain=False)
+            return
+        if self.anim_cache_playing and st['deferrals'] < 4:
+            # A cached replay is running: never let this conversion delay
+            # its next tick. If that tick is due before a frame's worth of
+            # conversion would finish, run right after it instead (that
+            # tick then leaves a whole frame duration free). After a few
+            # such put-offs in a row -- frames so short there is never
+            # room -- go ahead anyway rather than starve.
+            slack_ms = (self._anim_cache_deadline - time.perf_counter()) * 1000.0
+            if slack_ms < st['cost_ms'] * 1.3 + 2.0:
+                st['deferrals'] += 1
+                QTimer.singleShot(max(1, int(slack_ms) + 1), self._anim_admit_step)
+                return
+        st['deferrals'] = 0
+        result = st['result']
+        frames = result['frames']
+        i = st['index']
+        t0 = time.perf_counter()
+        raw, w, h = frames[i]
+        frames[i] = None   # the raw copy goes as soon as the pixmap exists
+        qimg = QImage(raw, w, h, w * 4, QImage.Format_RGBA8888).copy()
+        pixmap = QPixmap.fromImage(qimg)
+        del raw, qimg
+        if pixmap.isNull():
+            # Deterministic for this data -- retrying would just fail the
+            # same way every time.
+            self._end_anim_admission(st, chain=True, ineligible=True)
+            return
+        # Same key shape as _animated_cache_key, built from the settings
+        # captured when this job was submitted -- not a live re-read --
+        # since that's what these pixels actually reflect. If
+        # anim_saturation/brightness/contrast changed since,
+        # _take_retained_anim_cache's own check (against the *current*
+        # settings, when the animation is actually opened) refuses the
+        # entry then -- same protection a stash-on-leave entry gets.
+        st['frames_dict'][(i, result['saturation'], result['brightness'], result['contrast'])] = pixmap
+        st['index'] = i + 1
+        cost_ms = (time.perf_counter() - t0) * 1000.0
+        # Remember the pessimistic side: one slow frame shouldn't be
+        # forgotten by the very next step.
+        st['cost_ms'] = max(cost_ms, st['cost_ms'] * 0.8)
+        if st['index'] < len(frames):
+            # Leave the event loop for about as long as the conversion
+            # just took (at least a few ms), so this uses at most about
+            # half of the GUI thread however heavy the frames are.
+            QTimer.singleShot(max(2, int(cost_ms)), self._anim_admit_step)
+            return
+        self._finish_anim_admission(st)
+
+    def _finish_anim_admission(self, st):
+        key, filename, result = st['key'], st['filename'], st['result']
+        problem = self._anim_admission_problem(key, filename)
+        if problem:
+            self._end_anim_admission(st, chain=False, declined=(problem == 'full'))
+            return
+        if len(self.retained_anim_caches) >= ANIMATED_CACHE_RETAIN_MAX:
+            # _anim_admission_problem just confirmed there is an entry that
+            # is not wanted: drop the farthest such one.
+            self.retained_anim_caches.pop(self._anim_evictable_keys()[0], None)
+        entry = {'frames': st['frames_dict'], 'delays': result['delays'],
+                 'total': result['total'], 'bytes': result['bytes'],
+                 'frame_size': result['frame_size']}
+        self.retained_anim_caches[key] = entry
+        self._trim_retained_anim_caches()
+        kept = key in self.retained_anim_caches
+        # Only chain into the next candidate after a success: after a
+        # result that was thrown away, the same conditions would just
+        # discard the next one too, each after a full decode.
+        self._end_anim_admission(st, chain=kept, declined=not kept)
+
+    def _end_anim_admission(self, st, chain, declined=False, ineligible=False):
+        self.anim_admit = None
+        self.anim_preload_inflight.pop(st['filename'], None)
+        # Drop whatever this conversion still holds: raw frames not yet
+        # converted, and (unless they were handed to the pool) the pixmaps.
+        st['result']['frames'] = None
+        st['frames_dict'] = None
+        if ineligible:
+            self._mark_anim_ineligible(st['key'])
+        if declined:
+            self._mark_anim_declined(st['key'])
+        if chain:
+            self._preload_neighbor_animations()
+
+    def _stop_anim_cache_playback(self):
+        self.anim_cache_timer.stop()
+        self.anim_cache_playing = False
+        self.anim_cache_index = -1
+
+    def _leave_anim_cache_mode(self):
+        """Give playback back to QMovie -- cached replay can't continue
+        (a frame is missing from the cache, or something went wrong). QMovie
+        picks up from the frame it was paused on; a later loop can switch
+        back to cached replay once the cache covers the loop again."""
+        was_playing = self.anim_cache_playing
+        # 첫 루프 병렬 디코딩 중이었다면 그것도 멈춘다 (QMovie 가 이어받으므로).
+        self._cancel_first_loop_decode()
+        self._stop_anim_cache_playback()
+        if was_playing and self.current_movie:
+            movie = self.current_movie
+            if movie.state() == QMovie.NotRunning:
+                # Replay began straight from a retained cache, so QMovie
+                # was never started.
+                movie.start()
+            else:
+                movie.setPaused(False)
+
+    # ------------------------------------------------------------------
+    # 고해상도 애니메이션 webp: 첫 루프 병렬 디코딩
+    # (작업 자체는 모듈 위쪽의 FirstLoopJob 이 GUI 스레드 밖에서 한다)
+    # ------------------------------------------------------------------
+    def _first_loop_eligible(self, ext, frame_count, w, h):
+        """이 애니메이션의 첫 루프를 QMovie 대신 병렬 디코딩으로 채울지. 캐시 재생이 가능한
+        webp (anim_frame_delays 가 있고 루프 전체가 캐시에 들어감) 중에서도 프레임이 충분히
+        커서 QMovie 로는 느린 것만 해당한다. 나머지는 예전 방식 그대로."""
+        try:
+            if ext != '.webp':
+                return False
+            delays = self.anim_frame_delays
+            if (not delays or not frame_count or frame_count < ANIMATED_FIRST_LOOP_MIN_FRAMES
+                    or len(delays) != frame_count):
+                return False
+            if self.animated_frame_cache_limit < frame_count or w <= 0 or h <= 0:
+                return False
+            orig = self.current_movie_original_size
+            if not orig or orig.width() * orig.height() < ANIMATED_FIRST_LOOP_MIN_PIXELS:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _start_first_loop_decode(self, source, frame_count, w, h, movie_generation):
+        """작업 스레드 여러 개가 루프 전체를 w x h 로 풀도록 시작한다. QMovie 는 시작하지 않고,
+        프레임이 나오는 대로 _first_loop_pump 가 캐시에 넣는다. 재생은 기존 캐시 재생
+        (_anim_cache_tick) 이 하되, 디코딩이 재생을 따라잡을 수 있다고 판단되는 시점
+        (first_loop_can_start) 부터 시작한다. 시작했으면 True."""
+        try:
+            if ImageLoader._shutdown:
+                ImageLoader.restart_executor()
+            job = FirstLoopJob(
+                movie_generation, source, frame_count, w, h,
+                self.settings.get('anim_saturation', 100),
+                self.settings.get('anim_brightness', 100),
+                self.settings.get('anim_contrast', 100),
+                self.anim_frame_delays)
+            self._first_loop_job = job
+            job.start(ImageLoader._first_loop_executor)
+            self._first_loop_timer.start(8)
+            return True
+        except Exception as e:
+            print(f"[첫 루프 병렬 디코딩 오류] 시작하지 못했습니다: {e}")
+            self._cancel_first_loop_decode()
+            return False
+
+    def _cancel_first_loop_decode(self):
+        job = self._first_loop_job
+        self._first_loop_job = None
+        try:
+            self._first_loop_timer.stop()
+        except Exception:
+            pass
+        if job is not None:
+            job.cancel()
+            job.release()
+
+    def _first_loop_pump(self):
+        """8ms 마다: 작업 스레드가 내놓은 프레임을 캐시로 옮기고, 재생을 시작할 때가 됐는지 본다."""
+        job = self._first_loop_job
+        if job is None:
+            self._first_loop_timer.stop()
+            return
+        try:
+            if job.generation != self.current_movie_generation or not self.current_movie:
+                self._cancel_first_loop_decode()
+                return
+            sig = (self.settings.get('anim_saturation', 100),
+                   self.settings.get('anim_brightness', 100),
+                   self.settings.get('anim_contrast', 100))
+            if sig != job.settings_sig:
+                raise RuntimeError('애니메이션 색 보정 설정이 바뀌었습니다')
+            if job.error:
+                raise RuntimeError(job.error)
+            # 창을 키웠거나 확대해서 필요한 디코딩 크기가 작업 크기보다 훨씬 커졌으면 새 크기로
+            # 다시 푼다. 파일을 실행하며 바로 열 때가 대표적이다: 창이 아직 배치되기 전 (작은
+            # 크기) 에 이 작업이 시작되는데, 그대로 두면 모든 프레임이 작은 크기로 풀려 흐릿하다.
+            target = self.current_movie_target_size
+            if target and target.width() > 0 and target.height() > 0:
+                need = self._anim_decode_size(target)
+                if (need.width() > job.target_w * 1.15 or need.height() > job.target_h * 1.15) \
+                        and time.perf_counter() - self._first_loop_last_restart >= 0.4:
+                    self._first_loop_restart(job, need)
+                    return
+            self._first_loop_convert_ready(job)
+            if self._first_loop_job is not job:
+                return
+            self._first_loop_maybe_play(job)
+            if self._first_loop_job is job and job.converted >= job.frame_count:
+                self._first_loop_done(job)
+        except Exception as e:
+            print(f"[첫 루프 병렬 디코딩 오류] {e} -- QMovie 재생으로 되돌립니다")
+            self._first_loop_fallback()
+
+    def _first_loop_convert_ready(self, job):
+        """작업 스레드가 내놓은 프레임을 (시간 예산 안에서) QPixmap 으로 바꿔 캐시에 넣는다.
+        QPixmap 은 GUI 스레드에서만 만들 수 있다."""
+        stop_at = time.perf_counter() + 0.005
+        while True:
+            try:
+                idx, raw, w, h, opaque = job.results.get_nowait()
+            except queue.Empty:
+                return
+            # 알파가 없는 프레임은 RGBX 로 넘겨서 알파 곱셈 변환을 피하고 불투명 픽스맵으로 만든다.
+            fmt = QImage.Format_RGBX8888 if opaque else QImage.Format_RGBA8888
+            qimg = QImage(raw, w, h, w * 4, fmt)
+            pixmap = QPixmap.fromImage(qimg)
+            del qimg
+            if pixmap.isNull():
+                raise RuntimeError(f'프레임 {idx} 를 QPixmap 으로 바꾸지 못했습니다')
+            self._store_animated_frame(self._animated_cache_key(idx), pixmap)
+            job.mark_converted(idx)
+            if idx == 0 and not job.first_shown and not self.anim_cache_playing:
+                job.first_shown = True
+                self.current_movie_frame = 0
+                self._show_animated_pixmap(pixmap)
+            if time.perf_counter() >= stop_at:
+                return
+
+    def _first_loop_begin_playback(self, job):
+        """캐시 재생을 0번 프레임부터 시작한다 (_start_retained_replay 와 같은 방식)."""
+        key0 = self._animated_cache_key(0)
+        pixmap = self.animated_frame_cache.get(key0)
+        if pixmap is None:
+            return False
+        job.playing = True
+        self.animated_frame_cache.move_to_end(key0)
+        self.anim_cache_playing = True
+        self.anim_cache_index = 0
+        self.current_movie_frame = 0
+        self.on_gif_frame_changed(0)
+        self._anim_cache_deadline = time.perf_counter()
+        self._schedule_next_cached_frame()
+        return True
+
+    def _first_loop_maybe_play(self, job):
+        if job.playing or self.anim_cache_playing:
+            return
+        if job.prefix < min(2, job.frame_count):
+            return
+        elapsed = time.perf_counter() - job.t0
+        if not (first_loop_can_start(job.frame_count, job.decoded, elapsed, job.cum_s,
+                                      _FIRST_LOOP_WORKER_COUNT)
+                or elapsed >= ANIMATED_FIRST_LOOP_MAX_PREBUFFER):
+            return
+        self._first_loop_begin_playback(job)
+
+    def _first_loop_done(self, job):
+        """모든 프레임이 캐시에 들어갔다: 이후는 기존 캐시 재생이 그대로 이어받는다."""
+        self._first_loop_timer.stop()
+        self._first_loop_job = None
+        job.release()
+        if not job.playing and not self.anim_cache_playing:
+            self._first_loop_begin_playback(job)
+        # 첫 루프 준비가 끝나서 GUI 스레드가 한가해졌으니 이웃 미리 디코딩을 시작해도 된다.
+        self._preload_neighbor_animations()
+
+    def _first_loop_fallback(self):
+        """병렬 디코딩을 포기하고 QMovie 재생으로 되돌린다. 이미 캐시에 들어간 프레임은 그대로
+        쓰인다."""
+        self._cancel_first_loop_decode()
+        movie = self.current_movie
+        if not movie:
+            return
+        try:
+            if self.anim_cache_playing:
+                # QMovie 를 시작하거나 재개한다.
+                self._leave_anim_cache_mode()
+            else:
+                movie.start()
+                start_frame = movie.currentFrameNumber()
+                self._render_animated_frame(start_frame, self.current_movie_generation)
+                self._prefetch_ahead(start_frame)
+        except Exception as e:
+            print(f"[첫 루프 병렬 디코딩 오류] QMovie 재생으로 되돌리지 못했습니다: {e}")
+        self._preload_neighbor_animations()
+
+    def _first_loop_restart(self, job, need):
+        """필요한 디코딩 크기가 커졌을 때 (창 확대, 확대 배율 변경) 새 크기로 처음부터 다시 푼다."""
+        source = job.source
+        frame_count = job.frame_count
+        generation = job.generation
+        w, h = need.width(), need.height()
+        self._first_loop_last_restart = time.perf_counter()
+        self._cancel_first_loop_decode()
+        if self.anim_cache_playing:
+            self._stop_anim_cache_playback()
+        # 크기가 섞인 프레임이 남지 않게 먼저 비운다 (그래야 아래에서 읽는 여유 메모리가 정확하다).
+        self.animated_frame_cache.clear()
+        # 새 크기에서도 루프 전체가 캐시에 들어가는지 (show_current_image 와 같은 기준).
+        budget = animated_cache_budget_bytes(get_available_physical_memory(), 0)
+        limit = animated_cache_frame_limit(frame_count, w, h, budget)
+        self.animated_frame_cache_limit = limit
+        if source is None or limit < frame_count:
+            # 루프 전체가 안 들어가는 애니메이션은 원래도 캐시 재생을 쓰지 않는다
+            # (캐시 재생을 쓰지 않는 상태로 만든다).
+            self.anim_frame_delays = None
+            self._first_loop_fallback()
+            return
+        if not self._start_first_loop_decode(source, frame_count, w, h, generation):
+            self._first_loop_fallback()
+
+    def _try_start_anim_cache_playback(self, frame_number):
+        """Called after every QMovie-driven frame. Once the first loop has
+        left every frame of the animation in animated_frame_cache, pauses
+        QMovie and shows the cached frames from our own timer instead
+        (_anim_cache_tick), timed by the durations read from the file.
+
+        Why: QMovie decodes -- and, at a scaled size, resamples -- every
+        frame on the GUI thread on every loop, and that result was already
+        being thrown away in favor of the cached pixmap, so loops after the
+        first were exactly as slow as the first. With the whole loop cached
+        there is nothing left to decode.
+
+        Only ever engages when the whole loop fits in the cache (see the
+        budget in show_current_image) and anim_frame_delays is set (webp
+        that loops forever); otherwise this returns False and QMovie keeps
+        driving playback exactly as before. Returns True if it took over."""
+        delays = self.anim_frame_delays
+        total = self.prefetch_frame_count
+        if (self.anim_cache_playing or not delays
+                or not total or total <= 1 or len(delays) != total
+                or not self.current_movie):
+            return False
+        # Only the last frame of a loop (or the first frame of the next
+        # one, if the last frame's color pass finished asynchronously)
+        # can be where the cache newly becomes complete, so a partly
+        # filled cache costs one length compare per frame instead of a
+        # full scan.
+        if frame_number != total - 1 and frame_number != 0:
+            return False
+        cache = self.animated_frame_cache
+        if len(cache) < total:
+            return False
+        if not all(self._animated_cache_key(i) in cache for i in range(total)):
+            return False
+        self.current_movie.setPaused(True)
+        self.anim_cache_playing = True
+        self.anim_cache_index = frame_number
+        self._anim_cache_deadline = time.perf_counter()
+        self._schedule_next_cached_frame()
+        # The first loop is over and the GUI thread is free of decoding:
+        # now is when preparing the neighbors starts (it was held back
+        # while this animation filled its own cache).
+        self._preload_neighbor_animations()
+        return True
+
+    def _schedule_next_cached_frame(self):
+        # Deadlines accumulate from the frame durations rather than each
+        # wait being measured from "now", so the time spent showing a frame
+        # comes out of its own duration instead of adding to it.
+        self._anim_cache_deadline += self.anim_frame_delays[self.anim_cache_index] / 1000.0
+        wait_ms = int(round((self._anim_cache_deadline - time.perf_counter()) * 1000))
+        if wait_ms < 0:
+            # Running behind (showing a frame took longer than its own
+            # duration): show the next one right away, but don't try to
+            # catch up by racing through the frames after it.
+            self._anim_cache_deadline = time.perf_counter()
+            wait_ms = 0
+        self.anim_cache_timer.start(wait_ms)
+
+    def _anim_cache_tick(self):
+        if not self.anim_cache_playing or not self.current_movie:
+            return
+        generation = self.current_movie_generation
+        try:
+            total = self.prefetch_frame_count
+            frame = (self.anim_cache_index + 1) % total
+            key = self._animated_cache_key(frame)
+            pixmap = self.animated_frame_cache.get(key)
+            if pixmap is None:
+                if self._first_loop_job is not None:
+                    # 첫 루프 병렬 디코딩이 아직 이 프레임까지 못 왔다: QMovie 로 넘기지 말고
+                    # 조금 있다가 다시 본다. 기다린 시간만큼 뒤로 밀리도록 기준 시각도 지금으로 맞춘다.
+                    self._anim_cache_deadline = time.perf_counter()
+                    self.anim_cache_timer.start(8)
+                    return
+                self._leave_anim_cache_mode()
+                return
+            # Slideshow "loop" mode counts finished loops off QMovie's
+            # frameChanged, which a paused movie no longer emits -- feed
+            # the same handler from here instead. It may move on to the
+            # next image (which stops this replay via stop_current_movie).
+            self.on_gif_frame_changed(frame)
+            if generation != self.current_movie_generation:
+                return
+            self.animated_frame_cache.move_to_end(key)
+            self.anim_cache_index = frame
+            self.current_movie_frame = frame
+            self._show_animated_pixmap(pixmap)
+            self._schedule_next_cached_frame()
+        except Exception as e:
+            print(f"[애니메이션 캐시 재생 오류] {e}")
+            # A fault must not turn into leave/re-enter cycling: no more
+            # cached replay for this animation.
+            self.anim_frame_delays = None
+            self._leave_anim_cache_mode()
+
     def connect_gif_loop(self):
         if self.current_movie and not self.gif_frame_connected:
             self.current_movie.frameChanged.connect(self.on_gif_frame_changed)
@@ -4376,8 +6146,20 @@ class ImageViewer(QMainWindow):
                         # the live and look-ahead movie in sync -- see its
                         # docstring for why that matters here.
                         self._apply_anim_scaled_size(scaled_size)
-                    self.current_movie_frame = self.current_movie.currentFrameNumber()
-                    self._render_animated_frame(self.current_movie_frame, self.current_movie_generation)
+                    if self.anim_cache_playing:
+                        # QMovie is paused during cached replay, so its
+                        # currentFrameNumber()/currentImage() are the frame
+                        # it stopped on, not the one on screen. Re-show the
+                        # cached frame that is, at the new size.
+                        cached = self.animated_frame_cache.get(self._animated_cache_key(self.anim_cache_index))
+                        if cached is not None:
+                            self.current_movie_frame = self.anim_cache_index
+                            self._show_animated_pixmap(cached)
+                        else:
+                            self._leave_anim_cache_mode()
+                    else:
+                        self.current_movie_frame = self.current_movie.currentFrameNumber()
+                        self._render_animated_frame(self.current_movie_frame, self.current_movie_generation)
             except:
                 pass
             return
@@ -4533,6 +6315,26 @@ class ImageViewer(QMainWindow):
         self.image_label.adjustSize()
 
     def toggle_actual_size(self):
+        # fit_to_window is changed by nothing else but this method (and
+        # _zoom_at, which only ever clears it), so "switched to actual size and
+        # then went back to fit by itself" can only be this being called a
+        # second time. Inputs that arrive as a burst -- one tilt of the wheel
+        # can come in as several wheel events, keys repeat, and a GUI thread
+        # that was busy replays everything it had queued in one go -- must
+        # count once. The gap is measured both on our own clock and on the
+        # native timestamps of the input events, whichever is smaller: events
+        # that were only *processed* late still carry the time they happened.
+        now = time.monotonic()
+        gap = now - self._last_toggle_attempt
+        ts = self._input_ts_ms
+        if ts is not None and self._last_toggle_attempt_ts is not None:
+            gap_ts = ((ts - self._last_toggle_attempt_ts) & 0xFFFFFFFF) / 1000.0
+            if gap_ts < 0x7FFFFFFF / 1000.0:
+                gap = min(gap, gap_ts)
+        self._last_toggle_attempt = now
+        self._last_toggle_attempt_ts = ts
+        if gap < TOGGLE_ACTUAL_SIZE_MIN_INTERVAL_S:
+            return
         self.fit_to_window = not self.fit_to_window
         if self.fit_to_window:
             self.zoom_factor = 1.0
@@ -4578,8 +6380,6 @@ class ImageViewer(QMainWindow):
 
         # Capture the image-space point under the cursor before scaling.
         # For a large image this is simply viewport position + scroll offset.
-        old_h = self.scroll_area.horizontalScrollBar().value()
-        old_v = self.scroll_area.verticalScrollBar().value()
         label_pos = self.image_label.mapFrom(viewport, viewport_pos)
         anchor_x = label_pos.x()
         anchor_y = label_pos.y()
@@ -4760,28 +6560,26 @@ class ImageViewer(QMainWindow):
         self.reset_cursor_timer()
         return True
 
-    def _is_pan_target(self, widget):
-        if widget is None:
-            return False
-        viewport = self.scroll_area.viewport()
-        if widget is self.image_label or widget is viewport:
-            return True
-        try:
-            # widgetAt() can return a child widget inside the viewport.
-            # What matters is whether the pointer is inside our image area.
-            return viewport.isAncestorOf(widget) or self.image_label.isAncestorOf(widget)
-        except Exception:
-            return False
-
     def _handle_tilt_wheel(self, event):
         dx = event.angleDelta().x()
         if dx == 0:
             return False
+        # Accepted up front: QApplication::notify keeps handing a wheel event to
+        # the next parent widget (whose own filter would run this again) until
+        # it has been accepted, and the shortcut below can take a while.
+        event.accept()
         # The mouse reports horizontal tilt with the opposite sign on this
         # device/event path. Map the physical direction to the UI name.
         button_text = 'Tilt Left' if dx > 0 else 'Tilt Right'
-        self.check_mouse_shortcut(button_text)
-        event.accept()
+        try:
+            ts = event.timestamp()
+        except Exception:
+            ts = None
+        self._input_ts_ms = ts
+        try:
+            self.check_mouse_shortcut(button_text)
+        finally:
+            self._input_ts_ms = None
         return True
 
     def eventFilter(self, obj, event):
@@ -4844,7 +6642,14 @@ class ImageViewer(QMainWindow):
         elif event.button() == Qt.XButton2:
             button_text = 'XButton2'
         if button_text:
-            self.check_mouse_shortcut(button_text)
+            try:
+                self._input_ts_ms = event.timestamp()
+            except Exception:
+                self._input_ts_ms = None
+            try:
+                self.check_mouse_shortcut(button_text)
+            finally:
+                self._input_ts_ms = None
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -4930,6 +6735,13 @@ class ImageViewer(QMainWindow):
         self.stop_current_movie()
         self.slideshow.stop()
         self.cursor_hide_timer.stop()
+        # A neighbor animation being pre-decoded in the background would
+        # otherwise keep the process alive until its whole decode finished.
+        for cancel_event in list(self.anim_preload_inflight.values()):
+            try:
+                cancel_event.set()
+            except Exception:
+                pass
         # Stop creating new background work and release all worker threads.
         # This is important on Windows: ThreadPoolExecutor worker threads can
         # keep the process alive and retain large decoded images/ZIP handles.
@@ -4938,7 +6750,6 @@ class ImageViewer(QMainWindow):
             self.loading_keys.clear()
             self.cache_manager.clear()
             self.current_pixmap = None
-            self.original_pixmap = None
         except Exception:
             pass
         try:
@@ -4959,33 +6770,28 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    
-    icon_path = get_icon_path()
-    if icon_path:
-        app.setWindowIcon(QIcon(icon_path))
-    
+
     single_app = SingleApplication()
     if single_app.is_running():
-        # Relaying to an already-running instance -- this process exits
-        # right after send_message below without ever constructing
-        # ImageViewer, so none of that instance's code (including any
-        # print() diagnostics added there) runs here. Printed explicitly
-        # because otherwise this looks identical from the outside to a
-        # normal fresh launch -- the window that comes to front is the
-        # *old* instance, still running whatever code was in memory when
-        # *it* started, not whatever is currently on disk.
-        print("이미 실행 중인 인스턴스가 있어 그쪽으로 파일을 전달하고 이 프로세스는 종료합니다 "
-              "(콘솔 로그가 필요하면 기존 창을 모두 닫고 다시 실행하세요).")
+        # Hand the file to the instance that is already running and leave
+        # without ever building a window.
         if len(sys.argv) > 1:
             single_app.send_message(sys.argv[1])
         sys.exit(0)
     single_app.start_server()
     viewer = ImageViewer()
     single_app.set_file_received_callback(viewer.load_path)
-    if len(sys.argv) > 1:
-        viewer.load_path(sys.argv[1])
+    # Show the (still empty) window first and open the file from the event
+    # loop afterwards. Opening it before the first paint meant the directory
+    # scan and the first decode all delayed the window appearing; this also
+    # sizes the first image against the real, laid-out window.
     viewer.show()
-    QTimer.singleShot(100, viewer.force_foreground)
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+        QTimer.singleShot(0, lambda: viewer.load_path(path))
+        warm_up_for_first_file(os.path.splitext(path)[1].lower())
+    else:
+        QTimer.singleShot(100, viewer.force_foreground)
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
